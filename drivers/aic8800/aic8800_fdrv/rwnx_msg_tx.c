@@ -3274,7 +3274,7 @@ int rwnx_send_me_config_req(struct rwnx_hw *rwnx_hw)
                                                                req->he_supp);
 #endif
 
-	AICWFDBG(LOGINFO, "HT supp %d, VHT supp %d, HE supp %d\n", req->ht_supp,
+	AICWFDBG(LOGDEBUG, "HT supp %d, VHT supp %d, HE supp %d\n", req->ht_supp,
                                                                req->vht_supp,
                                                                req->he_supp);
 

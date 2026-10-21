@@ -1590,9 +1590,10 @@ static int rwnx_close(struct net_device *dev)
     }
 
 #if defined(AICWF_USB_SUPPORT)
-    if (usbdev != NULL) {
-        if (usbdev->bus_if->state != BUS_DOWN_ST && usbdev->state != USB_DOWN_ST)
-			AICWFDBG(LOGINFO, "state: %d %d \r\n", (int)usbdev->bus_if->state, (int)usbdev->state);
+	if (usbdev != NULL) {
+		if (usbdev->bus_if->state != BUS_DOWN_ST && usbdev->state != USB_DOWN_ST)
+			AICWFDBG(LOGDEBUG, "state: %d %d\n",
+				 (int)usbdev->bus_if->state, (int)usbdev->state);
 
 		if(RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||
 			RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT){
@@ -1791,7 +1792,6 @@ static int rwnx_set_mac_address(struct net_device *dev, void *addr)
     struct sockaddr *sa = addr;
     int ret;
     struct rwnx_vif *rwnx_vif = netdev_priv(dev);
-	printk("%s enter \r\n", __func__);
 
     ret = eth_mac_addr(dev, sa);
     memcpy(rwnx_vif->wdev.address, dev->dev_addr, 6);
