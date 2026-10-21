@@ -9103,6 +9103,7 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     }
 
     rwnx_hw = wiphy_priv(wiphy);
+	spin_lock_init(&rwnx_hw->tx_lock);
     rwnx_hw->wiphy = wiphy;
     rwnx_hw->plat = rwnx_plat;
     rwnx_hw->dev = rwnx_platform_get_dev(rwnx_plat);
@@ -9192,7 +9193,6 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     spin_lock_init(&rwnx_hw->defrag_lock);
     mutex_init(&rwnx_hw->mutex);
     mutex_init(&rwnx_hw->dbgdump_elem.mutex);
-    spin_lock_init(&rwnx_hw->tx_lock);
     spin_lock_init(&rwnx_hw->cb_lock);
 
 	INIT_WORK(&rwnx_hw->apmStalossWork, apm_staloss_work_process);
@@ -9562,6 +9562,9 @@ err_lmac_reqs:
 //err_config:
 err_cache:
     aicwf_wakeup_lock_deinit(rwnx_hw);
+#ifdef AICWF_USB_SUPPORT
+	rwnx_plat->usbdev->rwnx_hw = NULL;
+#endif
     wiphy_free(wiphy);
 err_out:
     return ret;
@@ -9580,6 +9583,9 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 
     rwnx_send_set_stack_start_req(rwnx_hw, 0, 0, 0, 0, &set_start_cfm);
 
+#ifdef AICWF_USB_SUPPORT
+	aicwf_usb_tx_stop(rwnx_hw->usbdev);
+#endif
     rwnx_hw->fwlog_en = 0;
     rwnx_hw->scanning = 0;
     rwnx_hw->p2p_working = 0;
@@ -9633,7 +9639,13 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 	flush_workqueue(rwnx_hw->apmStaloss_wq);
 	destroy_workqueue(rwnx_hw->apmStaloss_wq);
 
+#ifdef CONFIG_FILTER_TCP_ACK
+	tcp_ack_deinit(rwnx_hw);
+#endif
     rwnx_wdev_unregister(rwnx_hw);
+#ifdef AICWF_USB_SUPPORT
+	aicwf_usb_rx_stop(rwnx_hw->usbdev);
+#endif
 	if(rwnx_hw->wiphy){
 		AICWFDBG(LOGINFO, "%s wiphy_unregister \r\n", __func__);
     	wiphy_unregister(rwnx_hw->wiphy);
@@ -9641,11 +9653,11 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
     rwnx_radar_detection_deinit(&rwnx_hw->radar);
     rwnx_platform_off(rwnx_hw, NULL);
     kmem_cache_destroy(rwnx_hw->sw_txhdr_cache);
-#ifdef CONFIG_FILTER_TCP_ACK
-    tcp_ack_deinit(rwnx_hw);
-#endif
     aicwf_wakeup_lock_deinit(rwnx_hw);
 
+#ifdef AICWF_USB_SUPPORT
+	rwnx_hw->usbdev->rwnx_hw = NULL;
+#endif
 	if(rwnx_hw->wiphy){
     	wiphy_free(rwnx_hw->wiphy);
 	}

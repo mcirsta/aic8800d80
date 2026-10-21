@@ -270,20 +270,7 @@ void aicwf_frame_tx(void *dev, struct sk_buff *skb)
     aicwf_bus_txdata(sdiodev->bus_if, skb);
 #else
     struct aic_usb_dev *usbdev = (struct aic_usb_dev *)dev;
-	struct rwnx_txhdr *txhdr = NULL;
-	unsigned long flags;
 
-    if (!usbdev->state) {
-        txrx_err("down\n");
-		spin_lock_irqsave(&usbdev->tx_flow_lock, flags);
-		if(!usbdev->tbusy)
-			aicwf_usb_tx_flowctrl(usbdev->rwnx_hw, true);
-		spin_unlock_irqrestore(&usbdev->tx_flow_lock, flags);
-		txhdr = (struct rwnx_txhdr *)skb->data;
-		kmem_cache_free(usbdev->rwnx_hw->sw_txhdr_cache, txhdr->sw_hdr);
-        dev_kfree_skb(skb);
-        return;
-    }
     aicwf_bus_txdata(usbdev->bus_if, skb);
 #endif
 }

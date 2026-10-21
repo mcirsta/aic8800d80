@@ -137,6 +137,11 @@ struct aicwf_usb_buf {
     dma_addr_t data_dma_trans_addr;
     #endif
     bool cfm;
+#ifndef CONFIG_USB_TX_AGGR
+	/* skb and the separately allocated confirmation copy never alias. */
+	u8 *tx_data;
+	u32 cfm_tag;
+#endif
     #ifdef CONFIG_USB_TX_AGGR
     u8 aggr_cnt;
     #endif
@@ -157,6 +162,13 @@ struct aic_usb_dev {
 #endif
 
     struct usb_anchor rx_submitted;
+	struct usb_anchor tx_submitted;
+	bool tx_stopping;
+#ifndef CONFIG_USB_TX_AGGR
+	struct work_struct tx_failed_work;
+	struct list_head tx_failed_list;
+	spinlock_t tx_failed_lock;
+#endif
     struct work_struct rx_urb_work;
 #ifdef CONFIG_USB_MSG_IN_EP
 	struct usb_anchor msg_rx_submitted;
@@ -231,6 +243,8 @@ int usb_busrx_thread(void *data);
 void rwnx_stop_sta_all_queues(void *sta, struct rwnx_hw *rwnx_hw);
 void rwnx_wake_sta_all_queues(void *sta, struct rwnx_hw *rwnx_hw);
 void aicwf_usb_cancel_all_urbs(struct aic_usb_dev *usb_dev);
+void aicwf_usb_tx_stop(struct aic_usb_dev *usb_dev);
+void aicwf_usb_rx_stop(struct aic_usb_dev *usb_dev);
 
 extern void aicwf_hostif_ready(void);
 

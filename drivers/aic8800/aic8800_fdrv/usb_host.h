@@ -27,6 +27,7 @@ struct usb_host_env_tag
     // Array storing the currently pushed host ids, per IPC queue
     //uint64_t tx_host_id[USB_TXQUEUE_CNT][USB_TXDESC_CNT];
     unsigned long tx_host_id[USB_TXQUEUE_CNT][USB_TXDESC_CNT];
+	u32 tx_host_tag[USB_TXQUEUE_CNT][USB_TXDESC_CNT];
 
     /// Pointer to the attached object (used in callbacks and register accesses)
     void *pthis;
@@ -35,7 +36,11 @@ struct usb_host_env_tag
 extern void aicwf_usb_host_init(struct usb_host_env_tag *env,
                   void *cb, void *shared_env_ptr, void *pthis);
 
-extern void aicwf_usb_host_txdesc_push(struct usb_host_env_tag *env, const int queue_idx, const uint64_t host_id);
+int aicwf_usb_host_txdesc_push(struct usb_host_env_tag *env,
+			     int queue_idx, struct sk_buff *skb);
+struct sk_buff *aicwf_usb_host_txdesc_take(struct usb_host_env_tag *env,
+					 u32 tag);
+void aicwf_usb_host_txdesc_flush(struct usb_host_env_tag *env);
 
 extern void aicwf_usb_host_tx_cfm_handler(struct usb_host_env_tag *env, u32 *data);
 extern int aicwf_rwnx_usb_platform_init(struct aic_usb_dev *usbdev);

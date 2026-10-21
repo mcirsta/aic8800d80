@@ -8,6 +8,7 @@
 
 
 #include "usb_host.h"
+#include "rwnx_defs.h"
 //#include "ipc_compat.h"
 #include "rwnx_tx.h"
 #include "rwnx_platform.h"
@@ -59,73 +60,77 @@ volatile struct txdesc_host *aicwf_usb_host_txdesc_get(struct usb_host_env_tag *
 /**
  ****************************************************************************************
  */
-void aicwf_usb_host_txdesc_push(struct usb_host_env_tag *env, const int queue_idx, const uint64_t host_id)
+/* The TX lock serializes publication, firmware replies and cancellation. */
+int aicwf_usb_host_txdesc_push(struct usb_host_env_tag *env,
+			     int queue_idx, struct sk_buff *skb)
 {
-    //printk("push, %d, %d, 0x%llx \r\n", queue_idx, env->txdesc_free_idx[queue_idx], host_id);
-    // Save the host id in the environment
-    env->tx_host_id[queue_idx][env->txdesc_free_idx[queue_idx] % USB_TXDESC_CNT] = host_id;
+	struct rwnx_hw *hw = env->pthis;
+	u32 tag, slot;
+	int i;
 
-    // Increment the index
-    env->txdesc_free_idx[queue_idx]++;
-    if(env->txdesc_free_idx[queue_idx]==0x40000000)
-        env->txdesc_free_idx[queue_idx] = 0;
+	lockdep_assert_held(&hw->tx_lock);
+	for (i = 0; i < USB_TXDESC_CNT; i++) {
+		tag = env->txdesc_free_idx[queue_idx];
+		env->txdesc_free_idx[queue_idx] = (tag + 1) & 0x3fffffff;
+		slot = tag % USB_TXDESC_CNT;
+		if (env->tx_host_id[queue_idx][slot])
+			continue;
+		env->tx_host_tag[queue_idx][slot] = tag;
+		env->tx_host_id[queue_idx][slot] = (unsigned long)skb;
+		return tag;
+	}
+
+	return -ENOSPC;
 }
 
-/**
- ****************************************************************************************
- */
+struct sk_buff *aicwf_usb_host_txdesc_take(struct usb_host_env_tag *env,
+					 u32 tag)
+{
+	struct rwnx_hw *hw = env->pthis;
+	u32 slot = tag % USB_TXDESC_CNT;
+	struct sk_buff *skb;
+
+	lockdep_assert_held(&hw->tx_lock);
+	/* A late reply must not consume the next occupant of this ring slot. */
+	if (env->tx_host_tag[0][slot] != tag)
+		return NULL;
+	skb = (struct sk_buff *)env->tx_host_id[0][slot];
+	env->tx_host_id[0][slot] = 0;
+	return skb;
+}
+
+void aicwf_usb_host_txdesc_flush(struct usb_host_env_tag *env)
+{
+	struct rwnx_hw *hw = env->pthis;
+	struct sk_buff *skb;
+	int i, dropped = 0;
+
+	lockdep_assert_held(&hw->tx_lock);
+	for (i = 0; i < USB_TXDESC_CNT; i++) {
+		skb = aicwf_usb_host_txdesc_take(env, env->tx_host_tag[0][i]);
+		if (skb) {
+			rwnx_usb_tx_drop(hw, skb);
+			dropped++;
+		}
+	}
+	dev_dbg(hw->dev, "USB TX shutdown: %d pending confirmations discarded\n", dropped);
+}
+
 void aicwf_usb_host_tx_cfm_handler(struct usb_host_env_tag *env, u32 *data)
 {
-    u32 queue_idx  = 0;//data[0];
-    //struct rwnx_hw *rwnx_hw = (struct rwnx_hw *)env->pthis;
-    struct sk_buff *skb = NULL;
-    struct rwnx_txhdr *txhdr;
-	AICWFDBG(LOGTRACE, "%s Enter \n", __func__);
-    //printk("sdio_host_tx_cfm_handler, %d, 0x%08x\r\n", queue_idx, data[1]);
-    // TX confirmation descriptors have been received
-   // REG_SW_SET_PROFILING(env->pthis, SW_PROF_IRQ_E2A_TXCFM);
-    //while (1)
-    {
-        // Get the used index and increase it. We do the increase before knowing if the
-        // current buffer is confirmed because the callback function may call the
-        // ipc_host_txdesc_get() in case flow control was enabled and the index has to be
-        // already at the good value to ensure that the test of FIFO full is correct
-        //uint32_t used_idx = env->txdesc_used_idx[queue_idx]++;
-		uint32_t used_idx = data[1];
-        //uint64_t host_id = env->tx_host_id[queue_idx][used_idx % USB_TXDESC_CNT];
-        unsigned long host_id = env->tx_host_id[queue_idx][used_idx % USB_TXDESC_CNT];
+	struct rwnx_hw *hw = env->pthis;
+	struct rwnx_txhdr *txhdr;
+	struct sk_buff *skb;
 
-        // Reset the host id in the array
-        env->tx_host_id[queue_idx][used_idx % USB_TXDESC_CNT] = 0;
-
-        // call the external function to indicate that a TX packet is freed
-        if (host_id == 0)
-        {
-            // No more confirmations, so put back the used index at its initial value
-            env->txdesc_used_idx[queue_idx] = used_idx;
-			AICWFDBG(LOGERROR, "ERROR:No more confirmations\r\n");
-            return;
-            //break;
-        }
-		AICWFDBG(LOGINFO, "usb_host_tx_cfm_handler:used_idx=%d, hostid=%p, 0x%p, status=%x\r\n",used_idx, (void *)host_id, env->pthis, data[0]);
-
-        // set the cfm status
-        skb = (struct sk_buff *)host_id;
-        txhdr = (struct rwnx_txhdr *)skb->data;
-        txhdr->hw_hdr.cfm.status = (union rwnx_hw_txstatus)data[0];
-        //txhdr->hw_hdr.status = data[1];
-        //if (env->cb.send_data_cfm(env->pthis, host_id) != 0)
-        if (rwnx_txdatacfm(env->pthis, (void *)host_id) != 0)
-        {
-            // No more confirmations, so put back the used index at its initial value
-            env->txdesc_used_idx[queue_idx] = used_idx;
-            env->tx_host_id[queue_idx][used_idx % USB_TXDESC_CNT] = host_id;
-            // and exit the loop
-            AICWFDBG(LOGERROR, "ERROR:rwnx_txdatacfm,\r\n");
-          //  break;
-        }
-
-    }
+	spin_lock_bh(&hw->tx_lock);
+	skb = aicwf_usb_host_txdesc_take(env, data[1]);
+	dev_dbg(hw->dev, "USB TX confirmation tag=%u matched=%d\n", data[1], !!skb);
+	if (skb) {
+		txhdr = (struct rwnx_txhdr *)skb->data;
+		txhdr->hw_hdr.cfm.status.value = data[0];
+		rwnx_txdatacfm(hw, skb);
+	}
+	spin_unlock_bh(&hw->tx_lock);
 }
 
 int aicwf_rwnx_usb_platform_init(struct aic_usb_dev *usbdev)

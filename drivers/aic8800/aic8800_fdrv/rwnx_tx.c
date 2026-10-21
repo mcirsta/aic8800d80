@@ -632,6 +632,7 @@ void rwnx_tx_push(struct rwnx_hw *rwnx_hw, struct rwnx_txhdr *txhdr, int flags)
     txq->credits--;
     #endif
     txq->pkt_pushed[user]++;
+	rwnx_hw->stats.cfm_balance[hw_queue]++;
     //printk("txq->credits=%d\n",txq->credits);
     #if 0
     if (txq->credits <= 0)
@@ -677,9 +678,15 @@ void rwnx_tx_push(struct rwnx_hw *rwnx_hw, struct rwnx_txhdr *txhdr, int flags)
 	((*(skb->data+sw_txhdr->headroom)==0xd0) || (*(skb->data+sw_txhdr->headroom)==0x10) || (*(skb->data+sw_txhdr->headroom)==0x30))) || \
         (sw_txhdr->desc.host.ethertype == 0x8e88) || (sw_txhdr->desc.host.ethertype == 0xb488)) {
 	// 0xd0:Action, 0x10:AssocRsp, 0x8e88:EAPOL, 0xb488: WAPI
-        sw_txhdr->need_cfm = 1;
-        sw_txhdr->desc.host.status_desc_addr = ((1<<31) | rwnx_hw->usb_env.txdesc_free_idx[0]);
-        aicwf_usb_host_txdesc_push(&(rwnx_hw->usb_env), 0, (long)(skb));
+		int tag;
+
+		sw_txhdr->need_cfm = 1;
+		tag = aicwf_usb_host_txdesc_push(&rwnx_hw->usb_env, 0, skb);
+		if (tag < 0) {
+			rwnx_usb_tx_drop(rwnx_hw, skb);
+			return;
+		}
+		sw_txhdr->desc.host.status_desc_addr = BIT(31) | tag;
         if((sw_txhdr->desc.host.flags & TXU_CNTRL_MGMT))
 		AICWFDBG(LOGINFO, "need cfm mgmt:%x,user_idx=%d, skb=%p sta_idx:%d\n",
 			*(skb->data+sw_txhdr->headroom),
@@ -703,9 +710,11 @@ void rwnx_tx_push(struct rwnx_hw *rwnx_hw, struct rwnx_txhdr *txhdr, int flags)
             sw_txhdr->desc.host.status_desc_addr = 0;
         }
 
+#ifdef CONFIG_USB_TX_AGGR
         sw_txhdr->rwnx_vif->net_stats.tx_packets++;
         sw_txhdr->rwnx_vif->net_stats.tx_bytes += sw_txhdr->frame_len;
         rwnx_hw->stats.last_tx = jiffies;
+#endif
     }
     aicwf_frame_tx((void *)(rwnx_hw->usbdev), skb);
 #endif
@@ -713,7 +722,6 @@ void rwnx_tx_push(struct rwnx_hw *rwnx_hw, struct rwnx_txhdr *txhdr, int flags)
     #if 0
     txq->hwq->credits[user]--;
     #endif
-    rwnx_hw->stats.cfm_balance[hw_queue]++;
 }
 
 
@@ -2371,6 +2379,32 @@ free_tag:
  *
  * called with tx_lock hold
  */
+#ifdef AICWF_USB_SUPPORT
+/* The caller owns this packet and has removed any confirmation-table entry. */
+void rwnx_usb_tx_drop(struct rwnx_hw *hw, struct sk_buff *skb)
+{
+	struct rwnx_sw_txhdr *sw = ((struct rwnx_txhdr *)skb->data)->sw_hdr;
+
+	lockdep_assert_held(&hw->tx_lock);
+	rwnx_txq_confirm_any(hw, sw->txq, &hw->hwq[sw->hw_queue], sw);
+	sw->rwnx_vif->net_stats.tx_dropped++;
+	if ((sw->desc.host.flags & TXU_CNTRL_MGMT) && !sw->raw_frame)
+		cfg80211_mgmt_tx_status(&sw->rwnx_vif->wdev, sw->cookie,
+					skb->data + sw->headroom, sw->frame_len,
+					false, GFP_ATOMIC);
+#ifdef CONFIG_RWNX_AMSDUS_TX
+	if (sw->desc.host.flags & TXU_CNTRL_AMSDU) {
+		struct rwnx_amsdu_txhdr *sub;
+
+		list_for_each_entry(sub, &sw->amsdu.hdrs, list)
+			dev_kfree_skb_any(sub->skb);
+	}
+#endif
+	kmem_cache_free(hw->sw_txhdr_cache, sw);
+	dev_kfree_skb_any(skb);
+}
+#endif
+
 int rwnx_txdatacfm(void *pthis, void *host_id)
 {
     struct rwnx_hw *rwnx_hw = (struct rwnx_hw *)pthis;
@@ -2398,13 +2432,10 @@ int rwnx_txdatacfm(void *pthis, void *host_id)
     }
 
 #ifdef AICWF_USB_SUPPORT
-    if (rwnx_hw->usbdev->state == USB_DOWN_ST) {
-        headroom = sw_txhdr->headroom;
-        kmem_cache_free(rwnx_hw->sw_txhdr_cache, sw_txhdr);
-        skb_pull(skb, headroom);
-        consume_skb(skb);
-        return 0;
-    }
+	if (rwnx_hw->usbdev->state == USB_DOWN_ST) {
+		rwnx_usb_tx_drop(rwnx_hw, skb);
+		return 0;
+	}
 #endif
 #ifdef AICWF_SDIO_SUPPORT
     if(rwnx_hw->sdiodev->bus_if->state == BUS_DOWN_ST) {

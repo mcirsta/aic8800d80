@@ -187,6 +187,9 @@ netdev_tx_t rwnx_start_monitor_if_xmit(struct sk_buff *skb,
                                        struct net_device *dev);
 #endif
 int rwnx_txdatacfm(void *pthis, void *host_id);
+#ifdef AICWF_USB_SUPPORT
+void rwnx_usb_tx_drop(struct rwnx_hw *hw, struct sk_buff *skb);
+#endif
 
 struct rwnx_hw;
 struct rwnx_sta;

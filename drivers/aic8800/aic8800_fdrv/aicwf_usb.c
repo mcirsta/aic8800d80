@@ -184,10 +184,7 @@ static void usb_txc_sta_flowctrl(struct aicwf_usb_buf *usb_buf, struct aic_usb_d
 	struct rwnx_sta *sta;
 	struct txdesc_api *hostdesc;
 	u8 sta_idx;
-	if(usb_buf->cfm)
-		hostdesc = (struct txdesc_api *)((u8 *)usb_buf->skb + 4);
-	else
-		hostdesc = (struct txdesc_api *)((u8 *)usb_buf->skb->data + 4);
+	hostdesc = (struct txdesc_api *)((u8 *)usb_buf->urb->transfer_buffer + 4);
 	//printk("txcpl: sta %d\n", hostdesc->host.staid);
 	sta_idx = hostdesc->host.staid;
 	if(sta_idx < NX_REMOTE_STA_MAX && !(hostdesc->host.flags & TXU_CNTRL_MGMT)) {
@@ -211,51 +208,77 @@ static void usb_txc_sta_flowctrl(struct aicwf_usb_buf *usb_buf, struct aic_usb_d
 #endif
 }
 
-static void aicwf_usb_tx_complete(struct urb *urb)
+/* Called only after USB has relinquished the transfer buffer. */
+static void aicwf_usb_tx_release(struct aicwf_usb_buf *usb_buf)
 {
-    unsigned long flags;
-    struct aicwf_usb_buf *usb_buf = (struct aicwf_usb_buf *) urb->context;
-    struct aic_usb_dev *usb_dev = usb_buf->usbdev;
-    #ifndef CONFIG_USB_TX_AGGR
-    struct sk_buff *skb;
-    #endif
+	struct aic_usb_dev *usb_dev = usb_buf->usbdev;
+	unsigned long flags;
 
 	usb_txc_sta_flowctrl(usb_buf, usb_dev);
+	kfree(usb_buf->usb_align_data);
+	usb_buf->usb_align_data = NULL;
+#ifndef CONFIG_USB_TX_AGGR
+	dev_kfree_skb_any(usb_buf->skb);
+	kfree(usb_buf->tx_data);
+	usb_buf->skb = NULL;
+	usb_buf->tx_data = NULL;
+	usb_buf->cfm = false;
+#else
+	usb_buf->aggr_cnt = 0;
+#endif
+	aicwf_usb_tx_queue(usb_dev, &usb_dev->tx_free_list, usb_buf,
+			   &usb_dev->tx_free_count, &usb_dev->tx_free_lock);
+	spin_lock_irqsave(&usb_dev->tx_flow_lock, flags);
+	if (!READ_ONCE(usb_dev->tx_stopping) &&
+	    usb_dev->tx_free_count > AICWF_USB_TX_HIGH_WATER && usb_dev->tbusy) {
+		usb_dev->tbusy = false;
+		aicwf_usb_tx_flowctrl(usb_dev->rwnx_hw, false);
+	}
+	spin_unlock_irqrestore(&usb_dev->tx_flow_lock, flags);
+}
 
-#ifdef CONFIG_USB_ALIGN_DATA
-	if(usb_buf->usb_align_data) {
-		kfree(usb_buf->usb_align_data);
-        usb_buf->usb_align_data = NULL;
+#ifndef CONFIG_USB_TX_AGGR
+static void aicwf_usb_tx_failed_work(struct work_struct *work)
+{
+	struct aic_usb_dev *usb_dev = container_of(work, struct aic_usb_dev,
+						 tx_failed_work);
+	struct rwnx_hw *hw = usb_dev->rwnx_hw;
+	struct aicwf_usb_buf *usb_buf;
+	struct sk_buff *skb;
+
+	while ((usb_buf = aicwf_usb_tx_dequeue(usb_dev, &usb_dev->tx_failed_list,
+					      NULL, &usb_dev->tx_failed_lock))) {
+		spin_lock_bh(&hw->tx_lock);
+		skb = aicwf_usb_host_txdesc_take(&hw->usb_env, usb_buf->cfm_tag);
+		if (skb)
+			rwnx_usb_tx_drop(hw, skb);
+		spin_unlock_bh(&hw->tx_lock);
+		aicwf_usb_tx_release(usb_buf);
+	}
+}
+#endif
+
+static void aicwf_usb_tx_finish(struct aicwf_usb_buf *usb_buf, int status)
+{
+#ifndef CONFIG_USB_TX_AGGR
+	if (status && usb_buf->cfm) {
+		struct aic_usb_dev *usb_dev = usb_buf->usbdev;
+		unsigned long flags;
+
+		/* tx_lock is also taken with BHs disabled; never take it in an IRQ. */
+		spin_lock_irqsave(&usb_dev->tx_failed_lock, flags);
+		list_add_tail(&usb_buf->list, &usb_dev->tx_failed_list);
+		spin_unlock_irqrestore(&usb_dev->tx_failed_lock, flags);
+		schedule_work(&usb_dev->tx_failed_work);
+		return;
 	}
 #endif
-#ifndef CONFIG_USB_TX_AGGR
-    if (usb_buf->cfm == false) {
-        skb = usb_buf->skb;
-        dev_kfree_skb_any(skb);
-    }
-    #if !defined CONFIG_USB_NO_TRANS_DMA_MAP
-    else {
-        u8 *buf;
-        buf = (u8 *)usb_buf->skb;
-        kfree(buf);
-    }
-    #endif
-    usb_buf->skb = NULL;
-#else
-    AICWFDBG(LOGDEBUG,"tx com %d\n", usb_buf->aggr_cnt);
-    usb_buf->aggr_cnt = 0;
-#endif//CONFIG_USB_TX_AGGR
-    aicwf_usb_tx_queue(usb_dev, &usb_dev->tx_free_list, usb_buf,
-                    &usb_dev->tx_free_count, &usb_dev->tx_free_lock);
+	aicwf_usb_tx_release(usb_buf);
+}
 
-    spin_lock_irqsave(&usb_dev->tx_flow_lock, flags);
-    if (usb_dev->tx_free_count > AICWF_USB_TX_HIGH_WATER) {
-        if (usb_dev->tbusy) {
-            usb_dev->tbusy = false;
-            aicwf_usb_tx_flowctrl(usb_dev->rwnx_hw, false);
-        }
-    }
-    spin_unlock_irqrestore(&usb_dev->tx_flow_lock, flags);
+static void aicwf_usb_tx_complete(struct urb *urb)
+{
+	aicwf_usb_tx_finish(urb->context, urb->status);
 }
 
 void aicwf_usb_rx_submit_all_urb_(struct aic_usb_dev *usb_dev);
@@ -1145,55 +1168,47 @@ int aicwf_usb_send(struct aicwf_tx_priv *tx_priv)
 
 static void aicwf_usb_tx_process(struct aic_usb_dev *usb_dev)
 {
-    struct aicwf_usb_buf *usb_buf;
-    int ret = 0;
-    u8* data = NULL;
+	struct aicwf_usb_buf *usb_buf;
+	int ret = 0;
 
 #ifdef CONFIG_USB_TX_AGGR
-    if (!aicwf_is_framequeue_empty(&usb_dev->tx_priv->txq)) {
-        if (aicwf_usb_send(usb_dev->tx_priv)) {
-            AICWFDBG(LOGERROR, "%s no buf send\n", __func__);
-        }
-    }
+	if (!aicwf_is_framequeue_empty(&usb_dev->tx_priv->txq)) {
+		if (aicwf_usb_send(usb_dev->tx_priv))
+			AICWFDBG(LOGERROR, "%s no buf send\n", __func__);
+	}
 #endif
 
-    while(!list_empty(&usb_dev->tx_post_list)) {
+	while (!list_empty(&usb_dev->tx_post_list)) {
 
-        if (usb_dev->state != USB_UP_ST) {
-            usb_err("usb state is not up!\n");
-            return;
-        }
+		if (usb_dev->state != USB_UP_ST || READ_ONCE(usb_dev->tx_stopping))
+			return;
 
-        usb_buf = aicwf_usb_tx_dequeue(usb_dev, &usb_dev->tx_post_list,
-                        &usb_dev->tx_post_count, &usb_dev->tx_post_lock);
-        if(!usb_buf) {
-            usb_err("can not get usb_buf from tx_post_list!\n");
-            return;
-        }
-        data = usb_buf->skb->data;
+		usb_buf = aicwf_usb_tx_dequeue(usb_dev, &usb_dev->tx_post_list,
+						&usb_dev->tx_post_count, &usb_dev->tx_post_lock);
+		if (!usb_buf) {
+			usb_err("can not get usb_buf from tx_post_list!\n");
+			return;
+		}
+		usb_anchor_urb(usb_buf->urb, &usb_dev->tx_submitted);
+		ret = usb_submit_urb(usb_buf->urb, GFP_ATOMIC);
+		if (ret) {
+			usb_unanchor_urb(usb_buf->urb);
+			AICWFDBG(LOGERROR, "aicwf_usb_bus_tx usb_submit_urb FAILED err:%d\n", ret);
+			#ifdef CONFIG_USB_TX_AGGR
+			aicwf_usb_tx_queue(usb_dev, &usb_dev->tx_post_list, usb_buf,
+					&usb_dev->tx_post_count, &usb_dev->tx_post_lock);
+			break;
+			#else
+			goto fail;
+			#endif
+		}
 
-        ret = usb_submit_urb(usb_buf->urb, GFP_KERNEL);
-        if (ret) {
-            AICWFDBG(LOGERROR, "aicwf_usb_bus_tx usb_submit_urb FAILED err:%d\n", ret);
-            #ifdef CONFIG_USB_TX_AGGR
-            aicwf_usb_tx_queue(usb_dev, &usb_dev->tx_post_list, usb_buf,
-                    &usb_dev->tx_post_count, &usb_dev->tx_post_lock);
-            break;
-            #else
-            goto fail;
-            #endif
-        }
-
-        continue;
+		continue;
 #ifndef CONFIG_USB_TX_AGGR
 fail:
-        usb_txc_sta_flowctrl(usb_buf, usb_dev);
-        dev_kfree_skb(usb_buf->skb);
-        usb_buf->skb = NULL;
-        aicwf_usb_tx_queue(usb_dev, &usb_dev->tx_free_list, usb_buf,
-                    &usb_dev->tx_free_count, &usb_dev->tx_free_lock);
+		aicwf_usb_tx_finish(usb_buf, ret);
 #endif
-    }
+	}
 }
 
 #ifdef CONFIG_TX_TASKLET
@@ -1260,26 +1275,19 @@ int usb_bustx_thread(void *data)
 	AICWFDBG(LOGINFO, "%s the current pid is:%d\n", __func__, current->pid);
 
 
-    while (1) {
-		#if 0
-        if(kthread_should_stop()) {
-            usb_err("usb bustx thread stop 2\n");
-            break;
-        }
-		#endif
-        if (!wait_for_completion_interruptible(&bus->bustx_trgg)) {
-            if(usbdev->bus_if->state == BUS_DOWN_ST){
-				AICWFDBG(LOGINFO, "usb bustx thread will to stop\n");
-                break;
-			}
-            #ifdef CONFIG_USB_TX_AGGR
-            if ((usbdev->tx_post_count > 0) || !aicwf_is_framequeue_empty(&usbdev->tx_priv->txq))
-            #else
-            if (usbdev->tx_post_count > 0)
-            #endif
-                aicwf_usb_tx_process(usbdev);
-        }
-    }
+	while (!kthread_should_stop()) {
+		if (wait_for_completion_interruptible(&bus->bustx_trgg))
+			continue;
+		if (kthread_should_stop() || READ_ONCE(usbdev->tx_stopping) ||
+		    usbdev->bus_if->state == BUS_DOWN_ST)
+			break;
+#ifdef CONFIG_USB_TX_AGGR
+		if (usbdev->tx_post_count || !aicwf_is_framequeue_empty(&usbdev->tx_priv->txq))
+#else
+		if (usbdev->tx_post_count)
+#endif
+			aicwf_usb_tx_process(usbdev);
+	}
 
 	aic_thread_wait_stop();
 	AICWFDBG(LOGINFO, "usb bustx thread stop\n");
@@ -1694,177 +1702,174 @@ static int aicwf_usb_bus_txdata(struct device *dev, struct sk_buff *pkt)
 }
 
 #else
+/* Called with tx_lock held; consume skb on both success and failure. */
 static int aicwf_usb_bus_txdata(struct device *dev, struct sk_buff *skb)
 {
-    u8 *buf;
-    u16 buf_len = 0;
-    u16 adjust_len = 0;
-    struct aicwf_usb_buf *usb_buf;
-    int ret = 0;
-    unsigned long flags;
-    struct aicwf_bus *bus_if = dev_get_drvdata(dev);
-    struct aic_usb_dev *usb_dev = bus_if->bus_priv.usb;
-    struct rwnx_txhdr *txhdr = (struct rwnx_txhdr *)skb->data;
-    struct rwnx_hw *rwnx_hw = usb_dev->rwnx_hw;
-    u8 usb_header[4];
-    u8 adj_buf[4] = {0};
-    u16 index = 0;
-    bool need_cfm = false;
-#ifdef CONFIG_USB_ALIGN_DATA//AIDEN
-    u8 *buf_align;
-    int align;
+	struct aicwf_bus *bus = dev_get_drvdata(dev);
+	struct aic_usb_dev *usb = bus->bus_priv.usb;
+	struct rwnx_hw *hw = usb->rwnx_hw;
+	struct rwnx_sw_txhdr *sw = ((struct rwnx_txhdr *)skb->data)->sw_hdr;
+	struct aicwf_usb_buf *usb_buf = NULL;
+	unsigned int payload_len, wire_len, transfer_len, extra = 0;
+	unsigned long flags;
+	u8 *buf, *wire;
+	int ret = -ENOMEM;
+#ifdef CONFIG_USB_ALIGN_DATA
+	unsigned int alignment = READ_ONCE(align_param);
+#ifdef CONFIG_USB_NO_TRANS_DMA_MAP
+#error "CONFIG_USB_NO_TRANS_DMA_MAP with CONFIG_USB_ALIGN_DATA is not supported"
+#endif
 #endif
 
-    if (usb_dev->state != USB_UP_ST) {
-        usb_err("usb state is not up!\n");
-        kmem_cache_free(rwnx_hw->sw_txhdr_cache, txhdr->sw_hdr);
-        dev_kfree_skb_any(skb);
-        return -EIO;
-    }
-
-    usb_buf = aicwf_usb_tx_dequeue(usb_dev, &usb_dev->tx_free_list,
-                        &usb_dev->tx_free_count, &usb_dev->tx_free_lock);
-    if (!usb_buf) {
-        usb_err("free:%d, post:%d\n", usb_dev->tx_free_count, usb_dev->tx_post_count);
-        kmem_cache_free(rwnx_hw->sw_txhdr_cache, txhdr->sw_hdr);
-        dev_kfree_skb_any(skb);
-        ret = -ENOMEM;
-        goto flow_ctrl;
-    }
-
-    usb_tx_flow_ctrl(txhdr, usb_dev, rwnx_hw);
-
-    if (txhdr->sw_hdr->need_cfm) {
-        need_cfm = true;
-        #if defined CONFIG_USB_NO_TRANS_DMA_MAP
-        buf = usb_buf->data_buf;
-        #else
-        buf = kmalloc(skb->len + 1, GFP_ATOMIC/*GFP_KERNEL*/);
-        #endif
-        index += sizeof(usb_header);
-        memcpy(&buf[index], (u8 *)(long)&txhdr->sw_hdr->desc, sizeof(struct txdesc_api));
-        index += sizeof(struct txdesc_api);
-        memcpy(&buf[index], &skb->data[txhdr->sw_hdr->headroom], skb->len - txhdr->sw_hdr->headroom);
-        index += skb->len - txhdr->sw_hdr->headroom;
-        buf_len = index;
-        if (buf_len & (TX_ALIGNMENT - 1)) {
-            adjust_len = roundup(buf_len, TX_ALIGNMENT)-buf_len;
-            memcpy(&buf[buf_len], adj_buf, adjust_len);
-            buf_len += adjust_len;
-        }
-        usb_header[0] =((buf_len) & 0xff);
-        usb_header[1] =(((buf_len) >> 8)&0x0f);
-        usb_header[2] = 0x01; //data
-        usb_header[3] = 0; //reserved
-        memcpy(&buf[0], usb_header, sizeof(usb_header));
-        usb_buf->skb = (struct sk_buff *)buf;
-    } else {
-        skb_pull(skb, txhdr->sw_hdr->headroom);
-        skb_push(skb, sizeof(struct txdesc_api));
-        memcpy(&skb->data[0], (u8 *)(long)&txhdr->sw_hdr->desc, sizeof(struct txdesc_api));
-        kmem_cache_free(rwnx_hw->sw_txhdr_cache, txhdr->sw_hdr);
-
-        skb_push(skb, sizeof(usb_header));
-        usb_header[0] =((skb->len) & 0xff);
-        usb_header[1] =(((skb->len) >> 8)&0x0f);
-        usb_header[2] = 0x01; //data
-        usb_header[3] = 0; //reserved
-        memcpy(&skb->data[0], usb_header, sizeof(usb_header));
-
-        #if defined CONFIG_USB_NO_TRANS_DMA_MAP
-        buf = usb_buf->data_buf;
-        memcpy(&buf[0], skb->data, skb->len);
-        #else
-        buf = skb->data;
-        #endif
-        buf_len = skb->len;
-
-        usb_buf->skb = skb;
-    }
-    usb_buf->usbdev = usb_dev;
-    if (need_cfm)
-        usb_buf->cfm = true;
-    else
-        usb_buf->cfm = false;
-
-
+	lockdep_assert_held(&hw->tx_lock);
+	if (usb->state != USB_UP_ST || READ_ONCE(usb->tx_stopping)) {
+		ret = -ESHUTDOWN;
+		goto drop;
+	}
+	/* The bus header has a 12-bit length, independently of the TX descriptor. */
+	if (sw->headroom > skb->len ||
+	    sw->headroom < sizeof(struct txdesc_api) + 4) {
+		ret = -EINVAL;
+		goto drop;
+	}
+	payload_len = skb->len - sw->headroom;
+	if (payload_len > 0xfff - sizeof(struct txdesc_api) - 4) {
+		ret = -EMSGSIZE;
+		goto drop;
+	}
+	wire_len = 4 + sizeof(struct txdesc_api) + payload_len;
+	if (sw->need_cfm)
+		wire_len = ALIGN(wire_len, TX_ALIGNMENT);
+	if (wire_len > 0xfff) {
+		ret = -EMSGSIZE;
+		goto drop;
+	}
 #ifndef CONFIG_USE_USB_ZERO_PACKET
-	if((buf_len % 512) == 0){
-		printk("%s send zero package buf_len: %d\r\n", __func__, buf_len);
-		if(txhdr->sw_hdr->need_cfm){
-			buf[buf_len] = 0x00;
-			buf_len = buf_len + 1;
-		}else{
-			skb_put(skb, 1);
-			skb->data[buf_len] = 0x00;
-			buf = skb->data;
-       		buf_len = skb->len;
-		}
+	if (!(wire_len % usb_maxpacket(usb->udev, usb->bulk_out_pipe)))
+		extra = 1;
+#endif
+	transfer_len = wire_len + extra;
+#ifdef CONFIG_USB_NO_TRANS_DMA_MAP
+	if (transfer_len > DATA_BUF_MAX) {
+		ret = -EMSGSIZE;
+		goto drop;
 	}
 #endif
-
 #ifdef CONFIG_USB_ALIGN_DATA
-    #if defined CONFIG_USB_NO_TRANS_DMA_MAP
-    #error "CONFIG_USB_NO_TRANS_DMA_MAP not supported"
-    #endif
-#if 0
-	usb_buf->usb_align_data = (u8*)kmalloc(sizeof(u8) * buf_len + align_param, GFP_ATOMIC);
-
-	align = ((unsigned long)(usb_buf->usb_align_data)) & (align_param - 1);
-	memcpy(usb_buf->usb_align_data + (align_param - align), buf, buf_len);
-
-    usb_fill_bulk_urb(usb_buf->urb, usb_dev->udev, usb_dev->bulk_out_pipe,
-                usb_buf->usb_align_data + (align_param - align), buf_len, aicwf_usb_tx_complete, usb_buf);
-#else
-    if (!IS_ALIGNED((unsigned long)buf, align_param)) {
-        usb_buf->usb_align_data = (u8*)kmalloc(sizeof(u8) * buf_len + align_param, GFP_ATOMIC);
-        if (usb_buf->usb_align_data) {
-            align = ((unsigned long)(usb_buf->usb_align_data)) & (align_param - 1);
-            buf_align = usb_buf->usb_align_data + (align_param - align);
-            memcpy(buf_align, buf, buf_len);
-        }
-    } else {
-        buf_align = buf;
-    }
-
-    usb_fill_bulk_urb(usb_buf->urb, usb_dev->udev, usb_dev->bulk_out_pipe,
-                buf_align, buf_len, aicwf_usb_tx_complete, usb_buf);
+	if (!is_power_of_2(alignment) || alignment > PAGE_SIZE) {
+		ret = -EINVAL;
+		goto drop;
+	}
 #endif
-#else
-	usb_fill_bulk_urb(usb_buf->urb, usb_dev->udev, usb_dev->bulk_out_pipe,
-			buf, buf_len, aicwf_usb_tx_complete, usb_buf);
-#endif
+	usb_buf = aicwf_usb_tx_dequeue(usb, &usb->tx_free_list,
+				     &usb->tx_free_count, &usb->tx_free_lock);
+	if (!usb_buf)
+		goto drop;
+	usb_buf->skb = NULL;
+	usb_buf->tx_data = NULL;
+	usb_buf->usb_align_data = NULL;
+	usb_buf->cfm = sw->need_cfm;
+	usb_buf->cfm_tag = sw->desc.host.status_desc_addr & 0x3fffffff;
 
-    #if defined CONFIG_USB_NO_TRANS_DMA_MAP
-    usb_buf->urb->transfer_dma = usb_buf->data_dma_trans_addr;
-    usb_buf->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-    #endif
+	/* Complete every fallible preparation step before relinquishing sw. */
+	if (skb_linearize(skb))
+		goto recycle;
+	if (!sw->need_cfm && extra && skb_tailroom(skb) < extra &&
+	    pskb_expand_head(skb, 0, extra, GFP_ATOMIC))
+		goto recycle;
+#ifdef CONFIG_USB_NO_TRANS_DMA_MAP
+	buf = usb_buf->data_buf;
+#else
+	if (sw->need_cfm) {
+		usb_buf->tx_data = kzalloc(transfer_len, GFP_ATOMIC);
+		if (!usb_buf->tx_data)
+			goto recycle;
+		buf = usb_buf->tx_data;
+	} else {
+		buf = skb->data + sw->headroom - sizeof(struct txdesc_api) - 4;
+	}
+#endif
+	wire = buf;
+#ifdef CONFIG_USB_ALIGN_DATA
+	if (!IS_ALIGNED((unsigned long)buf, alignment)) {
+		usb_buf->usb_align_data = kmalloc(transfer_len + alignment - 1,
+						 GFP_ATOMIC);
+		if (!usb_buf->usb_align_data)
+			goto recycle;
+		wire = PTR_ALIGN(usb_buf->usb_align_data, alignment);
+	}
+#endif
+	usb_tx_flow_ctrl((struct rwnx_txhdr *)skb->data, usb, hw);
+	if (sw->need_cfm) {
+		memcpy(buf + 4, &sw->desc, sizeof(sw->desc));
+		memcpy(buf + 4 + sizeof(sw->desc), skb->data + sw->headroom,
+		       payload_len);
+		memset(buf + 4 + sizeof(sw->desc) + payload_len, 0,
+		       transfer_len - 4 - sizeof(sw->desc) - payload_len);
+	} else {
+		skb_pull(skb, sw->headroom);
+		memcpy(skb_push(skb, sizeof(sw->desc)), &sw->desc, sizeof(sw->desc));
+		skb_push(skb, 4);
+		if (extra)
+			*(u8 *)skb_put(skb, 1) = 0;
+#ifdef CONFIG_USB_NO_TRANS_DMA_MAP
+		memcpy(buf, skb->data, transfer_len);
+#endif
+		usb_buf->skb = skb;
+		/* No radio confirmation follows: retire host bookkeeping now. */
+		rwnx_txq_confirm_any(hw, sw->txq, &hw->hwq[sw->hw_queue], sw);
+		sw->rwnx_vif->net_stats.tx_packets++;
+		sw->rwnx_vif->net_stats.tx_bytes += sw->frame_len;
+		hw->stats.last_tx = jiffies;
+		kmem_cache_free(hw->sw_txhdr_cache, sw);
+	}
+	buf[0] = wire_len & 0xff;
+	buf[1] = (wire_len >> 8) & 0x0f;
+	buf[2] = 0x01;
+	buf[3] = 0;
+	if (wire != buf)
+		memcpy(wire, buf, transfer_len);
+	usb_fill_bulk_urb(usb_buf->urb, usb->udev, usb->bulk_out_pipe,
+			  wire, transfer_len, aicwf_usb_tx_complete, usb_buf);
+	usb_buf->urb->transfer_flags = 0;
+#ifdef CONFIG_USB_NO_TRANS_DMA_MAP
+	usb_buf->urb->transfer_dma = usb_buf->data_dma_trans_addr;
+	usb_buf->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+#endif
 #ifdef CONFIG_USE_USB_ZERO_PACKET
-    usb_buf->urb->transfer_flags |= URB_ZERO_PACKET;
+	usb_buf->urb->transfer_flags |= URB_ZERO_PACKET;
 #endif
-
-    aicwf_usb_tx_queue(usb_dev, &usb_dev->tx_post_list, usb_buf,
-                    &usb_dev->tx_post_count, &usb_dev->tx_post_lock);
-
+	aicwf_usb_tx_queue(usb, &usb->tx_post_list, usb_buf,
+			   &usb->tx_post_count, &usb->tx_post_lock);
 #ifdef CONFIG_TX_TASKLET
-	tasklet_schedule(&usb_dev->xmit_tasklet);
+	tasklet_schedule(&usb->xmit_tasklet);
 #else
-	complete(&bus_if->bustx_trgg);
+	complete(&bus->bustx_trgg);
 #endif
+	ret = 0;
+	goto flow_ctrl;
 
-    ret = 0;
-
-    flow_ctrl:
-    spin_lock_irqsave(&usb_dev->tx_flow_lock, flags);
-    if (usb_dev->tx_free_count < AICWF_USB_TX_LOW_WATER) {
-		AICWFDBG(LOGDEBUG, "usb_dev->tx_free_count < AICWF_USB_TX_LOW_WATER:%d\r\n",
-			usb_dev->tx_free_count);
-        usb_dev->tbusy = true;
-        aicwf_usb_tx_flowctrl(usb_dev->rwnx_hw, true);
-    }
-    spin_unlock_irqrestore(&usb_dev->tx_flow_lock, flags);
-
-    return ret;
+recycle:
+	kfree(usb_buf->tx_data);
+	kfree(usb_buf->usb_align_data);
+	usb_buf->tx_data = NULL;
+	usb_buf->usb_align_data = NULL;
+	usb_buf->cfm = false;
+	aicwf_usb_tx_queue(usb, &usb->tx_free_list, usb_buf,
+			   &usb->tx_free_count, &usb->tx_free_lock);
+drop:
+	if (sw->need_cfm)
+		aicwf_usb_host_txdesc_take(&hw->usb_env,
+					 sw->desc.host.status_desc_addr & 0x3fffffff);
+	rwnx_usb_tx_drop(hw, skb);
+flow_ctrl:
+	spin_lock_irqsave(&usb->tx_flow_lock, flags);
+	if (usb->tx_free_count < AICWF_USB_TX_LOW_WATER && !usb->tx_stopping) {
+		usb->tbusy = true;
+		aicwf_usb_tx_flowctrl(hw, true);
+	}
+	spin_unlock_irqrestore(&usb->tx_flow_lock, flags);
+	return ret;
 }
 #endif
 static int aicwf_usb_bus_start(struct device *dev)
@@ -1893,42 +1898,49 @@ static int aicwf_usb_bus_start(struct device *dev)
     }
 }
 
+/* Idempotent final TX shutdown, while hw, vifs and the slab cache still exist. */
+void aicwf_usb_tx_stop(struct aic_usb_dev *usb_dev)
+{
+	struct rwnx_hw *hw = usb_dev->rwnx_hw;
+	struct aicwf_bus *bus = usb_dev->bus_if;
+	struct aicwf_usb_buf *usb_buf;
+
+	if (READ_ONCE(usb_dev->tx_stopping))
+		return;
+	if (hw)
+		spin_lock_bh(&hw->tx_lock);
+	WRITE_ONCE(usb_dev->tx_stopping, true);
+	if (hw)
+		spin_unlock_bh(&hw->tx_lock);
+	if (bus->bustx_thread) {
+		complete_all(&bus->bustx_trgg);
+		kthread_stop(bus->bustx_thread);
+		bus->bustx_thread = NULL;
+	}
+#ifdef CONFIG_TX_TASKLET
+	tasklet_kill(&usb_dev->xmit_tasklet);
+#endif
+	usb_kill_anchored_urbs(&usb_dev->tx_submitted);
+	/* Unsubmitted entries have no USB callback to release them. */
+	while ((usb_buf = aicwf_usb_tx_dequeue(usb_dev, &usb_dev->tx_post_list,
+					      &usb_dev->tx_post_count,
+					      &usb_dev->tx_post_lock)))
+		aicwf_usb_tx_finish(usb_buf, -ESHUTDOWN);
+#ifndef CONFIG_USB_TX_AGGR
+	flush_work(&usb_dev->tx_failed_work);
+#endif
+	if (hw && hw->usb_env.pthis) {
+		spin_lock_bh(&hw->tx_lock);
+		aicwf_usb_host_txdesc_flush(&hw->usb_env);
+		spin_unlock_bh(&hw->tx_lock);
+	}
+}
+
 static void aicwf_usb_cancel_all_urbs_(struct aic_usb_dev *usb_dev)
 {
-    struct aicwf_usb_buf *usb_buf, *tmp;
-    unsigned long flags;
-
-    if (usb_dev->msg_out_urb)
-        usb_kill_urb(usb_dev->msg_out_urb);
-
-    spin_lock_irqsave(&usb_dev->tx_post_lock, flags);
-    list_for_each_entry_safe(usb_buf, tmp, &usb_dev->tx_post_list, list) {
-        spin_unlock_irqrestore(&usb_dev->tx_post_lock, flags);
-        if (!usb_buf->urb) {
-            usb_err("bad usb_buf\n");
-            spin_lock_irqsave(&usb_dev->tx_post_lock, flags);
-            break;
-        }
-        usb_kill_urb(usb_buf->urb);
-        #if defined CONFIG_USB_NO_TRANS_DMA_MAP
-        // free dma buf if needed
-        if (usb_buf->data_buf) {
-            #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
-            usb_free_coherent(usb_buf->usbdev->udev, DATA_BUF_MAX, usb_buf->data_buf, usb_buf->data_dma_trans_addr);
-            #else
-            usb_buffer_free(usb_buf->usbdev->udev, DATA_BUF_MAX, usb_buf->data_buf, usb_buf->data_dma_trans_addr);
-            #endif
-            usb_buf->data_buf = NULL;
-            usb_buf->data_dma_trans_addr = 0x0;
-        } else {
-            usb_err("bad usb dma buf\n");
-            spin_lock_irqsave(&usb_dev->tx_post_lock, flags);
-            break;
-        }
-        #endif
-        spin_lock_irqsave(&usb_dev->tx_post_lock, flags);
-    }
-    spin_unlock_irqrestore(&usb_dev->tx_post_lock, flags);
+	aicwf_usb_tx_stop(usb_dev);
+	if (usb_dev->msg_out_urb)
+		usb_kill_urb(usb_dev->msg_out_urb);
 
     usb_kill_anchored_urbs(&usb_dev->rx_submitted);
 #ifdef CONFIG_USB_MSG_IN_EP
@@ -1957,6 +1969,43 @@ static void aicwf_usb_bus_stop(struct device *dev)
 
     aicwf_usb_state_change(usb_dev, USB_DOWN_ST);
     //aicwf_usb_cancel_all_urbs(usb_dev);//AIDEN
+}
+
+/* Keep transport callbacks from outliving the wiphy and its private state. */
+void aicwf_usb_rx_stop(struct aic_usb_dev *usb)
+{
+	struct aicwf_bus *bus = usb->bus_if;
+
+	aicwf_usb_state_change(usb, USB_DOWN_ST);
+	cancel_work_sync(&usb->rx_urb_work);
+#ifdef CONFIG_USB_MSG_IN_EP
+	if (usb->msg_in_pipe)
+		cancel_work_sync(&usb->msg_rx_urb_work);
+#endif
+	usb_kill_anchored_urbs(&usb->rx_submitted);
+#ifdef CONFIG_USB_MSG_IN_EP
+	if (usb->msg_in_pipe)
+		usb_kill_anchored_urbs(&usb->msg_rx_submitted);
+#endif
+#ifdef CONFIG_RX_TASKLET
+	tasklet_kill(&usb->recv_tasklet);
+#endif
+	if (bus->busrx_thread) {
+		complete_all(&bus->busrx_trgg);
+		kthread_stop(bus->busrx_thread);
+		bus->busrx_thread = NULL;
+	}
+#ifdef CONFIG_USB_MSG_IN_EP
+	if (bus->msg_busrx_thread) {
+		complete_all(&bus->msg_busrx_trgg);
+		kthread_stop(bus->msg_busrx_thread);
+		bus->msg_busrx_thread = NULL;
+	}
+#endif
+	if (usb->rx_priv) {
+		aicwf_rx_deinit(usb->rx_priv);
+		usb->rx_priv = NULL;
+	}
 }
 
 static void aicwf_usb_deinit(struct aic_usb_dev *usbdev)
@@ -1999,6 +2048,12 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
 
     init_waitqueue_head(&usb_dev->msg_wait);
     init_usb_anchor(&usb_dev->rx_submitted);
+	init_usb_anchor(&usb_dev->tx_submitted);
+#ifndef CONFIG_USB_TX_AGGR
+	INIT_LIST_HEAD(&usb_dev->tx_failed_list);
+	spin_lock_init(&usb_dev->tx_failed_lock);
+	INIT_WORK(&usb_dev->tx_failed_work, aicwf_usb_tx_failed_work);
+#endif
 #ifdef CONFIG_USB_MSG_IN_EP
 	if(usb_dev->msg_in_pipe){
 		init_usb_anchor(&usb_dev->msg_rx_submitted);
