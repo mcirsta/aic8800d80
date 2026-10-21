@@ -437,7 +437,9 @@ u16 rwnx_select_txq(struct rwnx_vif *rwnx_vif, struct sk_buff *skb)
            for AP interface, select BCMC queue
            (TODO: select another queue if BCMC queue is stopped) */
         skb->priority = PRIO_STA_NULL;
-        netdev_queue = nx_bcmc_txq_ndev_idx;
+		/* Monitor open starts queue zero, not the AP BCMC queue. */
+		netdev_queue = RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_MONITOR ?
+			       0 : nx_bcmc_txq_ndev_idx;
     }
     
 #ifndef CONFIG_ONE_TXQ
