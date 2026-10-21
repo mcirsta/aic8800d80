@@ -74,7 +74,7 @@ struct tcp_ack_manage {
 	unsigned int ack_winsize;
 };
 
-struct msg_buf *intf_tcp_alloc_msg(struct msg_buf *msg);
+struct msg_buf *intf_tcp_alloc_msg(void);
 
 void tcp_ack_init(struct rwnx_hw *priv);
 

@@ -3,15 +3,9 @@
 //#include "aicwf_tcp_ack.h"
 #include"rwnx_defs.h"
 extern int intf_tx(struct rwnx_hw *priv,struct msg_buf *msg);
-struct msg_buf *intf_tcp_alloc_msg(struct msg_buf *msg)
+struct msg_buf *intf_tcp_alloc_msg(void)
 {
-	//printk("%s \n",__func__);
-	int len=sizeof(struct msg_buf) ;
-	msg = kzalloc(len , GFP_ATOMIC);
-	if(!msg)
-		printk("%s: alloc failed \n", __func__);
-	memset(msg,0,len);
-	return msg;
+	return kzalloc(sizeof(struct msg_buf), GFP_ATOMIC);
 }
 						
 void intf_tcp_drop_msg(struct rwnx_hw *priv,

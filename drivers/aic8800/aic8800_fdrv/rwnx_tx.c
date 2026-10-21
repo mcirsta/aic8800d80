@@ -1470,16 +1470,17 @@ netdev_tx_t rwnx_start_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb->priority = 0;
 
 #ifdef CONFIG_FILTER_TCP_ACK
-	if(cpu_to_le16(skb->len) <= MAX_TCP_ACK){
-        msgbuf=intf_tcp_alloc_msg(msgbuf);
-        msgbuf->rwnx_vif=rwnx_vif;
-        msgbuf->skb=skb;
-        if(filter_send_tcp_ack(rwnx_hw,msgbuf,skb->data,cpu_to_le16(skb->len))){
-            return NETDEV_TX_OK;
-        }else{
-            move_tcpack_msg(rwnx_hw,msgbuf);
-            kfree(msgbuf);
-        }
+	if (skb->len <= MAX_TCP_ACK) {
+		msgbuf = intf_tcp_alloc_msg();
+		/* Filtering is optional: transmit normally under memory pressure. */
+		if (msgbuf) {
+			msgbuf->rwnx_vif = rwnx_vif;
+			msgbuf->skb = skb;
+			if (filter_send_tcp_ack(rwnx_hw, msgbuf, skb->data, skb->len))
+				return NETDEV_TX_OK;
+			move_tcpack_msg(rwnx_hw, msgbuf);
+			kfree(msgbuf);
+		}
 	}
 #endif
     memcpy(&eth_t, skb->data, sizeof(struct ethhdr));
