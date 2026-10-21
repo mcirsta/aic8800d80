@@ -2300,7 +2300,8 @@ netdev_tx_t rwnx_start_monitor_if_xmit(struct sk_buff *skb, struct net_device *d
     txhdr = (struct rwnx_txhdr *)skb_mgmt->data;
     txhdr->hw_hdr.cfm.status.value = 0;
     /* Fill the SW TX Header */
-    sw_txhdr = kmem_cache_alloc(rwnx_hw->sw_txhdr_cache, GFP_ATOMIC);
+	/* Raw frames do not populate every normal Ethernet TX descriptor field. */
+	sw_txhdr = kmem_cache_zalloc(rwnx_hw->sw_txhdr_cache, GFP_ATOMIC);
     if (unlikely(sw_txhdr == NULL)) {
         dev_kfree_skb(skb_mgmt);
         AICWFDBG(LOGERROR, "sw_txhdr alloc fail\n");
