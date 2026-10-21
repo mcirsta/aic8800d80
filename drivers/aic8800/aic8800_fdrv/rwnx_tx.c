@@ -2035,6 +2035,10 @@ netdev_tx_t rwnx_start_monitor_if_xmit(struct sk_buff *skb, struct net_device *d
     bool offchan = false;
     int nx_off_chan_txq_idx = NX_OFF_CHAN_TXQ_IDX;
 
+	/* The raw-frame copy below requires a linear skb and a 16-bit length. */
+	if (unlikely(skb->len > U16_MAX || skb_linearize(skb)))
+		goto free_tag;
+	rtap_buf = skb->data;
     frame_len = skb->len;
 
     if (unlikely(skb->len < sizeof(*rtap_hdr))) {
@@ -2068,6 +2072,9 @@ netdev_tx_t rwnx_start_monitor_if_xmit(struct sk_buff *skb, struct net_device *d
     }
     frame_len -= rtap_len;
     pframe = rtap_buf + rtap_len;
+	if (frame_len < sizeof(__le16) ||
+	    frame_len < ieee80211_hdrlen(cpu_to_le16(get_unaligned_le16(pframe))))
+		goto free_tag;
 
     // Parse radiotap for injection items and overwrite attribs as needed
     ret = ieee80211_radiotap_iterator_init(&iterator, rtap_hdr, rtap_len, NULL);
@@ -2232,6 +2239,10 @@ netdev_tx_t rwnx_start_monitor_if_xmit(struct sk_buff *skb, struct net_device *d
                 break;
         }
     }
+
+	/* Only -ENOENT means the complete radiotap header was valid. */
+	if (ret != -ENOENT)
+		goto free_tag;
 
     #if 0
     // dump buffer
