@@ -1,4 +1,5 @@
 #include <linux/etherdevice.h>
+#include <linux/hex.h>
 #include <linux/netdevice.h>
 #include <net/netlink.h>
 #include <linux/wireless.h>
@@ -32,8 +33,6 @@
 	#define IW_QUAL_LEVEL_UPDATED  0x2
 	#define IW_QUAL_NOISE_UPDATED  0x4
 #endif
-
-#define MAX_WPA_IE_LEN (256)
 
 
 /*				20/40/80,	ShortGI,	MCS Rate  */
@@ -393,514 +392,267 @@ static int aicwf_get_range(struct net_device *dev,
 }
 
 
-static char *aicwf_get_iwe_stream_mac_addr(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
+static const u8 *aicwf_wext_scan_ie(const struct scanu_result_wext *entry,
+				   u8 id, u8 min_len)
 {
-	/*  AP MAC address */
-	iwe->cmd = SIOCGIWAP;
-	iwe->u.ap_addr.sa_family = ARPHRD_ETHER;
+	const u8 *ie = cfg80211_find_ie(id, entry->ies, entry->ies_len);
 
-	if(scan_re->bss){
-	memcpy(iwe->u.ap_addr.sa_data, scan_re->bss->bssid, ETH_ALEN);
-	}
-
-	start = iwe_stream_add_event(info, start, stop, iwe, IW_EV_ADDR_LEN);
-	return start;
+	return ie && ie[1] >= min_len ? ie : NULL;
 }
 
-
-static inline char *aicwf_get_iwe_stream_essid(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
+static bool aicwf_wext_scan_has_he(const struct scanu_result_wext *entry)
 {
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
-	const u8 *ie = mgmt->u.beacon.variable;
-	u8 *ssid;
-	int ssid_len = 0;
+	const u8 *ie = entry->ies;
+	size_t left = entry->ies_len;
 
-	//get ssid len form ie
-	ssid_len = ie[1];
-
-	//get ssid form ie
-	ssid = (u8*)vmalloc(sizeof(char)* (ssid_len + 1));
-	memset(ssid, 0, (ssid_len + 1));
-	memcpy(ssid, &ie[2], ssid_len);
-
-	
-	//AICWFDBG(LOGDEBUG, "%s len:%d ssid:%s\r\n", __func__, ssid_len, ssid);
-
-	/* Add the ESSID */
-	iwe->cmd = SIOCGIWESSID;
-	iwe->u.data.flags = 1;
-	iwe->u.data.length = min((u16)ssid_len, (u16)32);
-	start = iwe_stream_add_point(info, start, stop, iwe, ssid);
-
-	vfree(ssid);
-
-	return start;
+	while (left >= 2 && ie[1] <= left - 2) {
+		/* Extension ID, MAC/PHY capabilities and the mandatory MCS maps. */
+		if (ie[0] == WLAN_EID_EXTENSION && ie[1] >= 22 &&
+		    ie[2] == WLAN_EID_EXT_HE_CAPABILITY)
+			return true;
+		left -= ie[1] + 2;
+		ie += ie[1] + 2;
+	}
+	return false;
 }
 
-
-
-static inline char *aicwf_get_iwe_stream_protocol(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
+static u32 aicwf_wext_scan_rate(const struct scanu_result_wext *entry)
 {
-	u16 ht_cap = false; 
-	u16 vht_cap = false;
-	u16 he_cap = false;
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
-	u8 *payload = mgmt->u.beacon.variable;
-	const u8 *ie_content;
+	struct rate_info rate = {};
+	const struct ieee80211_ht_cap *ht;
+	const struct ieee80211_vht_cap *vht;
+	const u8 *ie;
+	u32 max_rate = 0;
+	u32 value;
+	u16 cap = 0, map;
+	int i, j;
 
-	/* parsing HT_CAP_IE	 */
-	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, payload, scan_re->ind->length);
-	if (ie_content != NULL){
-		ht_cap = true;
+	for (i = 0; i < 2; i++) {
+		ie = aicwf_wext_scan_ie(entry, i ? WLAN_EID_EXT_SUPP_RATES :
+					WLAN_EID_SUPP_RATES, 1);
+		if (!ie)
+			continue;
+		for (j = 0; j < ie[1]; j++)
+			max_rate = max(max_rate, (ie[j + 2] & 0x7f) * 500000U);
 	}
 
-	/* parsing VHT_CAP_IE	 */
-	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_VHT_CAPABILITY, payload, scan_re->ind->length);
-	if (ie_content != NULL){
-		vht_cap = true;
-	}
-	
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)|| defined(CONFIG_HE_FOR_OLD_KERNEL)
-	/* parsing HE_CAP_IE	 */
-	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_EXTENSION, payload, scan_re->ind->length);
-	if (ie_content != NULL && ie_content[2] == WLAN_EID_EXT_HE_CAPABILITY){
-		he_cap = true;
-	}
-#endif
-
-	/* Add the protocol name */
-	iwe->cmd = SIOCGIWNAME;
-
-	if (ieee80211_frequency_to_channel(scan_re->ind->center_freq) > 14) {
-		if (he_cap == true){
-			snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11ax");
-		}else if(vht_cap == true){
-			snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11ac");
-		}else{
-			if (ht_cap == true)
-				snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11an");
-			else
-				snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11a");
-		}
-	} else {
-		if(he_cap == true){
-			snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11ax");
-		}else if (ht_cap == true){
-			snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11bgn");
-		}else{
-			snprintf(iwe->u.name, IFNAMSIZ, "IEEE 802.11bg");
-		}
-	}
-	
-	start = iwe_stream_add_event(info, start, stop, iwe, IW_EV_CHAR_LEN);
-	return start;
-}
-
-
-
-static inline char *aicwf_get_iwe_stream_rssi(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
-{
-	iwe->cmd = IWEVQUAL;
-
-	iwe->u.qual.updated = IW_QUAL_QUAL_UPDATED | IW_QUAL_LEVEL_UPDATED
-		| IW_QUAL_NOISE_INVALID
-		| IW_QUAL_DBM;
-
-	iwe->u.qual.level = (u8)scan_re->ind->rssi;
-	iwe->u.qual.qual = 100;//scan_re->bss->signal;
-	iwe->u.qual.noise = 0;
-	
-	start = iwe_stream_add_event(info, start, stop, iwe, IW_EV_QUAL_LEN);
-	
-	return start;
-}
-
-static inline char *aicwf_get_iwe_stream_chan(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
-{
-	/* Add frequency/channel */
-	iwe->cmd = SIOCGIWFREQ;
-	iwe->u.freq.m = scan_re->ind->center_freq * 100000;
-	iwe->u.freq.e = 1;
-	iwe->u.freq.i = ieee80211_frequency_to_channel(scan_re->ind->center_freq);
-	start = iwe_stream_add_event(info, start, stop, iwe, IW_EV_FREQ_LEN);
-
-	return start;
-}
-
-
-static inline char *aicwf_get_iwe_stream_mode(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
-{
-
-	u16 cap = scan_re->bss->capability;
-	/* Add mode */
-	if (cap & (WLAN_CAPABILITY_IBSS | WLAN_CAPABILITY_ESS)) {
-		iwe->cmd = SIOCGIWMODE;
-		if (cap & WLAN_CAPABILITY_ESS)
-			iwe->u.mode = IW_MODE_MASTER;
-		else
-			iwe->u.mode = IW_MODE_ADHOC;
-
-		start = iwe_stream_add_event(info, start, stop, iwe, IW_EV_UINT_LEN);
-	}
-	return start;
-
-}
-
-static inline char *aicwf_get_iwe_stream_encryption(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
-{
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
-	const u8 *ie = mgmt->u.beacon.variable;
-	u16 cap = scan_re->bss->capability;
-	u8 *ssid;
-	int ssid_len = 0;
-
-	//get ssid len form ie
-	ssid_len = ie[1];
-
-	//get ssid form ie
-	ssid = (u8*)vmalloc(sizeof(char)* (ssid_len + 1));
-	memset(ssid, 0, (ssid_len + 1));
-	memcpy(ssid, &ie[2], ssid_len);
-
-	
-	/* Add encryption capability */
-	iwe->cmd = SIOCGIWENCODE;
-	if (cap & WLAN_CAPABILITY_PRIVACY)
-		iwe->u.data.flags = IW_ENCODE_ENABLED | IW_ENCODE_NOKEY;
-	else
-		iwe->u.data.flags = IW_ENCODE_DISABLED;
-	iwe->u.data.length = 0;
-	start = iwe_stream_add_point(info, start, stop, iwe, ssid);
-	vfree(ssid);
-	
-	return start;
-
-}
-
-static inline char *aicwf_get_iwe_stream_rate(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
-{
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
-	u8 *payload = mgmt->u.beacon.variable;
-	const u8 *ie_content;
-	
-	u16 mcs_rate = 0;
-	u8 bw_40MHz = 0;
-	u8 short_GI = 0;
-	u16 max_rate = 0;
-	u8 bw_160MHz = 0;
-	
-	u16 ht_cap = false;
-	struct ieee80211_ht_cap *ht_capie;
-	
-	u16 vht_cap = false;
-	u8 tx_mcs_map[2];
-	u8 tx_mcs_index = 0;
-	u16 vht_data_rate = 0;
-
-	u16 he_cap = false;
-	u8 he_bw = 0;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)|| defined(CONFIG_HE_FOR_OLD_KERNEL)
-	u8 he_ch_width_set = 0;
-#endif
-
-	/* parsing HT_CAP_IE	 */
-	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_HT_CAPABILITY, payload, scan_re->ind->length);
-	if (ie_content != NULL){
-		ht_cap = true;
-		ht_capie = (struct ieee80211_ht_cap *)(ie_content + 2);
-		bw_40MHz = (ht_capie->cap_info & NL80211_CHAN_WIDTH_40) ? 1 : 0;
-		short_GI = (ht_capie->cap_info & (IEEE80211_HT_CAP_SGI_20 | IEEE80211_HT_CAP_SGI_40)) ? 1 : 0;
-		memcpy(&mcs_rate, ht_capie->mcs.rx_mask, 2);
-	}
-
-
-
-	/* parsing VHT_CAP_IE	 */
-	ie_content = NULL;
-	ie_content = cfg80211_find_ie(WLAN_EID_VHT_CAPABILITY, payload, scan_re->ind->length);
-	if (ie_content != NULL){
-		
-		vht_cap = true;
-		bw_160MHz = ((*(u8*)(ie_content + 2)) >> 2) & ((u8)(0xFF >> (8 - (2))));
-		if (bw_160MHz){
-			short_GI = ((*(u8*)(ie_content + 2)) >> 6) & ((u8)(0xFF >> (8 - (1))));
-		}else{
-			short_GI = ((*(u8*)(ie_content + 2)) >> 5) & ((u8)(0xFF >> (8 - (1))));
-		}
-
-		memcpy(tx_mcs_map, ((ie_content + 2)+8), 2);
-
-		tx_mcs_index = (tx_mcs_map[0] & 0x0F) - 1;
-		if(ieee80211_frequency_to_channel(scan_re->ind->center_freq) > 14){
-			vht_data_rate = VHT_MCS_DATA_RATE[2][short_GI][tx_mcs_index];
-		}else{
-			vht_data_rate = VHT_MCS_DATA_RATE[1][short_GI][tx_mcs_index];
-		}
-		//TO DO:
-		//need to counter antenna number for AC
-	}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)|| defined(CONFIG_HE_FOR_OLD_KERNEL)
-	/* parsing HE_CAP_IE	 */
-	ie_content = NULL;
-	/*0xFF+len+WLAN_EID_EXTENSION+playload */
-	ie_content = cfg80211_find_ie(WLAN_EID_EXTENSION, payload, scan_re->ind->length);
-	if (ie_content != NULL && ie_content[2] == WLAN_EID_EXT_HE_CAPABILITY){
-		he_cap = true;
-		he_ch_width_set = ie_content[8];
-		if(he_ch_width_set & IEEE80211_HE_CH_BW_SET_160_80P80){
-			he_bw = NL80211_CHAN_WIDTH_80;
-		}else if(he_ch_width_set & IEEE80211_HE_CH_BW_SET_160_IN_5G){
-			he_bw = NL80211_CHAN_WIDTH_160;
-		}else if(he_ch_width_set & IEEE80211_HE_CH_BW_SET_40_AND_80_IN_5G){
-			he_bw = NL80211_CHAN_WIDTH_40;
-		}else if(he_ch_width_set & IEEE80211_HE_CH_BW_SET_40_IN_2_4G){
-			he_bw = NL80211_CHAN_WIDTH_40;
-		}else{
-			he_bw = NL80211_CHAN_WIDTH_20;
-		}
-		//TO DO:
-		//need to counter antenna number for AX
-	}
-#endif
-
-	if(he_cap == true){
-		if(he_bw == NL80211_CHAN_WIDTH_20){
-			max_rate = 144;
-		}else if(he_bw == NL80211_CHAN_WIDTH_40){
-			max_rate = 287;
-		}else if(he_bw == NL80211_CHAN_WIDTH_80){
-			max_rate = 601;
-		}else if(he_bw == NL80211_CHAN_WIDTH_160){
-			max_rate = 1147;
-		}
-		max_rate = max_rate * 2;
-	}else if(vht_cap == true){
-		max_rate = vht_data_rate;
-	}else if (ht_cap == true) {
-		if (mcs_rate & 0x8000) /* MCS15 */
-			max_rate = (bw_40MHz) ? ((short_GI) ? 300 : 270) : ((short_GI) ? 144 : 130);
-	
-		else if (mcs_rate & 0x0080) /* MCS7 */
-			max_rate = (bw_40MHz) ? ((short_GI) ? 150 : 135) : ((short_GI) ? 72 : 65);
-		else { /* default MCS7 */
-			max_rate = (bw_40MHz) ? ((short_GI) ? 150 : 135) : ((short_GI) ? 72 : 65);
+	ie = aicwf_wext_scan_ie(entry, WLAN_EID_HT_CAPABILITY, sizeof(*ht));
+	if (ie) {
+		ht = (const void *)(ie + 2);
+		cap = le16_to_cpu(ht->cap_info);
+		rate.flags = RATE_INFO_FLAGS_MCS;
+		rate.bw = cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40 ?
+			RATE_INFO_BW_40 : RATE_INFO_BW_20;
+		if (cap & (rate.bw == RATE_INFO_BW_40 ? IEEE80211_HT_CAP_SGI_40 :
+						     IEEE80211_HT_CAP_SGI_20))
+			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+		/* Equal-modulation HT MCS rates supported by cfg80211. */
+		for (i = 0; i < 32; i++) {
+			if (!(ht->mcs.rx_mask[i / 8] & BIT(i % 8)))
+				continue;
+			rate.mcs = i;
+			value = cfg80211_calculate_bitrate(&rate);
+			if (value <= INT_MAX / 100000U)
+				max_rate = max(max_rate, value * 100000U);
 		}
 	}
 
-	iwe->cmd = SIOCGIWRATE;
-	iwe->u.bitrate.fixed = iwe->u.bitrate.disabled = 0;
-	iwe->u.bitrate.value = max_rate * 1000000;
-	start = iwe_stream_add_event(info, start, stop, iwe, IW_EV_PARAM_LEN);
-	return start ;
-}
-
-
-
-int aic_get_sec_ie(u8 *in_ie, uint in_len, u8 *rsn_ie, u16 *rsn_len, u8 *wpa_ie, u16 *wpa_len)
-{
-
-	u8 authmode;
-	u8 sec_idx;
-	u8 wpa_oui[4] = {0x00, 0x50, 0xf2, 0x01};
-	uint cnt = 0;
-
-	/* Search required WPA or WPA2 IE and copy to sec_ie[ ] */
-
-	cnt = 0;
-
-	sec_idx = 0;
-
-	while (cnt < in_len) {
-		authmode = in_ie[cnt];
-
-		if ((authmode == 0xdd/*_WPA_IE_ID_*/) && (memcmp(&in_ie[cnt + 2], &wpa_oui[0], 4) == 0)) {
-			if (wpa_ie)
-				memcpy(wpa_ie, &in_ie[cnt], in_ie[cnt + 1] + 2);
-
-			*wpa_len = in_ie[cnt + 1] + 2;
-			cnt += in_ie[cnt + 1] + 2; /* get next */
-		} else {
-			if (authmode == 0x30/*_WPA2_IE_ID_*/) {
-				if (rsn_ie)
-					memcpy(rsn_ie, &in_ie[cnt], in_ie[cnt + 1] + 2);
-
-				*rsn_len = in_ie[cnt + 1] + 2;
-				cnt += in_ie[cnt + 1] + 2; /* get next */
-			} else {
-				cnt += in_ie[cnt + 1] + 2; /* get next */
-			}
+	ie = aicwf_wext_scan_ie(entry, WLAN_EID_VHT_CAPABILITY, sizeof(*vht));
+	if (ie) {
+		vht = (const void *)(ie + 2);
+		rate.flags = RATE_INFO_FLAGS_VHT_MCS;
+		rate.bw = entry->center_freq > 4000 ? RATE_INFO_BW_80 :
+			  cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40 ?
+			  RATE_INFO_BW_40 : RATE_INFO_BW_20;
+		if ((rate.bw == RATE_INFO_BW_80 &&
+		     (le32_to_cpu(vht->vht_cap_info) & IEEE80211_VHT_CAP_SHORT_GI_80)) ||
+		    (rate.bw == RATE_INFO_BW_40 && (cap & IEEE80211_HT_CAP_SGI_40)) ||
+		    (rate.bw == RATE_INFO_BW_20 && (cap & IEEE80211_HT_CAP_SGI_20)))
+			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+		map = le16_to_cpu(vht->supp_mcs.rx_mcs_map);
+		for (i = 0; i < 8; i++) {
+			j = (map >> (2 * i)) & 3;
+			if (j == 3)
+				continue;
+			rate.mcs = 7 + j;
+			rate.nss = i + 1;
+			value = cfg80211_calculate_bitrate(&rate);
+			if (value <= INT_MAX / 100000U)
+				max_rate = max(max_rate, value * 100000U);
 		}
-
 	}
-
-
-	return *rsn_len + *wpa_len;
-
+	/* A scan result is not a negotiated rate; do not invent an HE bitrate. */
+	return max_rate;
 }
 
-
-static inline char *aicwf_get_iwe_stream_wpa_wpa2(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
+static int aicwf_wext_scan_event(struct iw_request_info *info, char **stream,
+				 char *end, struct iw_event *iwe, int len)
 {
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
-	u8 *payload = mgmt->u.beacon.variable;
-	int buf_size = MAX_WPA_IE_LEN * 2;
-	u8 *pbuf;
+	char *next = iwe_stream_add_event(info, *stream, end, iwe, len);
 
-	u8 wpa_ie[255] = {0}, rsn_ie[255] = {0};
-	u16 i, wpa_len = 0, rsn_len = 0;
-	u8 *p;
-	int out_len = 0;
-
-	pbuf = (u8*)vmalloc(sizeof(u8) * buf_size);
-
-	if (pbuf) {
-		p = pbuf;
-
-		/* parsing WPA/WPA2 IE */
-			out_len = aic_get_sec_ie(payload , scan_re->ind->length, rsn_ie, &rsn_len, wpa_ie, &wpa_len);
-
-			if (wpa_len > 0) {
-
-				memset(pbuf, 0, buf_size);
-				p += sprintf(p, "wpa_ie=");
-				for (i = 0; i < wpa_len; i++)
-					p += sprintf(p, "%02x", wpa_ie[i]);
-
-				if (wpa_len > 100) {
-					printk("-----------------Len %d----------------\n", wpa_len);
-					for (i = 0; i < wpa_len; i++)
-						printk("%02x ", wpa_ie[i]);
-					printk("\n");
-					printk("-----------------Len %d----------------\n", wpa_len);
-				}
-
-				memset(iwe, 0, sizeof(*iwe));
-				iwe->cmd = IWEVCUSTOM;
-				iwe->u.data.length = strlen(pbuf);
-				start = iwe_stream_add_point(info, start, stop, iwe, pbuf);
-
-				memset(iwe, 0, sizeof(*iwe));
-				iwe->cmd = IWEVGENIE;
-				iwe->u.data.length = wpa_len;
-				start = iwe_stream_add_point(info, start, stop, iwe, wpa_ie);
-			}
-			if (rsn_len > 0) {
-
-				memset(pbuf, 0, buf_size);
-				p += sprintf(p, "rsn_ie=");
-				for (i = 0; i < rsn_len; i++)
-					p += sprintf(p, "%02x", rsn_ie[i]);
-				memset(iwe, 0, sizeof(*iwe));
-				iwe->cmd = IWEVCUSTOM;
-				iwe->u.data.length = strlen(pbuf);
-				start = iwe_stream_add_point(info, start, stop, iwe, pbuf);
-
-				memset(iwe, 0, sizeof(*iwe));
-				iwe->cmd = IWEVGENIE;
-				iwe->u.data.length = rsn_len;
-				start = iwe_stream_add_point(info, start, stop, iwe, rsn_ie);
-			}
-
-		vfree(pbuf);
-	}
-	return start;
+	if (next == *stream)
+		return -E2BIG;
+	*stream = next;
+	return 0;
 }
 
-
-u8 aicwf_get_is_wps_ie(u8 *ie_ptr, uint *wps_ielen)
+static int aicwf_wext_scan_point(struct iw_request_info *info, char **stream,
+				 char *end, struct iw_event *iwe, const void *data)
 {
-	u8 match = false;
-	u8 eid, wps_oui[4] = {0x0, 0x50, 0xf2, 0x04};
+	char *next = iwe_stream_add_point(info, *stream, end, iwe,
+					       (char *)(data ? data : ""));
 
-	if (ie_ptr == NULL)
-		return match;
-
-	eid = ie_ptr[0];
-
-	if ((eid == 0xdd/*_WPA_IE_ID_*/) && (memcmp(&ie_ptr[2], wps_oui, 4) == 0)) {
-		*wps_ielen = ie_ptr[1] + 2;
-		match = true;
-	}
-	return match;
+	if (next == *stream)
+		return -E2BIG;
+	*stream = next;
+	return 0;
 }
 
-
-static inline char *aicwf_get_iwe_stream_wps(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop, struct iw_event *iwe)
+static int aicwf_wext_scan_security(struct iw_request_info *info,
+				   const struct scanu_result_wext *entry,
+				   char **stream, char *end)
 {
-
-	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt*)scan_re->payload;
-	u8 *payload = mgmt->u.beacon.variable;
-
-	/* parsing WPS IE */
-	uint cnt = 0, total_ielen;
-	u8 *wpsie_ptr = NULL;
-	uint wps_ielen = 0;
-	u8 *ie_ptr = payload;
-	
-	total_ielen = scan_re->ind->length;
-	
-	while (cnt < total_ielen) {
-		if (aicwf_get_is_wps_ie(&ie_ptr[cnt], &wps_ielen) && (wps_ielen > 2)) {
-			wpsie_ptr = &ie_ptr[cnt];
-			iwe->cmd = IWEVGENIE;
-			iwe->u.data.length = (u16)wps_ielen;
-			start = iwe_stream_add_point(info, start, stop, iwe, wpsie_ptr);
-		}
-		cnt += ie_ptr[cnt + 1] + 2; /* goto next */
-	}
-	return start;
-}
-
-
-static char *translate_scan(struct rwnx_hw* rwnx_hw,
-		struct iw_request_info *info, struct scanu_result_wext *scan_re,
-		char *start, char *stop)
-{
+	static const u8 wpa_oui[] = { 0x00, 0x50, 0xf2, 0x01 };
+	static const u8 wps_oui[] = { 0x00, 0x50, 0xf2, 0x04 };
+	const u8 *ie = entry->ies;
+	size_t left = entry->ies_len;
+	char custom[IW_CUSTOM_MAX];
 	struct iw_event iwe;
-	memset(&iwe, 0, sizeof(iwe));
+	const char *prefix;
+	size_t len, prefix_len;
+	bool rsn, wpa, wps;
+	bool sent_rsn = false, sent_wpa = false;
+	int ret;
 
-	if(scan_re->bss){
-	    	start = aicwf_get_iwe_stream_mac_addr(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_essid(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_protocol(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_chan(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_mode(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_encryption(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_rate(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_wpa_wpa2(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_wps(rwnx_hw, info, scan_re, start, stop, &iwe);
-	    	start = aicwf_get_iwe_stream_rssi(rwnx_hw, info, scan_re, start, stop, &iwe);
-		return start;
-	} else{
-		return start;
-	}	
+	while (left >= 2 && ie[1] <= left - 2) {
+		len = ie[1] + 2;
+		rsn = ie[0] == WLAN_EID_RSN && !sent_rsn;
+		wpa = !sent_wpa && ie[0] == WLAN_EID_VENDOR_SPECIFIC &&
+		      ie[1] >= sizeof(wpa_oui) &&
+		      !memcmp(ie + 2, wpa_oui, sizeof(wpa_oui));
+		wps = ie[0] == WLAN_EID_VENDOR_SPECIFIC && ie[1] >= sizeof(wps_oui) &&
+		      !memcmp(ie + 2, wps_oui, sizeof(wps_oui));
+		if (rsn || wpa || wps) {
+			sent_rsn |= rsn;
+			sent_wpa |= wpa;
+			if (rsn || wpa) {
+				prefix = rsn ? "rsn_ie=" : "wpa_ie=";
+				prefix_len = strlen(prefix);
+				/* Keep the legacy textual event within its WEXT limit. */
+				if (prefix_len + len * 2 <= sizeof(custom)) {
+					memcpy(custom, prefix, prefix_len);
+					bin2hex(custom + prefix_len, ie, len);
+					memset(&iwe, 0, sizeof(iwe));
+					iwe.cmd = IWEVCUSTOM;
+					iwe.u.data.length = prefix_len + len * 2;
+					ret = aicwf_wext_scan_point(info, stream, end,
+							      &iwe, custom);
+					if (ret)
+						return ret;
+				}
+			}
+			memset(&iwe, 0, sizeof(iwe));
+			iwe.cmd = IWEVGENIE;
+			iwe.u.data.length = len;
+			ret = aicwf_wext_scan_point(info, stream, end, &iwe, ie);
+			if (ret)
+				return ret;
+		}
+		left -= len;
+		ie += len;
+	}
+	return 0;
 }
 
+static int aicwf_wext_format_scan(struct iw_request_info *info,
+				   const struct scanu_result_wext *entry,
+				   char **stream, char *end)
+{
+	struct iw_event iwe = {};
+	const u8 *ssid, *ht, *vht;
+	const char *protocol;
+	int ret;
+
+	iwe.cmd = SIOCGIWAP;
+	iwe.u.ap_addr.sa_family = ARPHRD_ETHER;
+	memcpy(iwe.u.ap_addr.sa_data, entry->bssid, ETH_ALEN);
+	ret = aicwf_wext_scan_event(info, stream, end, &iwe, IW_EV_ADDR_LEN);
+	if (ret)
+		return ret;
+
+	ssid = aicwf_wext_scan_ie(entry, WLAN_EID_SSID, 0);
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = SIOCGIWESSID;
+	iwe.u.data.flags = 1;
+	iwe.u.data.length = ssid ? min_t(u8, ssid[1], IEEE80211_MAX_SSID_LEN) : 0;
+	ret = aicwf_wext_scan_point(info, stream, end, &iwe, ssid ? ssid + 2 : NULL);
+	if (ret)
+		return ret;
+
+	ht = aicwf_wext_scan_ie(entry, WLAN_EID_HT_CAPABILITY,
+				 sizeof(struct ieee80211_ht_cap));
+	vht = aicwf_wext_scan_ie(entry, WLAN_EID_VHT_CAPABILITY,
+				  sizeof(struct ieee80211_vht_cap));
+	if (aicwf_wext_scan_has_he(entry))
+		protocol = "IEEE 802.11ax";
+	else if (vht)
+		protocol = "IEEE 802.11ac";
+	else if (entry->center_freq > 4000)
+		protocol = ht ? "IEEE 802.11an" : "IEEE 802.11a";
+	else
+		protocol = ht ? "IEEE 802.11bgn" : "IEEE 802.11bg";
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = SIOCGIWNAME;
+	snprintf(iwe.u.name, IFNAMSIZ, "%s", protocol);
+	ret = aicwf_wext_scan_event(info, stream, end, &iwe, IW_EV_CHAR_LEN);
+	if (ret)
+		return ret;
+
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = SIOCGIWFREQ;
+	iwe.u.freq.m = entry->center_freq;
+	iwe.u.freq.e = 6;
+	iwe.u.freq.i = ieee80211_frequency_to_channel(entry->center_freq);
+	ret = aicwf_wext_scan_event(info, stream, end, &iwe, IW_EV_FREQ_LEN);
+	if (ret)
+		return ret;
+
+	if (entry->capability & (WLAN_CAPABILITY_IBSS | WLAN_CAPABILITY_ESS)) {
+		memset(&iwe, 0, sizeof(iwe));
+		iwe.cmd = SIOCGIWMODE;
+		iwe.u.mode = entry->capability & WLAN_CAPABILITY_ESS ?
+			IW_MODE_MASTER : IW_MODE_ADHOC;
+		ret = aicwf_wext_scan_event(info, stream, end, &iwe, IW_EV_UINT_LEN);
+		if (ret)
+			return ret;
+	}
+
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = SIOCGIWENCODE;
+	iwe.u.data.flags = entry->capability & WLAN_CAPABILITY_PRIVACY ?
+		IW_ENCODE_ENABLED | IW_ENCODE_NOKEY : IW_ENCODE_DISABLED;
+	ret = aicwf_wext_scan_point(info, stream, end, &iwe, NULL);
+	if (ret)
+		return ret;
+
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = SIOCGIWRATE;
+	iwe.u.bitrate.value = aicwf_wext_scan_rate(entry);
+	ret = aicwf_wext_scan_event(info, stream, end, &iwe, IW_EV_PARAM_LEN);
+	if (ret)
+		return ret;
+
+	ret = aicwf_wext_scan_security(info, entry, stream, end);
+	if (ret)
+		return ret;
+	memset(&iwe, 0, sizeof(iwe));
+	iwe.cmd = IWEVQUAL;
+	iwe.u.qual.updated = IW_QUAL_QUAL_UPDATED | IW_QUAL_LEVEL_UPDATED |
+			     IW_QUAL_NOISE_INVALID | IW_QUAL_DBM;
+	iwe.u.qual.level = (u8)entry->rssi;
+	iwe.u.qual.qual = 100;
+	return aicwf_wext_scan_event(info, stream, end, &iwe, IW_EV_QUAL_LEN);
+}
 
 
 static int aicwf_get_wap(struct net_device *dev,
@@ -998,6 +750,7 @@ static int aicwf_set_scan(struct net_device *dev, struct iw_request_info *a,
 	struct rwnx_vif *vif = netdev_priv(dev);
 	struct rwnx_hw *hw = vif->rwnx_hw;
 	struct rwnx_wext_scan *scan;
+	LIST_HEAD(retired);
 	bool submitted = false;
 	long waited;
 	int ret;
@@ -1017,16 +770,20 @@ static int aicwf_set_scan(struct net_device *dev, struct iw_request_info *a,
 
 	/* Do not cancel or replace another caller's scan, including a drain fence. */
 	spin_lock_bh(&hw->cb_lock);
-	if (hw->scan_request || hw->scanning || hw->wext_scan) {
+	if (hw->wext_cache_stopped || hw->scan_request || hw->scanning ||
+	    hw->wext_scan) {
+		ret = hw->wext_cache_stopped ? -ESHUTDOWN : -EBUSY;
 		spin_unlock_bh(&hw->cb_lock);
 		kfree(scan);
-		return -EBUSY;
+		return ret;
 	}
+	aicwf_wext_cache_reset_locked(hw, &vif->wdev, &retired);
 	hw->scan_request = &scan->request;
 	hw->wext_scan = scan;
 	hw->scanning = true;
 	hw->scan_submitted = false;
 	spin_unlock_bh(&hw->cb_lock);
+	aicwf_wext_cache_free_list(&retired);
 
 	/* Completion only detaches/signals; it never frees the sender's storage. */
 	ret = rwnx_send_scanu_req(hw, vif, &scan->request, &submitted);
@@ -1050,42 +807,26 @@ static int aicwf_set_scan(struct net_device *dev, struct iw_request_info *a,
 	return ret;
 }
 
-static int aicwf_get_scan(struct net_device *dev, struct iw_request_info *a,
-			   union iwreq_data *wrqu, char *extra)
+static int aicwf_get_scan(struct net_device *dev, struct iw_request_info *info,
+			  union iwreq_data *wrqu, char *extra)
 {
-	int ret = 0;
-	struct rwnx_vif* rwnx_vif = netdev_priv(dev);
-	struct rwnx_hw* rwnx_hw = rwnx_vif->rwnx_hw;
-	struct scanu_result_wext *scan_re;
-	struct scanu_result_wext *tmp;
-	char *start = extra;
-	char *stop = start + wrqu->data.length;
-	
-	AICWFDBG(LOGDEBUG, "%s Enter %p %p len:%d \r\n", __func__, start, stop, wrqu->data.length);
+	struct rwnx_vif *vif = netdev_priv(dev);
+	struct scanu_result_wext *entries[AICWF_WEXT_CACHE_MAX_RESULTS];
+	char *stream = extra;
+	char *end = extra + wrqu->data.length;
+	int count, i, ret = 0;
 
-	//TODO: spinlock
-	list_for_each_entry_safe(scan_re, tmp, &rwnx_hw->wext_scanre_list, scanu_re_list) {
-		start = translate_scan(rwnx_hw, a, scan_re, start, stop);
-		if ((stop - start) < 768) {
-			return -E2BIG;
-		}
-		
+	count = aicwf_wext_cache_snapshot(vif->rwnx_hw, entries, ARRAY_SIZE(entries));
+	if (count < 0)
+		return count;
+	for (i = 0; i < count; i++) {
+		if (!ret)
+			ret = aicwf_wext_format_scan(info, entries[i], &stream, end);
+		aicwf_wext_result_put(entries[i]);
 	}
-
-	list_for_each_entry_safe(scan_re, tmp, &rwnx_hw->wext_scanre_list, scanu_re_list) {
-		list_del(&scan_re->scanu_re_list);
-		vfree(scan_re->payload);
-		vfree(scan_re->ind);
-		vfree(scan_re);
-		scan_re = NULL;
-	}
-
-	
-	wrqu->data.length = start - extra;
+	wrqu->data.length = stream - extra;
 	wrqu->data.flags = 0;
-
-	return ret ;
-
+	return ret;
 }
 
 

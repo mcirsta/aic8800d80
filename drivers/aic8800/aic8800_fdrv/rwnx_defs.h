@@ -920,6 +920,12 @@ struct rwnx_hw {
 #ifdef CONFIG_USE_WIRELESS_EXT
 	struct rwnx_wext_scan *wext_scan;
 	struct list_head wext_scanre_list;
+	/* Cache ownership, generation, accounting and admission use cb_lock. */
+	u64 wext_cache_generation;
+	struct wireless_dev *wext_cache_owner;
+	size_t wext_cache_bytes;
+	unsigned int wext_cache_count;
+	bool wext_cache_stopped;
 	char wext_essid[33];
 	int support_freqs[SCAN_CHANNEL_MAX];
 	int support_freqs_number;

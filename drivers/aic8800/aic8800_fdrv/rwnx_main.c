@@ -1710,6 +1710,9 @@ static int rwnx_close(struct net_device *dev)
 
 	rwnx_hw->p2p_working = false;
 	rwnx_radar_cancel_cac(&rwnx_hw->radar);
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, &rwnx_vif->wdev, false);
+#endif
 
 	/* Completion and close compete for one detached scan request. */
 	if (rwnx_scan_complete(rwnx_hw, &rwnx_vif->wdev, true) &&
@@ -2655,6 +2658,9 @@ static int rwnx_cfg80211_del_iface(struct wiphy *wiphy, struct wireless_dev *wde
    // printk("del_iface: %p\n",wdev);
 
 	AICWFDBG(LOGINFO, "del_iface: %p, %x\n",wdev, wdev->address[5]);
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, &rwnx_vif->wdev, false);
+#endif
 
     if (!dev || !rwnx_vif->ndev) {
 #if 0
@@ -2780,6 +2786,9 @@ static int rwnx_cfg80211_change_iface(struct wiphy *wiphy,
         p2p = true;
     }
 	if (vif->up) {
+#ifdef CONFIG_USE_WIRELESS_EXT
+		aicwf_wext_cache_purge(vif->rwnx_hw, &vif->wdev, false);
+#endif
 		if (rwnx_scan_complete(vif->rwnx_hw, &vif->wdev, true)) {
 			ret = rwnx_send_scanu_cancel_req(vif->rwnx_hw, NULL);
 			if (ret)
@@ -2859,6 +2868,9 @@ static void rwnx_cfgp2p_stop_p2p_device(struct wiphy *wiphy, struct wireless_dev
 	int ret = 0;
 	struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
 	struct rwnx_vif *rwnx_vif = container_of(wdev, struct rwnx_vif, wdev);
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, &rwnx_vif->wdev, false);
+#endif
 	/* Share scan completion ownership with the RX callback and close. */
 	if (rwnx_scan_complete(rwnx_hw, &rwnx_vif->wdev, true) &&
 	    rwnx_close_bus_ready(dev_get_drvdata(rwnx_hw->dev))) {
@@ -9588,6 +9600,9 @@ if(rwnx_hw->wiphy){
 }
 err_register_wiphy:
 err_lmac_reqs:
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
+#endif
     AICWFDBG(LOGERROR, "err_lmac_reqs\n");
     flush_workqueue(rwnx_hw->apmStaloss_wq);
     destroy_workqueue(rwnx_hw->apmStaloss_wq);
@@ -9617,6 +9632,9 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
+#endif
     rwnx_send_set_stack_start_req(rwnx_hw, 0, 0, 0, 0, &set_start_cfm);
 
 #ifdef AICWF_USB_SUPPORT
@@ -9681,6 +9699,10 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
     rwnx_wdev_unregister(rwnx_hw);
 #ifdef AICWF_USB_SUPPORT
 	aicwf_usb_rx_stop(rwnx_hw->usbdev);
+#endif
+#ifdef CONFIG_USE_WIRELESS_EXT
+	/* RX is drained; outstanding readers retain their independent references. */
+	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
 #endif
 	if(rwnx_hw->wiphy){
 		AICWFDBG(LOGINFO, "%s wiphy_unregister \r\n", __func__);

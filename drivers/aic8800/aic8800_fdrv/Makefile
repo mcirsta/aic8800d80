@@ -232,7 +232,7 @@ $(MODULE_NAME)-$(CONFIG_FILTER_TCP_ACK)   += aicwf_tcp_ack.o
 $(MODULE_NAME)-$(CONFIG_USB_SUPPORT)     += usb_host.o
 $(MODULE_NAME)-$(CONFIG_USB_SUPPORT)     += aicwf_txrxif.o
 $(MODULE_NAME)-$(CONFIG_USB_SUPPORT)     += aicwf_usb.o
-$(MODULE_NAME)-$(CONFIG_USE_WIRELESS_EXT)	 += aicwf_wext_linux.o
+$(MODULE_NAME)-$(CONFIG_USE_WIRELESS_EXT)	 += aicwf_wext_linux.o aicwf_wext_cache.o
 $(MODULE_NAME)-$(CONFIG_GKI)    += rwnx_gki.o
 
 ccflags-$(CONFIG_DEBUG_FS) += -DCONFIG_RWNX_DEBUGFS

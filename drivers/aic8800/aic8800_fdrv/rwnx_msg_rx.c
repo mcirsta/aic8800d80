@@ -655,137 +655,78 @@ static inline int rwnx_rx_scanu_start_cfm(struct rwnx_hw *rwnx_hw,
 }
 
 static inline int rwnx_rx_scanu_result_ind(struct rwnx_hw *rwnx_hw,
-                                           struct rwnx_cmd *cmd,
-                                           struct ipc_e2a_msg *msg)
+					struct rwnx_cmd *cmd,
+					struct ipc_e2a_msg *msg)
 {
-    struct cfg80211_bss *bss = NULL;
-    struct ieee80211_channel *chan;
-    struct scanu_result_ind *ind = (struct scanu_result_ind *)msg->param;
-    struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)ind->payload;
+	struct scanu_result_ind *ind = (void *)msg->param;
+	struct ieee80211_mgmt *mgmt = (void *)ind->payload;
+	struct ieee80211_channel *chan;
+	struct cfg80211_bss *bss;
+	u16 capability, beacon_interval, len;
+	size_t ielen;
 	u64 tsf;
 	u8 *ie;
-	size_t ielen;
-	u16 capability, beacon_interval;
-	u16 len = ind->length;
-
-#if 0    
-	const u8 *ie = mgmt->u.beacon.variable;
-	char *ssid = NULL;
-	int ssid_len = 0;
-	int freq = 0;
-#endif
-
 #ifdef CONFIG_USE_WIRELESS_EXT
-	struct scanu_result_wext *scan_re_wext;
+	u64 generation;
 #endif
 
-
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
-	
-	if (len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable) ||
-		len > msg->param_len - offsetof(struct scanu_result_ind, payload))
+	if (msg->param_len < offsetof(struct scanu_result_ind, payload))
 		return -EMSGSIZE;
-
-    chan = ieee80211_get_channel(rwnx_hw->wiphy, ind->center_freq);
-
-    if (chan != NULL) {
+	len = ind->length;
+	if (len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable) ||
+	    len > msg->param_len - offsetof(struct scanu_result_ind, payload))
+		return -EMSGSIZE;
+	chan = ieee80211_get_channel(rwnx_hw->wiphy, ind->center_freq);
+	if (!chan)
+		return 0;
+#ifdef CONFIG_USE_WIRELESS_EXT
+	/* A scan reset during allocation/inform must not inherit this result. */
+	generation = aicwf_wext_cache_generation(rwnx_hw);
+#endif
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 17, 0)
-        struct timespec ts;
-        get_monotonic_boottime(&ts);
-        tsf = (u64)ts.tv_sec * 1000000 + div_u64(ts.tv_nsec, 1000);
-        mgmt->u.probe_resp.timestamp = ((u64)ts.tv_sec*1000000) + ts.tv_nsec/1000;
+	struct timespec ts;
+
+	get_monotonic_boottime(&ts);
+	tsf = (u64)ts.tv_sec * 1000000 + div_u64(ts.tv_nsec, 1000);
+	mgmt->u.probe_resp.timestamp = cpu_to_le64(tsf);
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
-        struct timespec ts;
-        ts = ktime_to_timespec(ktime_get_boottime());
-        tsf = (u64)ts.tv_sec * 1000000 + div_u64(ts.tv_nsec, 1000);
-        mgmt->u.probe_resp.timestamp = tsf;
+	struct timespec ts;
+
+	ts = ktime_to_timespec(ktime_get_boottime());
+	tsf = (u64)ts.tv_sec * 1000000 + div_u64(ts.tv_nsec, 1000);
+	mgmt->u.probe_resp.timestamp = cpu_to_le64(tsf);
 #else
-        struct timespec64 ts;
-        ts = ktime_to_timespec64(ktime_get_boottime());
-        tsf = (u64)ts.tv_sec * 1000000 + div_u64(ts.tv_nsec, 1000);
-        mgmt->u.probe_resp.timestamp = tsf;
+	struct timespec64 ts;
+
+	ts = ktime_to_timespec64(ktime_get_boottime());
+	tsf = (u64)ts.tv_sec * 1000000 + div_u64(ts.tv_nsec, 1000);
+	mgmt->u.probe_resp.timestamp = cpu_to_le64(tsf);
 #endif
-        ie = mgmt->u.probe_resp.variable;
-        ielen = len - offsetof(struct ieee80211_mgmt, u.probe_resp.variable);
-        beacon_interval = le16_to_cpu(mgmt->u.probe_resp.beacon_int);
-        capability = le16_to_cpu(mgmt->u.probe_resp.capab_info);
-        /* framework use system bootup time */
-        bss = cfg80211_inform_bss(rwnx_hw->wiphy, chan,
+	ie = mgmt->u.probe_resp.variable;
+	ielen = len - offsetof(struct ieee80211_mgmt, u.probe_resp.variable);
+	beacon_interval = le16_to_cpu(mgmt->u.probe_resp.beacon_int);
+	capability = le16_to_cpu(mgmt->u.probe_resp.capab_info);
+	bss = cfg80211_inform_bss(rwnx_hw->wiphy, chan,
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 18, 0))
-            CFG80211_BSS_FTYPE_UNKNOWN,
+				 CFG80211_BSS_FTYPE_UNKNOWN,
 #endif
-            mgmt->bssid, tsf, capability, beacon_interval,
-            ie, ielen, ind->rssi * 100, GFP_ATOMIC);
-
-#if 0
-        //print scan result info start
-        if(ie != NULL && bss != NULL){
-            ssid_len = ie[1];
-            ssid = (char *)vmalloc(sizeof(char)* (ssid_len + 1));
-            if(ssid != NULL){
-                memset(ssid, 0, ssid_len + 1);
-                memcpy(ssid, &ie[2], ssid_len);
-                freq = ind->center_freq;
-                AICWFDBG(LOGDEBUG, "%s %02x:%02x:%02x:%02x:%02x:%02x ssid:%s freq:%d timestamp:%ld\r\n", __func__, 
-                    bss->bssid[0],bss->bssid[1],bss->bssid[2],
-                    bss->bssid[3],bss->bssid[4],bss->bssid[5],
-                    ssid, freq, (long)mgmt->u.probe_resp.timestamp);
-                vfree(ssid);
-                ssid = NULL;
-            }else{
-                AICWFDBG(LOGERROR, "%s ssid vmalloc fail skip printk ssid info \r\n", __func__);
-            }
-        }
-        //print scan result info end
-#endif
-
+				 mgmt->bssid, tsf, capability, beacon_interval,
+				 ie, ielen, ind->rssi * 100, GFP_ATOMIC);
+	if (!bss)
+		return 0;
 #ifdef CONFIG_USE_WIRELESS_EXT
-	if(rwnx_hw->wext_scan){
-		if (!bss ) {
-			AICWFDBG(LOGERROR, "%s: Invalid BSS structure\n", __func__);
-			goto putbss;
-		}
-		list_for_each_entry(scan_re_wext, &rwnx_hw->wext_scanre_list, scanu_re_list) {
-			if (!scan_re_wext || !scan_re_wext->bss ) {
-				AICWFDBG(LOGDEBUG, "%s: Corrupted list entry detected\n", __func__);
-				continue;
-			}
-			if (!memcmp(scan_re_wext->bss->bssid, bss->bssid, ETH_ALEN)) {
-				AICWFDBG(LOGDEBUG, "%s: BSSID already exists, no need to add again\r\n", __func__);
-				goto putbss;
-			}
-		}
-			scan_re_wext = (struct scanu_result_wext *)vmalloc(sizeof(struct scanu_result_wext));
-			scan_re_wext->ind = (struct scanu_result_ind *)vmalloc(sizeof(struct scanu_result_ind));
-			scan_re_wext->payload = (u32_l *)vmalloc(sizeof(u32_l) * ind->length);
-
-			memset(scan_re_wext->ind, 0, sizeof(struct scanu_result_ind));
-			memset(scan_re_wext->payload, 0, ind->length);
-			
-			memcpy(scan_re_wext->ind, ind, sizeof(struct scanu_result_ind));
-			memcpy(scan_re_wext->payload, ind->payload, ind->length);
-	
-			scan_re_wext->bss = bss;
-
-			INIT_LIST_HEAD(&scan_re_wext->scanu_re_list);
-			list_add_tail(&scan_re_wext->scanu_re_list, &rwnx_hw->wext_scanre_list);
-			return 0;
-	}
+	aicwf_wext_cache_add(rwnx_hw, generation, mgmt->bssid, capability,
+			     ind->center_freq, ind->rssi, ie, ielen);
 #endif
-
-    }
-#ifdef CONFIG_USE_WIRELESS_EXT
-putbss:
-#endif
-    if (bss != NULL)
+	/* The WEXT cache owns bytes only; every inform reference is returned here. */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
 	cfg80211_put_bss(bss);
 #else
-        cfg80211_put_bss(rwnx_hw->wiphy, bss);
+	cfg80211_put_bss(rwnx_hw->wiphy, bss);
 #endif
-
-    return 0;
+	return 0;
 }
+
 #endif /* CONFIG_RWNX_FULLMAC */
 
 /***************************************************************************
