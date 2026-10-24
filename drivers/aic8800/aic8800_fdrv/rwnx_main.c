@@ -8966,6 +8966,7 @@ static int start_from_bootrom(struct rwnx_hw *rwnx_hw)
 
 
 int rwnx_ic_system_init(struct rwnx_hw *rwnx_hw){
+	int ret;
 
 	if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8801){
 		system_config(rwnx_hw);
@@ -8975,8 +8976,9 @@ int rwnx_ic_system_init(struct rwnx_hw *rwnx_hw){
 		aicwf_usb_config(rwnx_hw);
 #endif
 		system_config(rwnx_hw);
-		if (rwnx_platform_on(rwnx_hw, NULL))
-			return -1;
+		ret = rwnx_platform_on(rwnx_hw, NULL);
+		if (ret)
+			return ret;
 
 #if defined(CONFIG_START_FROM_BOOTROM)
         if (chip_sub_id < 2) {
@@ -8988,23 +8990,32 @@ int rwnx_ic_system_init(struct rwnx_hw *rwnx_hw){
 			return -1;
 #endif
 	}else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D81){
-		if (system_config_8800d80(rwnx_hw)) {
-			return -1;
-		}
-		rwnx_plat_userconfig_load_8800d80(rwnx_hw);
+		ret = system_config_8800d80(rwnx_hw);
+		if (ret)
+			return ret;
+		ret = rwnx_plat_userconfig_load_8800d80(rwnx_hw);
+		if (ret)
+			return ret;
         #ifdef CONFIG_POWER_LIMIT
-        rwnx_plat_powerlimit_load_8800d80(rwnx_hw);
+		ret = rwnx_plat_powerlimit_load_8800d80(rwnx_hw);
+		if (ret)
+			return ret;
         #endif
 	}else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D81X2 ||
 		rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D89X2){
-		rwnx_plat_userconfig_load_8800d80x2(rwnx_hw);
+		ret = rwnx_plat_userconfig_load_8800d80x2(rwnx_hw);
+		if (ret)
+			return ret;
         #ifdef CONFIG_POWER_LIMIT
-        rwnx_plat_powerlimit_load_8800d80x2(rwnx_hw);
+		ret = rwnx_plat_powerlimit_load_8800d80x2(rwnx_hw);
+		if (ret)
+			return ret;
         #endif
 	} else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D80N){
         system_config(rwnx_hw);
-		if (rwnx_platform_on(rwnx_hw, NULL))
-			return -1;
+		ret = rwnx_platform_on(rwnx_hw, NULL);
+		if (ret)
+			return ret;
         if (testmode == 0) {
             if (start_from_bootrom(rwnx_hw)) {
                 return -1;
@@ -9020,8 +9031,9 @@ int rwnx_ic_system_init(struct rwnx_hw *rwnx_hw){
         }
 	} else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DLN){
 		system_config(rwnx_hw);
-		if (rwnx_platform_on(rwnx_hw, NULL))
-			return -1;
+		ret = rwnx_platform_on(rwnx_hw, NULL);
+		if (ret)
+			return ret;
 		if (start_from_bootrom(rwnx_hw)) {
 			return -1;
 		}

@@ -6,8 +6,6 @@
 #define FW_USERCONFIG_NAME_8800D80         "aic_userconfig_8800d80.txt"
 #define FW_POWERLIMIT_NAME_8800D80         "aic_powerlimit_8800d80.txt"
 
-extern char aic_fw_path[200];
-
 int rwnx_request_firmware_common(struct rwnx_hw *rwnx_hw,
 	u32** buffer, const char *filename);
 void rwnx_plat_userconfig_parsing(char *buffer, int size);
@@ -39,19 +37,14 @@ int	rwnx_plat_userconfig_load_8800d80(struct rwnx_hw *rwnx_hw){
     u32 *dst=NULL;
     char *filename = FW_USERCONFIG_NAME_8800D80;
 
-#ifndef ANDROID_PLATFORM
-            if (strlcat(aic_fw_path, "/aic8800D80", sizeof(aic_fw_path)) >= sizeof(aic_fw_path))
-                return -ENAMETOOLONG;
-#endif
 
     AICWFDBG(LOGINFO, "userconfig file path:%s \r\n", filename);
 
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-            AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-            dst = NULL;
-            return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
     /* Copy the file on the Embedded side */
@@ -79,9 +72,8 @@ int rwnx_plat_powerlimit_load_8800d80(struct rwnx_hw *rwnx_hw)
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-        AICWFDBG(LOGERROR, "wrong size of cfg file\n");
-        dst = NULL;
-        return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
     AICWFDBG(LOGINFO, "### Load file done: %s, size=%d\n", filename, size);

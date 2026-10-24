@@ -3071,7 +3071,10 @@ int aicwf_set_rf_config_8800dc(struct rwnx_hw *rwnx_hw, struct mm_set_rf_calib_c
         if (chip_sub_id >= 1) {
             #ifdef CONFIG_DPD
             #ifndef CONFIG_FORCE_DPD_CALIB
-            if (is_file_exist(FW_DPDRESULT_NAME_8800DC) == 1) {
+			ret = is_file_exist(rwnx_hw, FW_DPDRESULT_NAME_8800DC);
+			if (ret < 0)
+				return ret;
+			if (ret) {
                 AICWFDBG(LOGINFO, "%s load dpd bin\n", __func__);
                 ret = aicwf_dpd_result_load_8800dc(rwnx_hw, &dpd_res);
                 if (ret) {
@@ -3429,10 +3432,13 @@ int aicwf_dpd_result_load_8800dc(struct rwnx_hw *rwnx_hw, rf_misc_ram_lite_t *dp
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
         AICWFDBG(LOGERROR, "wrong size of dpd_res file\n");
-        dst = NULL;
-        return -1;
+		return size < 0 ? size : -EINVAL;
     }
-    AICWFDBG(LOGINFO, "### Load file done: %s, size=%d, dst[0]=%x\n", filename, size, dst[0]);
+	if ((size_t)size < sizeof(*dpd_res)) {
+		rwnx_release_firmware_common(&dst);
+		return -EINVAL;
+	}
+	AICWFDBG(LOGINFO, "### Load file done: %s, size=%d\n", filename, size);
     memcpy((u8 *)dpd_res, (u8 *)dst, sizeof(rf_misc_ram_lite_t));
     if (dst) {
         rwnx_release_firmware_common(&dst);
@@ -3458,7 +3464,17 @@ int aicwf_dpd_result_write_8800dc(void *buf, int buf_len)
         return -1;
     }
 
-    len = snprintf(path, FW_PATH_MAX_LEN, "%s/%s", aic_fw_path, FW_DPDRESULT_NAME_8800DC);
+#ifndef ANDROID_PLATFORM
+	len = snprintf(path, FW_PATH_MAX_LEN, "%s/aic8800DC/%s",
+				   aic_fw_path, FW_DPDRESULT_NAME_8800DC);
+#else
+	len = snprintf(path, FW_PATH_MAX_LEN, "%s/%s",
+				   aic_fw_path, FW_DPDRESULT_NAME_8800DC);
+#endif
+	if (len < 0 || len >= FW_PATH_MAX_LEN) {
+		__putname(path);
+		return len < 0 ? len : -ENAMETOOLONG;
+	}
     //AICWFDBG(LOGINFO, "%s\n", path);
 
     fp = filp_open(path, O_RDWR | O_CREAT, 0644);
@@ -3610,9 +3626,8 @@ int	rwnx_plat_userconfig_load_8800dc(struct rwnx_hw *rwnx_hw){
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-            AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-            dst = NULL;
-            return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
 	/* Copy the file on the Embedded side */
@@ -3637,9 +3652,8 @@ int	rwnx_plat_userconfig_load_8800dw(struct rwnx_hw *rwnx_hw){
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-            AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-            dst = NULL;
-            return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
 	/* Copy the file on the Embedded side */
@@ -3676,9 +3690,8 @@ int rwnx_plat_powerlimit_load_8800dcdw(struct rwnx_hw *rwnx_hw, uint16_t chip_id
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-        AICWFDBG(LOGERROR, "wrong size of cfg file\n");
-        dst = NULL;
-        return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
     /* Copy the file on the Embedded side */

@@ -8,9 +8,8 @@
 #include "md5.h"
 #include "aicbluetooth.h"
 #include "aicwf_debug.h"
-#ifdef CONFIG_USE_FW_REQUEST
 #include <linux/firmware.h>
-#endif
+#include "../aic_firmware.h"
 
 //Parser state
 #define INIT 0
@@ -152,6 +151,8 @@ static const char* aic_default_fw_path = "/vendor/etc/firmware";
 #endif
 char aic_fw_path[FW_PATH_MAX];
 module_param_string(aic_fw_path, aic_fw_path, FW_PATH_MAX, 0660);
+MODULE_PARM_DESC(aic_fw_path,
+		 "Firmware-relative root before the chip directory (standard Linux roots are accepted aliases)");
 #ifdef CONFIG_M2D_OTA_AUTO_SUPPORT
 char saved_sdk_ver[64];
 module_param_string(saved_sdk_ver, saved_sdk_ver,64, 0660);
@@ -251,121 +252,98 @@ void aic_bt_platform_deinit(struct aic_usb_dev *usbdev)
 #define MD5(x) x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],x[8],x[9],x[10],x[11],x[12],x[13],x[14],x[15]
 #define MD5PINRT "file md5:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\r\n"
 
+/* Resolve a firmware-class name without changing the shared module parameter. */
+static int aic_firmware_name(char *fw_name, size_t len, const char *name,
+			     struct device *device)
+{
+	char prefix[FW_PATH_MAX];
+	const char *directory;
+	int ret;
+#ifdef CONFIG_PLATFORM_UBUNTU
+	struct aicwf_bus *bus_if;
+	struct aic_usb_dev *usb_dev;
+#endif
+
+	if (!device)
+		return -EINVAL;
+	/* sysfs may update aic_fw_path while a USB reprobe is resolving a file. */
+	kernel_param_lock(THIS_MODULE);
+	ret = strscpy(prefix, aic_fw_path, sizeof(prefix));
+	kernel_param_unlock(THIS_MODULE);
+	if (ret < 0)
+		return ret;
+
+#ifdef CONFIG_PLATFORM_UBUNTU
+	bus_if = dev_get_drvdata(device);
+	if (!bus_if || !bus_if->bus_priv.usb)
+		return -ENODEV;
+	usb_dev = bus_if->bus_priv.usb;
+	switch (usb_dev->chipid) {
+	case PRODUCT_ID_AIC8800:
+		directory = "aic8800";
+		break;
+	case PRODUCT_ID_AIC8800D80:
+		directory = "aic8800D80";
+		break;
+	case PRODUCT_ID_AIC8800D80X2:
+		directory = "aic8800D80X2";
+		break;
+	default:
+		return -ENODEV;
+	}
+#else
+	/* Vendor platform layouts historically keep the files together. */
+	directory = "";
+#endif
+	ret = aicwf_firmware_name(fw_name, len, prefix, directory, name);
+	if (ret == -EINVAL)
+		dev_err(device,
+			"invalid firmware name/root; use firmware_class.path for a custom root\n");
+	return ret;
+}
+
 /* Return the byte count on success and a negative errno on failure. */
 static int aic_load_firmware(u32 **fw_buf, const char *name, struct device *device)
 {
+	const struct firmware *fw;
+	char fw_name[FW_PATH_MAX];
 	void *buffer;
 	MD5_CTX md5;
 	unsigned char decrypt[16];
 	int size, ret;
-#ifdef CONFIG_USE_FW_REQUEST
-	const struct firmware *fw;
 
+	if (!fw_buf)
+		return -EINVAL;
 	*fw_buf = NULL;
-	ret = request_firmware(&fw, name, NULL);
+	ret = aic_firmware_name(fw_name, sizeof(fw_name), name, device);
+	if (ret)
+		return ret;
+	ret = request_firmware(&fw, fw_name, device);
 	if (ret)
 		return ret;
 	if (!fw->size || fw->size > INT_MAX) {
 		ret = fw->size ? -EFBIG : -EINVAL;
-		release_firmware(fw);
-		return ret;
+		goto out_release;
 	}
 	size = fw->size;
-	buffer = vmalloc(size);
-	if (!buffer) {
-		release_firmware(fw);
-		return -ENOMEM;
-	}
-	memcpy(buffer, fw->data, size);
-	release_firmware(fw);
-#else
-	struct file *fp;
-	char *path;
-	loff_t file_size;
-	ssize_t rdlen;
-	int len;
-#ifdef CONFIG_PLATFORM_UBUNTU
-	struct aicwf_bus *bus_if = dev_get_drvdata(device);
-	struct aic_usb_dev *usb_dev;
-#endif
-
-	*fw_buf = NULL;
-	path = __getname();
-	if (!path)
-		return -ENOMEM;
-	if (strlen(aic_fw_path) > 0) {
-		len = snprintf(path, FW_PATH_MAX, "%s/%s", aic_fw_path, name);
-	} else {
-#ifdef CONFIG_PLATFORM_UBUNTU
-		if (!bus_if || !bus_if->bus_priv.usb) {
-			ret = -ENODEV;
-			goto out_putname;
-		}
-		usb_dev = bus_if->bus_priv.usb;
-		if (usb_dev->chipid == PRODUCT_ID_AIC8800)
-			len = snprintf(path, FW_PATH_MAX, "%s/aic8800/%s",
-				       aic_default_fw_path, name);
-		else if (usb_dev->chipid == PRODUCT_ID_AIC8800D80)
-			len = snprintf(path, FW_PATH_MAX, "%s/aic8800D80/%s",
-				       aic_default_fw_path, name);
-		else if (usb_dev->chipid == PRODUCT_ID_AIC8800D80X2)
-			len = snprintf(path, FW_PATH_MAX, "%s/aic8800D80X2/%s",
-				       aic_default_fw_path, name);
-		else {
-			ret = -ENODEV;
-			goto out_putname;
-		}
-#else
-		len = snprintf(path, FW_PATH_MAX, "%s/%s", aic_default_fw_path, name);
-#endif
-	}
-	if (len < 0 || len >= FW_PATH_MAX) {
-		ret = len < 0 ? len : -ENAMETOOLONG;
-		goto out_putname;
-	}
-	fp = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(fp)) {
-		ret = PTR_ERR(fp);
-		pr_err("firmware %s open failed: %d\n", path, ret);
-		goto out_putname;
-	}
-	file_size = i_size_read(file_inode(fp));
-	if (file_size <= 0 || file_size > INT_MAX) {
-		ret = file_size > INT_MAX ? -EFBIG : -EINVAL;
-		goto out_close;
-	}
-	size = file_size;
+	/* Patch-table users modify this buffer; firmware-loader data is const. */
 	buffer = vmalloc(size);
 	if (!buffer) {
 		ret = -ENOMEM;
-		goto out_close;
+		goto out_release;
 	}
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 13, 16)
-	rdlen = kernel_read(fp, buffer, size, &fp->f_pos);
-#else
-	rdlen = kernel_read(fp, fp->f_pos, buffer, size);
-#endif
-	if (rdlen != size) {
-		ret = rdlen < 0 ? rdlen : -EIO;
-		vfree(buffer);
-		goto out_close;
-	}
-	filp_close(fp, NULL);
-	__putname(path);
-#endif
+	memcpy(buffer, fw->data, size);
+	release_firmware(fw);
 	*fw_buf = buffer;
 	MD5Init(&md5);
 	MD5Update(&md5, buffer, size);
 	MD5Final(&md5, decrypt);
 	printk(MD5PINRT, MD5(decrypt));
 	return size;
-#ifndef CONFIG_USE_FW_REQUEST
-out_close:
-	filp_close(fp, NULL);
-out_putname:
-	__putname(path);
+
+out_release:
+	release_firmware(fw);
 	return ret;
-#endif
 }
 
 int rwnx_plat_bin_fw_upload_android(struct aic_usb_dev *usbdev, u32 fw_addr,
@@ -788,13 +766,14 @@ int8_t rwnx_atoi(char *value){
 	return result;
 }
 
-void get_fw_path(char* fw_path){
-	if (strlen(aic_fw_path) > 0) {
-		memcpy(fw_path, aic_fw_path, strlen(aic_fw_path));
-	}else{
-		memcpy(fw_path, aic_default_fw_path, strlen(aic_default_fw_path));
-	}
-} 
+void get_fw_path(char *fw_path)
+{
+	/* Legacy ABI: callers provide a FW_PATH_MAX-byte buffer. */
+	kernel_param_lock(THIS_MODULE);
+	strscpy(fw_path, aic_fw_path[0] ? aic_fw_path : aic_default_fw_path,
+		FW_PATH_MAX);
+	kernel_param_unlock(THIS_MODULE);
+}
 
 int get_testmode(void){
 	return testmode;

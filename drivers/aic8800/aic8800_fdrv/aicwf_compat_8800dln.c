@@ -281,9 +281,8 @@ int	rwnx_plat_userconfig_load_8800dln(struct rwnx_hw *rwnx_hw){
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-            AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-            dst = NULL;
-            return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
     /* Copy the file on the Embedded side */
@@ -311,9 +310,8 @@ int rwnx_plat_powerlimit_load_8800dln(struct rwnx_hw *rwnx_hw)
     /* load file */
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
     if (size <= 0) {
-        AICWFDBG(LOGERROR, "wrong size of cfg file\n");
-        dst = NULL;
-        return 0;
+		/* Only an absent optional file may retain the built-in defaults. */
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
     }
 
     AICWFDBG(LOGINFO, "### Load file done: %s, size=%d\n", filename, size);

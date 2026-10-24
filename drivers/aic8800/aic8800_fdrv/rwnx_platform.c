@@ -12,6 +12,8 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/vmalloc.h>
+#include <linux/limits.h>
+#include "../aic_firmware.h"
 
 #include "rwnx_platform.h"
 #include "reg_access.h"
@@ -36,9 +38,6 @@
 #include "aicwf_compat_8800d80x2.h"
 #include "aicwf_compat_8800d80n.h"
 #include "aicwf_compat_8800dln.h"
-#ifdef CONFIG_USE_FW_REQUEST
-#include <linux/firmware.h>
-#endif
 
 
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0))
@@ -609,166 +608,87 @@ static int rwnx_plat_bin_fw_upload(struct rwnx_plat *rwnx_plat, u8* fw_addr,
 #define MD5(x) x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],x[8],x[9],x[10],x[11],x[12],x[13],x[14],x[15]
 #define MD5PINRT "file md5:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\r\n"
 
-static int rwnx_load_firmware(u32 **fw_buf, const char *name, struct device *device)
+static const char *rwnx_firmware_directory(struct rwnx_hw *rwnx_hw)
 {
-
-#ifdef CONFIG_USE_FW_REQUEST
-	const struct firmware *fw = NULL;
-	u32 *dst = NULL;
-	void *buffer=NULL;
-	MD5_CTX md5;
-	unsigned char decrypt[16];
-	int size = 0;
-	int ret = 0;
-
-	AICWFDBG(LOGINFO, "%s: request firmware = %s \n", __func__ ,name);
-
-	ret = request_firmware(&fw, name, NULL);
-
-	if (ret < 0) {
-		AICWFDBG(LOGERROR, "Load %s fail\n", name);
-		release_firmware(fw);
-		return -1;
+#if defined(AICWF_USB_SUPPORT) && !defined(ANDROID_PLATFORM)
+	if (!rwnx_hw->usbdev)
+		return NULL;
+	switch (rwnx_hw->usbdev->chipid) {
+	case PRODUCT_ID_AIC8801:
+		return "aic8800";
+	case PRODUCT_ID_AIC8800DC:
+	case PRODUCT_ID_AIC8800DW:
+		return "aic8800DC";
+	case PRODUCT_ID_AIC8800DLN:
+		return "aic8800DLN";
+	case PRODUCT_ID_AIC8800D80N:
+		return "aic8800D80N";
+	case PRODUCT_ID_AIC8800D81:
+		return "aic8800D80";
+	case PRODUCT_ID_AIC8800D81X2:
+	case PRODUCT_ID_AIC8800D89X2:
+		return "aic8800D80X2";
+	default:
+		return NULL;
 	}
-
-	size = fw->size;
-	dst = (u32 *)fw->data;
-
-	if (size <= 0) {
-		AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-		release_firmware(fw);
-		return -1;
-	}
-
-	buffer = vmalloc(size);
-	memset(buffer, 0, size);
-	memcpy(buffer, dst, size);
-
-	*fw_buf = buffer;
-
-	MD5Init(&md5);
-	MD5Update(&md5, (unsigned char *)buffer, size);
-	MD5Final(&md5, decrypt);
-	AICWFDBG(LOGINFO, MD5PINRT, MD5(decrypt));
-
-	release_firmware(fw);
-
-	return size;
 #else
-    void *buffer = NULL;
-    char *path = NULL;
-    struct file *fp = NULL;
-    int size = 0, len = 0;// i = 0;
-    ssize_t rdlen = 0;
-    //u32 *src = NULL, *dst = NULL;
+	return "";
+#endif
+}
+
+/* Firmware-class data is const; the patch and text parsers need an owned copy. */
+static int rwnx_load_firmware(u32 **fw_buf, const char *name,
+			      struct rwnx_hw *rwnx_hw)
+{
+	const struct firmware *fw;
+	const char *directory;
+	char prefix[FW_PATH_MAX_LEN], fw_name[FW_PATH_MAX_LEN];
+	void *buffer;
 	MD5_CTX md5;
 	unsigned char decrypt[16];
+	int size, ret;
 
-    /* get the firmware path */
-    path = __getname();
-    if (!path) {
-        *fw_buf = NULL;
-        return -1;
-    }
-
-	len = snprintf(path, FW_PATH_MAX_LEN, "%s/%s", aic_fw_path, name);
-
-    //len = snprintf(path, FW_PATH_MAX_LEN, "%s", name);
-    if (len >= FW_PATH_MAX_LEN) {
-        AICWFDBG(LOGERROR, "%s: %s file's path too long\n", __func__, name);
-        *fw_buf = NULL;
-        __putname(path);
-        return -1;
-    }
-
-    AICWFDBG(LOGINFO, "%s :firmware path = %s  \n", __func__, path);
-
-    /* open the firmware file */
-    fp = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR_OR_NULL(fp)) {
-        AICWFDBG(LOGERROR, "%s: %s file failed to open\n", __func__, name);
-        *fw_buf = NULL;
-        __putname(path);
-        fp = NULL;
-        return -1;
-    }
-
-    size = i_size_read(file_inode(fp));
-    if (size <= 0) {
-        AICWFDBG(LOGERROR, "%s: %s file size invalid %d\n", __func__, name, size);
-        *fw_buf = NULL;
-        __putname(path);
-        filp_close(fp, NULL);
-        fp = NULL;
-        return -1;
-    }
-
-    /* start to read from firmware file */
-    buffer = vmalloc(size + 1);
-    if (!buffer) {
-        *fw_buf = NULL;
-        __putname(path);
-        filp_close(fp, NULL);
-        fp = NULL;
-        return -1;
-    }
-
-    #if LINUX_VERSION_CODE > KERNEL_VERSION(4, 13, 16)
-    rdlen = kernel_read(fp, buffer, size, &fp->f_pos);
-    #else
-    rdlen = kernel_read(fp, fp->f_pos, buffer, size);
-    #endif
-
-    *((char*)buffer + size) = 0;
-    if (size != rdlen) {
-        AICWFDBG(LOGERROR, "%s: %s file rdlen invalid %d\n", __func__, name, (int)rdlen);
-        *fw_buf = NULL;
-        __putname(path);
-        filp_close(fp, NULL);
-        fp = NULL;
-        vfree(buffer);
-        buffer = NULL;
-        return -1;
-    }
-    if (rdlen > 0) {
-        fp->f_pos += rdlen;
-    }
-
-#if 0
-    /*start to transform the data format*/
-    src = (u32 *)buffer;
-    dst = (u32 *)vmalloc(size);
-
-    if (!dst) {
-        *fw_buf = NULL;
-        __putname(path);
-        filp_close(fp, NULL);
-        fp = NULL;
-        vfree(buffer);
-        buffer = NULL;
-        return -1;
-    }
-
-    for (i = 0; i < (size/4); i++) {
-        dst[i] = src[i];
-    }
-#endif
-
-    __putname(path);
-    filp_close(fp, NULL);
-    fp = NULL;
-    //vfree(buffer);
-    //buffer = NULL;
-    *fw_buf = (u32*)buffer;
-
+	if (!fw_buf)
+		return -EINVAL;
+	*fw_buf = NULL;
+	if (!rwnx_hw || !rwnx_hw->dev)
+		return -ENODEV;
+	directory = rwnx_firmware_directory(rwnx_hw);
+	if (!directory)
+		return -ENODEV;
+	/* Snapshot the loader's parameter; no probe mutates the shared prefix. */
+	get_fw_path(prefix);
+	ret = aicwf_firmware_name(fw_name, sizeof(fw_name), prefix, directory,
+				 name);
+	if (ret)
+		return ret;
+	ret = request_firmware(&fw, fw_name, rwnx_hw->dev);
+	if (ret)
+		return ret;
+	if (!fw->size || fw->size > INT_MAX) {
+		ret = fw->size ? -EFBIG : -EINVAL;
+		goto out_release;
+	}
+	size = fw->size;
+	/* Text configurations need a terminator outside the firmware byte count. */
+	buffer = vmalloc((size_t)size + 1);
+	if (!buffer) {
+		ret = -ENOMEM;
+		goto out_release;
+	}
+	memcpy(buffer, fw->data, size);
+	((char *)buffer)[size] = '\0';
+	release_firmware(fw);
+	*fw_buf = buffer;
 	MD5Init(&md5);
-	MD5Update(&md5, (unsigned char *)buffer, size);
+	MD5Update(&md5, buffer, size);
 	MD5Final(&md5, decrypt);
-
 	AICWFDBG(LOGINFO, MD5PINRT, MD5(decrypt));
+	return size;
 
-    return size;
-#endif
+out_release:
+	release_firmware(fw);
+	return ret;
 }
 
 static void rwnx_restore_firmware(u32 **fw_buf)
@@ -778,14 +698,14 @@ static void rwnx_restore_firmware(u32 **fw_buf)
 }
 
 
-/* buffer is allocated by kzalloc */
+/* The caller owns the vmalloc buffer returned on success. */
 int rwnx_request_firmware_common(struct rwnx_hw *rwnx_hw, u32** buffer, const char *filename)
 {
     int size;
 
     AICWFDBG(LOGINFO, "### Load file %s\n", filename);
 
-    size = rwnx_load_firmware(buffer, filename, NULL);
+	size = rwnx_load_firmware(buffer, filename, rwnx_hw);
 
     return size;
 }
@@ -811,7 +731,8 @@ int rwnx_plat_bin_fw_upload_2(struct rwnx_hw *rwnx_hw, u32 fw_addr,
                                char *filename)
 {
     int err = 0;
-    unsigned int i = 0, size;
+	unsigned int i = 0;
+	int size;
 //    u32 *src;
 	u32 *dst = NULL;
 
@@ -819,18 +740,10 @@ int rwnx_plat_bin_fw_upload_2(struct rwnx_hw *rwnx_hw, u32 fw_addr,
     AICWFDBG(LOGINFO, "### Upload %s firmware, @ = %x\n", filename, fw_addr);
 
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
-    if (!dst) {
-	    AICWFDBG(LOGERROR, "No such file or directory\n");
-	    return -1;
-    }
-    if (size <= 0) {
-            AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-            dst = NULL;
-            err = -1;
-		return -1;
-    }
+	if (size <= 0)
+		return size < 0 ? size : -EINVAL;
 
-	AICWFDBG(LOGINFO, "size=%d, dst[0]=%x\n", size, dst[0]);
+	AICWFDBG(LOGINFO, "size=%d\n", size);
     if (size > 512) {
         for (; i < (size - 512); i += 512) {
             //printk("wr blk 0: %p -> %x\r\n", dst + i / 4, fw_addr + i);
@@ -860,37 +773,28 @@ int rwnx_plat_bin_fw_upload_2_with_version(struct rwnx_hw *rwnx_hw, u32 fw_addr,
                                char *filename, char *version_str, int version_size)
 {
     int err = 0;
-    unsigned int i = 0, size;
+	unsigned int i = 0;
+	int size;
     u32 *dst = NULL;
 
     /* Copy the file on the Embedded side */
     AICWFDBG(LOGINFO, "### Upload %s firmware, @ = %x\n", filename, fw_addr);
 
     size = rwnx_request_firmware_common(rwnx_hw, &dst, filename);
-    if (!dst) {
-        AICWFDBG(LOGERROR, "No such file or directory\n");
-        return -1;
-    }
-    if (size <= 0) {
-        AICWFDBG(LOGERROR, "wrong size of firmware file\n");
-        dst = NULL;
-        err = -1;
-        return -1;
-    }
-    AICWFDBG(LOGINFO, "size=%d, dst[0]=%x\n", size, dst[0]);
-    // get version if exist
+	if (size <= 0)
+		return size < 0 ? size : -EINVAL;
+	AICWFDBG(LOGINFO, "size=%d\n", size);
     if (version_str) {
-        char *bin_str = (char *)&dst[4];
-        int char_idx = 0;
-        for (char_idx = 0; char_idx < version_size; char_idx++) {
-            version_str[char_idx] = bin_str[char_idx];
-            if (bin_str[char_idx] == '\0') {
-                //break;
-            }
+		size_t version_len;
+
+		if (version_size <= 0 || size <= 4 * sizeof(*dst)) {
+			err = -EINVAL;
+			goto out_release;
         }
-        if (char_idx == version_size) {
-            version_str[version_size - 1] = '\0';
-        }
+		version_len = min_t(size_t, size - 4 * sizeof(*dst),
+				    version_size - 1);
+		memcpy(version_str, (u8 *)dst + 4 * sizeof(*dst), version_len);
+		version_str[version_len] = '\0';
         AICWFDBG(LOGINFO, "version_str=%s\n", version_str);
     }
     // upload
@@ -912,6 +816,7 @@ int rwnx_plat_bin_fw_upload_2_with_version(struct rwnx_hw *rwnx_hw, u32 fw_addr,
         }
     }
 
+out_release:
     if (dst) {
         rwnx_release_firmware_common(&dst);
     }
@@ -1627,31 +1532,16 @@ static void rwnx_plat_mpif_sel(struct rwnx_plat *rwnx_plat)
 }
 #endif
 #if (defined(CONFIG_DPD) && !defined(CONFIG_FORCE_DPD_CALIB))
-int is_file_exist(char* name)
+int is_file_exist(struct rwnx_hw *rwnx_hw, const char *name)
 {
-    char *path = NULL;
-    struct file *fp = NULL;
-    int len;
+	u32 *buffer = NULL;
+	int size;
 
-    path = __getname();
-    if (!path) {
-        AICWFDBG(LOGINFO, "%s getname fail\n", __func__);
-        return -1;
-    }
-
-    len = snprintf(path, FW_PATH_MAX_LEN, "%s/%s", aic_fw_path, name);
-
-    fp = filp_open(path, O_RDONLY, 0);
-    if (IS_ERR(fp)) {
-        __putname(path);
-        fp = NULL;
-        return 0;
-    } else {
-        __putname(path);
-        filp_close(fp, NULL);
-		fp = NULL;
-        return 1;
-    }
+	size = rwnx_request_firmware_common(rwnx_hw, &buffer, name);
+	if (size <= 0)
+		return size == -ENOENT ? 0 : (size < 0 ? size : -EINVAL);
+	rwnx_release_firmware_common(&buffer);
+	return 1;
 }
 #endif//CONFIG_DPD && !CONFIG_FORCE_DPD_CALIB
 /**
@@ -1668,10 +1558,6 @@ static int rwnx_plat_patch_load(struct rwnx_hw *rwnx_hw)
 
     if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DC ||
         rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DW){
-#ifndef ANDROID_PLATFORM
-        if (strlcat(aic_fw_path, "/aic8800DC", sizeof(aic_fw_path)) >= sizeof(aic_fw_path))
-            return -ENAMETOOLONG;
-#endif
         AICWFDBG(LOGINFO, "testmode=%d\n", testmode);
         if (chip_sub_id == 0) {
             if (testmode == FW_NORMAL_MODE) {
@@ -1707,7 +1593,10 @@ static int rwnx_plat_patch_load(struct rwnx_hw *rwnx_hw)
                     }
                 }
                 #else
-                if (is_file_exist(FW_DPDRESULT_NAME_8800DC) == 1) {
+				ret = is_file_exist(rwnx_hw, FW_DPDRESULT_NAME_8800DC);
+				if (ret < 0)
+					return ret;
+				if (ret) {
                     AICWFDBG(LOGINFO, "dpd bin load\n");
                     ret = aicwf_dpd_result_load_8800dc(rwnx_hw, &dpd_res);
                     if (ret) {
@@ -1783,7 +1672,10 @@ static int rwnx_plat_patch_load(struct rwnx_hw *rwnx_hw)
                 /* Note: apply dpd_res after rftest running */
             } else if (testmode == FW_DPDCALIB_MODE) {
                 #if (defined(CONFIG_DPD) && !defined(CONFIG_FORCE_DPD_CALIB))
-                if (is_file_exist(FW_DPDRESULT_NAME_8800DC) == 0) {
+				ret = is_file_exist(rwnx_hw, FW_DPDRESULT_NAME_8800DC);
+				if (ret < 0)
+					return ret;
+				if (!ret) {
                     AICWFDBG(LOGINFO, "patch load\n");
                     ret = aicwf_plat_patch_load_8800dc(rwnx_hw);
                     if (ret) {
@@ -1808,10 +1700,6 @@ static int rwnx_plat_patch_load(struct rwnx_hw *rwnx_hw)
             }
         }
     } else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D80N) {
-#ifndef ANDROID_PLATFORM
-        if (strlcat(aic_fw_path, "/aic8800D80N", sizeof(aic_fw_path)) >= sizeof(aic_fw_path))
-            return -ENAMETOOLONG;
-#endif
         if (testmode == FW_NORMAL_MODE) {
             ret = aicwf_plat_patch_load_8800d80n(rwnx_hw);
             if (ret) {
@@ -1839,10 +1727,6 @@ static int rwnx_plat_patch_load(struct rwnx_hw *rwnx_hw)
         }
     }
     else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DLN) {
-#ifndef ANDROID_PLATFORM
-        if (strlcat(aic_fw_path, "/aic8800DLN", sizeof(aic_fw_path)) >= sizeof(aic_fw_path))
-            return -ENAMETOOLONG;
-#endif
         if (testmode == FW_NORMAL_MODE) {
             aicwf_patch_config_8800dln(rwnx_hw);
         }
@@ -3273,21 +3157,22 @@ int IsCommentString(char *szStr)
         return 0;
 }
 
-int ParseQualifiedString(char *In, u32 *Start, char *Out, char LeftQualifier, char RightQualifier)
+static int ParseQualifiedString(const char *in, u32 *start, char *out,
+				size_t out_size, char left, char right)
 {
-    u32 i = 0, j = 0;
-    char c = In[(*Start)++];
-    if (c != LeftQualifier)
-        return 0;
-    i = (*Start);
-    c = In[(*Start)++];
-    while (c != RightQualifier && c != '\0')
-        c = In[(*Start)++];
-    if (c == '\0')
-        return 0;
-    j = (*Start) - 2;
-    strncpy((char *)Out, (const char *)(In + i), j - i + 1);
-    return 1;
+	size_t len = strlen(in), begin = *start, end;
+
+	if (!out_size || begin >= len || in[begin] != left)
+		return 0;
+	begin++;
+	for (end = begin; end < len && in[end] != right; end++)
+		;
+	if (end == len || end - begin >= out_size)
+		return 0;
+	memcpy(out, in + begin, end - begin);
+	out[end - begin] = '\0';
+	*start = end + 1;
+	return 1;
 }
 
 int GetU1ByteIntegerFromStringInDecimal(char *Str, u8 *pInt)
@@ -3416,7 +3301,7 @@ void rwnx_plat_powerlimit_parsing(char *buffer, int size)
 			memset((void *)bandwidth, 0, 10);
 			memset((void *)colNumBuf, 0, 10);
 
-			if (!ParseQualifiedString(szLine, &i, band, ' ', ',')) {
+			if (!ParseQualifiedString(szLine, &i, band, sizeof(band), ' ', ',')) {
 				AICWFDBG(LOGERROR, "Fail to parse band!\n");
 				goto exit;
 			}
@@ -3426,7 +3311,8 @@ void rwnx_plat_powerlimit_parsing(char *buffer, int size)
 				band_cc = PHY_BAND_5G;
 			}
 
-			if (!ParseQualifiedString(szLine, &i, bandwidth, ' ', ',')) {
+			if (!ParseQualifiedString(szLine, &i, bandwidth,
+					  sizeof(bandwidth), ' ', ',')) {
 				AICWFDBG(LOGERROR, "Fail to parse bandwidth!\n");
 				goto exit;
 			}
@@ -3437,7 +3323,8 @@ void rwnx_plat_powerlimit_parsing(char *buffer, int size)
 			else if (strncmp(bandwidth, "80M", 3) == 0)
 				bw_cc = PHY_CHNL_BW_80;
 
-			if (!ParseQualifiedString(szLine, &i, colNumBuf, '#', '#')) {
+			if (!ParseQualifiedString(szLine, &i, colNumBuf,
+					  sizeof(colNumBuf), '#', '#')) {
 				AICWFDBG(LOGERROR, "Fail to parse column number!\n");
 				goto exit;
 			}
@@ -3499,7 +3386,7 @@ void rwnx_plat_powerlimit_parsing(char *buffer, int size)
 					goto exit;
 				}
 
-				strncpy(reg_name[forCnt], szLine + i_cc, i - i_cc);
+				memcpy(reg_name[forCnt], szLine + i_cc, i - i_cc);
 				reg_name[forCnt][i - i_cc] = '\0';
 				AICWFDBG(LOGINFO, "reg_name: %s\n", reg_name[forCnt]);
 
@@ -3705,36 +3592,50 @@ int8_t get_powerlimit_by_chnum(uint8_t chnum, uint8_t r_idx, uint8_t bw)
  * rwnx_plat_userconfig_load  ---Load aic_userconfig.txt
  *@filename name of config
 */
-static int rwnx_plat_userconfig_load(struct rwnx_hw *rwnx_hw) {
+static int rwnx_plat_userconfig_load(struct rwnx_hw *rwnx_hw)
+{
+	int ret = 0;
 
-	if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DC){
-		rwnx_plat_userconfig_load_8800dc(rwnx_hw);
-        #ifdef CONFIG_POWER_LIMIT
-        rwnx_plat_powerlimit_load_8800dcdw(rwnx_hw, PRODUCT_ID_AIC8800DC);
-        #endif
-	}else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DW){
-        rwnx_plat_userconfig_load_8800dw(rwnx_hw);
-        #ifdef CONFIG_POWER_LIMIT
-        rwnx_plat_powerlimit_load_8800dcdw(rwnx_hw, PRODUCT_ID_AIC8800DW);
-        #endif
-    }else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DLN){
-        rwnx_plat_userconfig_load_8800dln(rwnx_hw);
-        #ifdef CONFIG_POWER_LIMIT
-        rwnx_plat_powerlimit_load_8800dln(rwnx_hw);
-        #endif
-    }else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D81){
-        rwnx_plat_userconfig_load_8800d80(rwnx_hw);
-    }else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D81X2 ||
-        rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D89X2){
-        rwnx_plat_userconfig_load_8800d80x2(rwnx_hw);
-    }else if(rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D80N){
-        rwnx_plat_userconfig_load_8800d80n(rwnx_hw);
+	switch (rwnx_hw->usbdev->chipid) {
+	case PRODUCT_ID_AIC8800DC:
+		ret = rwnx_plat_userconfig_load_8800dc(rwnx_hw);
 #ifdef CONFIG_POWER_LIMIT
-        rwnx_plat_powerlimit_load_8800d80n(rwnx_hw);
+		if (!ret)
+			ret = rwnx_plat_powerlimit_load_8800dcdw(rwnx_hw,
+							 PRODUCT_ID_AIC8800DC);
 #endif
-    }
-
-	return 0;
+		break;
+	case PRODUCT_ID_AIC8800DW:
+		ret = rwnx_plat_userconfig_load_8800dw(rwnx_hw);
+#ifdef CONFIG_POWER_LIMIT
+		if (!ret)
+			ret = rwnx_plat_powerlimit_load_8800dcdw(rwnx_hw,
+							 PRODUCT_ID_AIC8800DW);
+#endif
+		break;
+	case PRODUCT_ID_AIC8800DLN:
+		ret = rwnx_plat_userconfig_load_8800dln(rwnx_hw);
+#ifdef CONFIG_POWER_LIMIT
+		if (!ret)
+			ret = rwnx_plat_powerlimit_load_8800dln(rwnx_hw);
+#endif
+		break;
+	case PRODUCT_ID_AIC8800D81:
+		ret = rwnx_plat_userconfig_load_8800d80(rwnx_hw);
+		break;
+	case PRODUCT_ID_AIC8800D81X2:
+	case PRODUCT_ID_AIC8800D89X2:
+		ret = rwnx_plat_userconfig_load_8800d80x2(rwnx_hw);
+		break;
+	case PRODUCT_ID_AIC8800D80N:
+		ret = rwnx_plat_userconfig_load_8800d80n(rwnx_hw);
+#ifdef CONFIG_POWER_LIMIT
+		if (!ret)
+			ret = rwnx_plat_powerlimit_load_8800d80n(rwnx_hw);
+#endif
+		break;
+	}
+	return ret;
 }
 
 
@@ -3754,12 +3655,10 @@ static int rwnx_plat_userconfig_load(struct rwnx_hw *rwnx_hw) {
  */
 int rwnx_platform_on(struct rwnx_hw *rwnx_hw, void *config)
 {
+	int ret = 0;
     #if 0
     u8 *shared_ram;
     #endif
-#ifdef CONFIG_ROM_PATCH_EN
-    int ret = 0;
-#endif
 
     struct rwnx_plat *rwnx_plat = rwnx_hw->plat;
 
@@ -3828,7 +3727,9 @@ int rwnx_platform_on(struct rwnx_hw *rwnx_hw, void *config)
     }
 #endif
 
-    rwnx_plat_userconfig_load(rwnx_hw);
+	ret = rwnx_plat_userconfig_load(rwnx_hw);
+	if (ret)
+		return ret;
 
 
     //rwnx_plat->enabled = true;
