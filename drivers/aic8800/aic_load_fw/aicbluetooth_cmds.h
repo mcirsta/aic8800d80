@@ -110,6 +110,7 @@ struct rwnx_cmd {
     lmac_msg_id_t reqid;
     struct rwnx_cmd_a2emsg *a2e_msg;
     char *e2a_msg;
+	size_t e2a_msg_len;
     u32 tkn;
     u16 flags;
     struct completion complete;
@@ -139,7 +140,8 @@ struct rwnx_cmd_mgr {
 
     int  (*queue)(struct rwnx_cmd_mgr *, struct rwnx_cmd *);
     int  (*llind)(struct rwnx_cmd_mgr *, struct rwnx_cmd *);
-    int  (*msgind)(struct rwnx_cmd_mgr *, struct rwnx_cmd_e2amsg *, msg_cb_fct);
+	int (*msgind)(struct rwnx_cmd_mgr *cmd_mgr,
+		     struct rwnx_cmd_e2amsg *msg, size_t msg_len, msg_cb_fct cb);
     void (*print)(struct rwnx_cmd_mgr *);
     void (*drain)(struct rwnx_cmd_mgr *);
 
@@ -321,7 +323,8 @@ int rwnx_send_dbg_mem_block_write_req(struct aic_usb_dev *usbdev, u32 mem_addr,
 int rwnx_send_dbg_mem_write_req(struct aic_usb_dev *usbdev, u32 mem_addr, u32 mem_data);
 int rwnx_send_dbg_mem_read_req(struct aic_usb_dev *usbdev, u32 mem_addr, struct dbg_mem_read_cfm *cfm);
 
-void rwnx_rx_handle_msg(struct aic_usb_dev *usbdev, struct ipc_e2a_msg *msg);
+int rwnx_rx_handle_msg(struct aic_usb_dev *usbdev, struct ipc_e2a_msg *msg,
+		       size_t msg_len);
 
 int rwnx_send_dbg_start_app_req(struct aic_usb_dev *usbdev, u32 boot_addr,
                                 u32 boot_type);

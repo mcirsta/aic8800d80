@@ -115,12 +115,19 @@ static int cmd_mgr_run_callback(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *c
 }
 
 static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr,
-			 struct rwnx_cmd_e2amsg *msg, msg_cb_fct cb)
+			 struct rwnx_cmd_e2amsg *msg, size_t msg_len,
+			 msg_cb_fct cb)
 {
 	struct rwnx_cmd *cmd;
 	bool found = false;
+	int ret = 0;
+	size_t hdr_len = offsetof(struct rwnx_cmd_e2amsg, param);
 
-	//printk("cmd->id=%x\n", msg->id);
+	if (!msg || msg_len < hdr_len)
+		return -EMSGSIZE;
+	if (msg->param_len > sizeof(msg->param) ||
+	    msg->param_len > msg_len - hdr_len)
+		ret = -EMSGSIZE;
 	spin_lock(&cmd_mgr->lock);
 	if (cmd_mgr->state != RWNX_CMD_MGR_STATE_INITED) {
 		spin_unlock(&cmd_mgr->lock);
@@ -129,16 +136,19 @@ static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr,
 	list_for_each_entry(cmd, &cmd_mgr->cmds, list) {
 		if (cmd->reqid == msg->id &&
 			(cmd->flags & RWNX_CMD_FLAG_WAIT_CFM)) {
+			if (ret || (cmd->e2a_msg &&
+				    msg->param_len != cmd->e2a_msg_len)) {
+				/* A malformed reply cannot authorize reuse of its ID. */
+				cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+				cmd_complete(cmd_mgr, cmd, -EMSGSIZE);
+				ret = -EMSGSIZE;
+				found = true;
+				break;
+			}
 
 			if (!cmd_mgr_run_callback(cmd_mgr, cmd, msg, cb)) {
 				found = true;
 				cmd->flags &= ~RWNX_CMD_FLAG_WAIT_CFM;
-
-				if (WARN((msg->param_len > RWNX_CMD_E2AMSG_LEN_MAX),
-                         "Unexpect E2A msg len %d > %d\n", msg->param_len,
-                         RWNX_CMD_E2AMSG_LEN_MAX)) {
-					msg->param_len = RWNX_CMD_E2AMSG_LEN_MAX;
-				}
 
 				if (cmd->e2a_msg && msg->param_len)
 					memcpy(cmd->e2a_msg, &msg->param, msg->param_len);
@@ -152,10 +162,10 @@ static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr,
 	}
 	spin_unlock(&cmd_mgr->lock);
 
-	if (!found)
+	if (!found && !ret)
 		cmd_mgr_run_callback(cmd_mgr, NULL, msg, cb);
 
-	return 0;
+	return ret;
 }
 
 static void cmd_mgr_print(struct rwnx_cmd_mgr *cmd_mgr)
@@ -292,7 +302,8 @@ static void rwnx_msg_free(struct lmac_msg *msg, const void *msg_params)
 
 
 static int rwnx_send_msg(struct aic_usb_dev *usbdev, const void *msg_params,
-			 int reqcfm, lmac_msg_id_t reqid, void *cfm)
+			 int reqcfm, lmac_msg_id_t reqid, void *cfm,
+			 size_t cfm_len)
 {
 	struct rwnx_cmd_mgr *cmd_mgr = &usbdev->cmd_mgr;
 	struct lmac_msg *msg;
@@ -300,6 +311,11 @@ static int rwnx_send_msg(struct aic_usb_dev *usbdev, const void *msg_params,
 	int ret;
 
 	msg = container_of((void *)msg_params, struct lmac_msg, param);
+	if ((!cfm && cfm_len) || (cfm && !cfm_len) ||
+	    (!reqcfm && cfm_len)) {
+		ret = -EINVAL;
+		goto out_free_msg;
+	}
 	ret = mutex_lock_interruptible(&cmd_mgr->tx_lock);
 	if (ret)
 		goto out_free_msg;
@@ -336,6 +352,7 @@ static int rwnx_send_msg(struct aic_usb_dev *usbdev, const void *msg_params,
 	cmd->reqid = reqid;
 	cmd->a2e_msg = msg;
 	cmd->e2a_msg = cfm;
+	cmd->e2a_msg_len = cfm_len;
 	cmd->flags = RWNX_CMD_FLAG_REQ_CFM;
 	ret = cmd_mgr->queue(cmd_mgr, cmd);
 	kfree(cmd);
@@ -363,7 +380,8 @@ int rwnx_send_dbg_mem_mask_write_req(struct aic_usb_dev *usbdev, u32 mem_addr,
     mem_mask_write_req->memdata = mem_data;
 
     /* Send the DBG_MEM_MASK_WRITE_REQ message to LMAC FW */
-    return rwnx_send_msg(usbdev, mem_mask_write_req, 1, DBG_MEM_MASK_WRITE_CFM, NULL);
+	return rwnx_send_msg(usbdev, mem_mask_write_req, 1, DBG_MEM_MASK_WRITE_CFM,
+			     NULL, 0);
 }
 
 
@@ -385,7 +403,8 @@ int rwnx_send_dbg_mem_block_write_req(struct aic_usb_dev *usbdev, u32 mem_addr,
     memcpy(mem_blk_write_req->memdata, mem_data, mem_size);
 
     /* Send the DBG_MEM_BLOCK_WRITE_REQ message to LMAC FW */
-    return rwnx_send_msg(usbdev, mem_blk_write_req, 1, DBG_MEM_BLOCK_WRITE_CFM, NULL);
+	return rwnx_send_msg(usbdev, mem_blk_write_req, 1, DBG_MEM_BLOCK_WRITE_CFM,
+			     NULL, 0);
 }
 
 
@@ -394,6 +413,8 @@ int rwnx_send_dbg_mem_read_req(struct aic_usb_dev *usbdev, u32 mem_addr,
 {
     struct dbg_mem_read_req *mem_read_req;
 
+	if (!cfm)
+		return -EINVAL;
 
     /* Build the DBG_MEM_READ_REQ message */
     mem_read_req = rwnx_msg_zalloc(DBG_MEM_READ_REQ, TASK_DBG, DRV_TASK_ID,
@@ -405,7 +426,8 @@ int rwnx_send_dbg_mem_read_req(struct aic_usb_dev *usbdev, u32 mem_addr,
     mem_read_req->memaddr = mem_addr;
 
     /* Send the DBG_MEM_READ_REQ message to LMAC FW */
-    return rwnx_send_msg(usbdev, mem_read_req, 1, DBG_MEM_READ_CFM, cfm);
+	return rwnx_send_msg(usbdev, mem_read_req, 1, DBG_MEM_READ_CFM, cfm,
+			     sizeof(*cfm));
 }
 
 
@@ -426,7 +448,7 @@ int rwnx_send_dbg_mem_write_req(struct aic_usb_dev *usbdev, u32 mem_addr, u32 me
     mem_write_req->memdata = mem_data;
 
     /* Send the DBG_MEM_WRITE_REQ message to LMAC FW */
-    return rwnx_send_msg(usbdev, mem_write_req, 1, DBG_MEM_WRITE_CFM, NULL);
+	return rwnx_send_msg(usbdev, mem_write_req, 1, DBG_MEM_WRITE_CFM, NULL, 0);
 }
 
 int rwnx_send_dbg_start_app_req(struct aic_usb_dev *usbdev, u32 boot_addr,
@@ -446,20 +468,23 @@ int rwnx_send_dbg_start_app_req(struct aic_usb_dev *usbdev, u32 boot_addr,
     start_app_req->boottype = boot_type;
 
     /* Send the DBG_START_APP_REQ message to LMAC FW */
-    return rwnx_send_msg(usbdev, start_app_req, 0, 0, NULL);
+	return rwnx_send_msg(usbdev, start_app_req, 0, 0, NULL, 0);
 }
 
 static msg_cb_fct dbg_hdlrs[MSG_I(DBG_MAX)] = {
 };
 
-static msg_cb_fct *msg_hdlrs[] = {
-    [TASK_DBG]   = dbg_hdlrs,
-};
-
-void rwnx_rx_handle_msg(struct aic_usb_dev *usbdev, struct ipc_e2a_msg *msg)
+int rwnx_rx_handle_msg(struct aic_usb_dev *usbdev, struct ipc_e2a_msg *msg,
+		       size_t msg_len)
 {
-    usbdev->cmd_mgr.msgind(&usbdev->cmd_mgr, msg,
-                            msg_hdlrs[MSG_T(msg->id)][MSG_I(msg->id)]);
+	if (!msg || msg_len < offsetof(struct ipc_e2a_msg, param))
+		return -EMSGSIZE;
+	/* The loader supports only the debug task; empty callbacks are valid. */
+	if (MSG_T(msg->id) != TASK_DBG ||
+	    MSG_I(msg->id) >= ARRAY_SIZE(dbg_hdlrs))
+		return -EOPNOTSUPP;
+	return usbdev->cmd_mgr.msgind(&usbdev->cmd_mgr, msg, msg_len,
+				     dbg_hdlrs[MSG_I(msg->id)]);
 }
 
 
