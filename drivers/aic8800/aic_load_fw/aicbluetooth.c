@@ -1,6 +1,7 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 #include <linux/limits.h>
+#include <linux/unaligned.h>
 #include "aicbluetooth_cmds.h"
 #include "aicwf_usb.h"
 #include "aic_txrxif.h"
@@ -1051,16 +1052,40 @@ int aicbt_patch_table_free(struct aicbt_patch_table *head)
 	return 0;
 }
 
-struct aicbt_patch_table *aicbt_patch_table_alloc(struct aic_usb_dev *usbdev,const char *filename)
+static int aicbt_patch_table_validate(const struct aicbt_patch_table *table)
+{
+	/* The old >= 1000 workaround did not consume a record's payload. */
+	if (!table || table->type >= 1000 || table->len > INT_MAX / 8 ||
+	    (table->len && !table->data))
+		return -EINVAL;
+
+	if (table->type == AICBT_PT_BTMODE && table->len < 9)
+		return -EINVAL;
+	if (table->type == AICBT_PT_VER && !table->len)
+		return -EINVAL;
+	if (table->type == AICBT_PT_INF) {
+		if (!table->len)
+			return -EINVAL;
+		/* Four base pairs, then an optional count and extension pairs. */
+		if (table->len > 4 && table->data[9] > table->len - 5)
+			return -EINVAL;
+	}
+	return 0;
+}
+
+struct aicbt_patch_table *aicbt_patch_table_alloc(struct aic_usb_dev *usbdev,
+					       const char *filename)
 {
 	struct device *dev = usbdev->dev;
 	struct aicbt_patch_table *head = NULL;
-	struct aicbt_patch_table *new = NULL;
 	struct aicbt_patch_table *cur = NULL;
+	struct aicbt_patch_table *entry;
+	size_t remaining, bytes;
+	uint32_t type, len, i;
 	int size;
 	int ret = 0;
-	uint8_t *rawdata=NULL;
-	uint8_t *p = NULL;
+	uint8_t *rawdata = NULL;
+	const uint8_t *p;
 
 	/* load aic firmware */
 	size = aic_load_firmware((u32 **)&rawdata, filename, dev);
@@ -1078,58 +1103,66 @@ struct aicbt_patch_table *aicbt_patch_table_alloc(struct aic_usb_dev *usbdev,con
 		ret = -EINVAL;
 		goto err;
 	}
-	p = rawdata;
-
-	if (memcmp(p, AICBT_PT_TAG, sizeof(AICBT_PT_TAG) < 16 ? sizeof(AICBT_PT_TAG) : 16)) {
+	if (memcmp(rawdata, AICBT_PT_TAG, sizeof(AICBT_PT_TAG))) {
 		printk("TAG err\n");
 		ret = -EINVAL;
 		goto err;
 	}
-	p += 16;
+	p = rawdata + 16;
+	remaining = size - 16;
 
-	while (p - rawdata < size) {
-		//printk("size = %d  p - rawdata = %d \r\n", size, p - rawdata);
-		new = (struct aicbt_patch_table *)vmalloc(sizeof(struct aicbt_patch_table));
-		if (!new) {
+	while (remaining) {
+		if (remaining < 24) {
+			ret = -EINVAL;
+			goto err;
+		}
+		type = get_unaligned_le32(p + 16);
+		len = get_unaligned_le32(p + 20);
+		/* Divide before multiplying so a firmware count cannot wrap. */
+		if (len > (remaining - 24) / 8) {
+			ret = -EINVAL;
+			goto err;
+		}
+		bytes = (size_t)len * 8;
+
+		entry = vzalloc(sizeof(*entry));
+		if (!entry) {
 			ret = -ENOMEM;
 			goto err;
 		}
-		memset(new, 0, sizeof(struct aicbt_patch_table));
-		if (head == NULL) {
-			head = new;
-			cur  = new;
-		} else {
-			cur->next = new;
-			cur = cur->next;
-		}
+		if (cur)
+			cur->next = entry;
+		else
+			head = entry;
+		cur = entry;
+		cur->type = type;
+		cur->len = len;
 
-		cur->name = (char *)vmalloc(sizeof(char) * 16);
+		cur->name = vzalloc(17);
 		if (!cur->name) {
 			ret = -ENOMEM;
 			goto err;
 		}
-		memset(cur->name, 0, sizeof(char) * 16);
 		memcpy(cur->name, p, 16);
-		p += 16;
-
-		cur->type = *(uint32_t *)p;
-		p += 4;
-
-		cur->len = *(uint32_t *)p;
-		p += 4;
-
-		if((cur->type )  >= 1000 || cur->len == 0) {//Temp Workaround
-			cur->len = 0;
-		}else{
-			cur->data = (uint32_t *)vmalloc(sizeof(uint8_t) * cur->len * 8);
+		p += 24;
+		if (bytes) {
+			cur->data = vmalloc(bytes);
 			if (!cur->data) {
 				ret = -ENOMEM;
 				goto err;
 			}
-			memset(cur->data, 0, sizeof(uint8_t) * cur->len * 8);
-			memcpy(cur->data, p, cur->len * 8);
-			p += cur->len * 8;
+			if (type == AICBT_PT_VER) {
+				memcpy(cur->data, p, bytes);
+			} else {
+				for (i = 0; i < len * 2; i++)
+					cur->data[i] = get_unaligned_le32(p + i * 4);
+			}
 		}
+		ret = aicbt_patch_table_validate(cur);
+		if (ret)
+			goto err;
+		p += bytes;
+		remaining -= 24 + bytes;
 	}
 
 	if (!head) {
@@ -1334,10 +1367,22 @@ void aicbt_parse_config(struct aic_usb_dev *usbdev, const char *filename)
 int aicbt_patch_table_load(struct aic_usb_dev *usbdev, struct aicbt_patch_table *_head)
 {
 	struct aicbt_patch_table *head, *p;
-	int ret = 0, i;
+	int ret;
+	uint32_t i;
 	uint32_t *data = NULL;
 
+	if (!usbdev || usbdev->chipid >= ARRAY_SIZE(aicbt_info))
+		return -ENODEV;
+	if (!_head)
+		return -EINVAL;
+
 	head = _head;
+	/* Reject the whole table before issuing any device write. */
+	for (p = head; p; p = p->next) {
+		ret = aicbt_patch_table_validate(p);
+		if (ret)
+			return ret;
+	}
 
 	for (p = head; p != NULL; p = p->next) {
 		data = p->data;
@@ -1361,9 +1406,9 @@ int aicbt_patch_table_load(struct aic_usb_dev *usbdev, struct aicbt_patch_table 
 			printk("%s bt tx_pwr[%d]:%4X\r\n", __func__, usbdev->chipid, aicbt_info[usbdev->chipid].txpwr_lvl);
 
 		}
-		if (p->type == 0x06) {
+		if (p->type == AICBT_PT_VER) {
 			char *data_s = (char *)p->data;
-			printk("patch version %s\n", data_s);
+			pr_info("patch version %.*s\n", (int)(p->len * 8), data_s);
 			continue;
 		}
 		for (i = 0; i < p->len; i++) {
@@ -1379,66 +1424,49 @@ int aicbt_patch_table_load(struct aic_usb_dev *usbdev, struct aicbt_patch_table 
 	return 0;
 }
 
-int aicbt_patch_info_unpack(struct aicbt_patch_info_t *patch_info, struct aicbt_patch_table *head_t)
+int aicbt_patch_info_unpack(struct aicbt_patch_info_t *patch_info,
+			    struct aicbt_patch_table *head_t)
 {
-    int base_len = 0;
-    int memcpy_len = 0;
-    
-    if (AICBT_PT_INF == head_t->type) {
-        base_len = ((offsetof(struct aicbt_patch_info_t,  ext_patch_nb_addr) - offsetof(struct aicbt_patch_info_t,  adid_addrinf) )/sizeof(uint32_t))/2;
-        AICWFDBG(LOGDEBUG, "%s head_t->len:%d base_len:%d \r\n", __func__, head_t->len, base_len);
+	uint32_t len;
+	int ret;
 
-        if (head_t->len > base_len){
-            patch_info->info_len = base_len;
-            memcpy_len = patch_info->info_len + 1;//include ext patch nb     
-        } else{
-            patch_info->info_len = head_t->len;
-            memcpy_len = patch_info->info_len;
-        }
+	if (!patch_info || !head_t)
+		return -EINVAL;
+	if (head_t->type != AICBT_PT_INF)
+		return 0;
+
+	/* Check extension pairs against physical size before shortening len. */
+	ret = aicbt_patch_table_validate(head_t);
+	if (ret)
+		return ret;
+	len = head_t->len;
+	patch_info->info_len = min_t(uint32_t, len, 4);
+	patch_info->ext_patch_nb_addr = 0;
+	patch_info->ext_patch_nb = 0;
+	patch_info->ext_patch_param = NULL;
+	patch_info->adid_addrinf = head_t->data[0];
+	patch_info->addr_adid = head_t->data[1];
+	if (len >= 2) {
+		patch_info->patch_addrinf = head_t->data[2];
+		patch_info->addr_patch = head_t->data[3];
+	}
+	if (len >= 3) {
+		patch_info->reset_addr = head_t->data[4];
+		patch_info->reset_val = head_t->data[5];
+	}
+	if (len >= 4) {
+		patch_info->adid_flag_addr = head_t->data[6];
+		patch_info->adid_flag = head_t->data[7];
+	}
+	if (len > 4) {
+		patch_info->ext_patch_nb_addr = head_t->data[8];
+		patch_info->ext_patch_nb = head_t->data[9];
+		if (patch_info->ext_patch_nb)
+			patch_info->ext_patch_param = head_t->data + 10;
+	}
+	/* Only base address/value pairs belong in the later device upload. */
 	head_t->len = patch_info->info_len;
-        AICWFDBG(LOGDEBUG, "%s memcpy_len:%d \r\n", __func__, memcpy_len);   
-
-        if (patch_info->info_len == 0)
-            return 0;
-
-        if (memcpy_len >= 1) {
-            patch_info->adid_addrinf = head_t->data[0];
-            patch_info->addr_adid = head_t->data[1];
-        }
-        if (memcpy_len >= 2) {
-            patch_info->patch_addrinf = head_t->data[2];
-            patch_info->addr_patch = head_t->data[3];
-        }
-        if (memcpy_len >= 3) {
-            patch_info->reset_addr = head_t->data[4];
-            patch_info->reset_val = head_t->data[5];
-        }
-        if (memcpy_len >= 4) {
-            patch_info->adid_flag_addr = head_t->data[6];
-            patch_info->adid_flag = head_t->data[7];
-        }
-        if (memcpy_len >= 5) {
-            patch_info->ext_patch_nb_addr = head_t->data[8];
-            patch_info->ext_patch_nb = head_t->data[9];
-        }
-        AICWFDBG(LOGDEBUG, "%s adid_addrinf:%x addr_adid:%x \r\n", __func__, 
-            patch_info->adid_addrinf,
-            patch_info->addr_adid);
-
-        if (patch_info->ext_patch_nb > 0){
-            int index = 0;
-            patch_info->ext_patch_param = (uint32_t *)(head_t->data + ((memcpy_len) * 2));
-            
-            for(index = 0; index < patch_info->ext_patch_nb; index++){
-                AICWFDBG(LOGDEBUG, "%s id:%x addr:%x \r\n", __func__, 
-                    *(patch_info->ext_patch_param + (index * 2)),
-                    *(patch_info->ext_patch_param + (index * 2) + 1));
-            }
-        }
-
-    }
-    return 0;
-
+	return 0;
 }
 
 int rwnx_plat_bin_fw_patch_table_upload_android(struct aic_usb_dev *usbdev,

@@ -85,6 +85,7 @@ struct aicbt_patch_info_t {
 #define AICBT_PT_BTMODE       0x03
 #define AICBT_PT_PWRON        0x04
 #define AICBT_PT_AF           0x05
+#define AICBT_PT_VER          0x06
 
 #define rwnx_cmd_e2amsg ipc_e2a_msg
 #define rwnx_cmd_a2emsg lmac_msg
