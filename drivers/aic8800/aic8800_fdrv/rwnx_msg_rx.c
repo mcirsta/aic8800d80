@@ -647,70 +647,11 @@ static inline int rwnx_rx_scan_done_ind(struct rwnx_hw *rwnx_hw,
  **************************************************************************/
 #ifdef CONFIG_RWNX_FULLMAC
 static inline int rwnx_rx_scanu_start_cfm(struct rwnx_hw *rwnx_hw,
-                                          struct rwnx_cmd *cmd,
-                                          struct ipc_e2a_msg *msg)
+					struct rwnx_cmd *cmd,
+					struct ipc_e2a_msg *msg)
 {
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
-			struct cfg80211_scan_info info = {
-				.aborted = false,
-			};
-#endif
-
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
-
-    if (rwnx_hw->scan_request 
-#ifdef CONFIG_SCHED_SCAN
-        && !rwnx_hw->is_sched_scan
-#endif//CONFIG_SCHED_SCAN
-#ifdef CONFIG_USE_WIRELESS_EXT
-		&& !rwnx_hw->wext_scan) {
-#else
-		){
-#endif
-
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
-        cfg80211_scan_done(rwnx_hw->scan_request, &info);
-#else
-        cfg80211_scan_done(rwnx_hw->scan_request, false);
-#endif
-    } 
-
-
-#ifdef CONFIG_USE_WIRELESS_EXT
-	else if(rwnx_hw->wext_scan){
-    	rwnx_hw->wext_scan = 0;
-		AICWFDBG(LOGDEBUG, "%s rwnx_hw->wext_scan done!!\r\n", __func__);
-		if(rwnx_hw->scan_request){
-			vfree(rwnx_hw->scan_request);
-		}
-		complete(&rwnx_hw->wext_scan_com);
-	}
-#endif
-	else {
-        AICWFDBG(LOGERROR, "%s rwnx_hw->scan_request is NULL!!\r\n", __func__);
-    }
-    
-#ifdef CONFIG_SCHED_SCAN
-        if(rwnx_hw->is_sched_scan){
-    
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
-            AICWFDBG(LOGINFO, "%s cfg80211_sched_scan_results \r\n", __func__);
-            cfg80211_sched_scan_results(rwnx_hw->scan_request->wiphy, 
-                    rwnx_hw->sched_scan_req->reqid);
-#else
-            cfg80211_sched_scan_results(rwnx_hw->sched_scan_req->wiphy);
-#endif  
-            kfree(rwnx_hw->scan_request);
-            rwnx_hw->is_sched_scan = false;
-        }
-#endif//CONFIG_SCHED_SCAN
-
-    rwnx_hw->scan_request = NULL;
-    rwnx_hw->scanning = 0;
-
-    return 0;
+	rwnx_scan_complete(rwnx_hw, NULL, false);
+	return 0;
 }
 
 static inline int rwnx_rx_scanu_result_ind(struct rwnx_hw *rwnx_hw,

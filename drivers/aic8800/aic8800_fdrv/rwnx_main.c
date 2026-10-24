@@ -1322,6 +1322,92 @@ void rwnx_set_conn_state(struct rwnx_vif *vif, atomic_t *drv_conn_state, int sta
 /*********************************************************************
  * netdev callbacks
  ********************************************************************/
+bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
+			struct wireless_dev *wdev, bool aborted)
+{
+	struct cfg80211_scan_request *request;
+#ifdef CONFIG_USE_WIRELESS_EXT
+	bool wext_scan = false;
+#endif
+#ifdef CONFIG_SCHED_SCAN
+	struct cfg80211_sched_scan_request *sched_request;
+	bool sched_scan;
+#endif
+
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	request = rwnx_hw->scan_request;
+	if (!request) {
+		if (!wdev) {
+			rwnx_hw->scanning = false;
+#ifdef CONFIG_USE_WIRELESS_EXT
+			wext_scan = rwnx_hw->wext_scan;
+			rwnx_hw->wext_scan = false;
+#endif
+		}
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+#ifdef CONFIG_USE_WIRELESS_EXT
+		/* Legacy WEXT publishes its request after sending the scan. */
+		if (wext_scan) {
+			complete(&rwnx_hw->wext_scan_com);
+			return true;
+		}
+#endif
+		return false;
+	}
+	if (wdev && request->wdev != wdev) {
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		return false;
+	}
+	rwnx_hw->scan_request = NULL;
+	rwnx_hw->scanning = false;
+#ifdef CONFIG_USE_WIRELESS_EXT
+	wext_scan = rwnx_hw->wext_scan;
+	rwnx_hw->wext_scan = false;
+#endif
+#ifdef CONFIG_SCHED_SCAN
+	sched_scan = rwnx_hw->is_sched_scan;
+	sched_request = rwnx_hw->sched_scan_req;
+	rwnx_hw->is_sched_scan = false;
+#endif
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+
+#ifdef CONFIG_USE_WIRELESS_EXT
+	if (wext_scan) {
+		vfree(request);
+		complete(&rwnx_hw->wext_scan_com);
+		return true;
+	}
+#endif
+#ifdef CONFIG_SCHED_SCAN
+	if (sched_scan) {
+		if (!aborted && sched_request) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 12, 0)
+			cfg80211_sched_scan_results(sched_request->wiphy,
+						   sched_request->reqid);
+#else
+			cfg80211_sched_scan_results(sched_request->wiphy);
+#endif
+		}
+		kfree(request);
+		return true;
+	}
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+	{
+		struct cfg80211_scan_info info = { .aborted = aborted };
+
+		cfg80211_scan_done(request, &info);
+	}
+#else
+	cfg80211_scan_done(request, aborted);
+#endif
+	return true;
+}
+
+static int rwnx_close(struct net_device *dev);
+static bool rwnx_close_bus_ready(struct aicwf_bus *bus_if);
+static void rwnx_reset_closed(struct net_device *dev, struct aicwf_bus *bus_if);
+
 /**
  * int (*ndo_open)(struct net_device *dev);
  *     This function is called when network device transistions to the up
@@ -1332,48 +1418,49 @@ void rwnx_set_conn_state(struct rwnx_vif *vif, atomic_t *drv_conn_state, int sta
  */
 static int rwnx_open(struct net_device *dev)
 {
-    struct rwnx_vif *rwnx_vif = netdev_priv(dev);
-    struct rwnx_hw *rwnx_hw = rwnx_vif->rwnx_hw;
-    struct mm_add_if_cfm add_if_cfm;
-    int error = 0;
-    int err = 0;
-    u8 rwnx_rx_gain = 0x0E;
-	int waiting_counter = 10;
+	struct rwnx_vif *rwnx_vif = netdev_priv(dev);
+	struct rwnx_hw *rwnx_hw = rwnx_vif->rwnx_hw;
+	struct aicwf_bus *bus_if = dev_get_drvdata(rwnx_hw->dev);
+	struct mm_add_if_cfm add_if_cfm;
+	int error = 0;
+	int err = 0;
+	bool firmware_started = false;
+	bool vif_added;
+	u8 rwnx_rx_gain = 0x0E;
 
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
+	RWNX_DBG(RWNX_FN_ENTRY_STR);
 #ifdef CONFIG_WOWLAN
-    rwnx_send_set_pkt_filter_req(rwnx_hw, wowlan_param1);
+	rwnx_send_set_pkt_filter_req(rwnx_hw, wowlan_param1);
 #endif
-	while(test_bit(RWNX_DEV_STARTED, &rwnx_vif->drv_flags)){
-		msleep(100);
-		AICWFDBG(LOGDEBUG, "%s waiting for rwnx_close \r\n", __func__);
-		waiting_counter--;
-		if(waiting_counter == 0){
-			AICWFDBG(LOGERROR, "%s error waiting for close time out \r\n", __func__);
-			break;
-		}
-	}
-    // Check if it is the first opened VIF
-    if (rwnx_hw->vif_started == 0)
-    {
-        // Start the FW
-       if ((error = rwnx_send_start(rwnx_hw)))
-           return error;
+	/* ndo_open/ndo_stop are serialized by RTNL, so waiting cannot help. */
+	if (test_bit(RWNX_DEV_STARTED, &rwnx_vif->drv_flags))
+		return -EBUSY;
+	if (!rwnx_close_bus_ready(bus_if))
+		return -ENETDOWN;
+#ifdef AICWF_USB_SUPPORT
+	if (rwnx_hw->usbdev != bus_if->bus_priv.usb)
+		return -ENETDOWN;
+#endif
+	/* Start firmware for the first opened VIF. */
+	if (rwnx_hw->vif_started == 0) {
+		error = rwnx_send_start(rwnx_hw);
+		if (error)
+			return error;
+		firmware_started = true;
 
-       if (rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DC || rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DW) {
-            error = rwnx_send_dbg_mem_mask_write_req(rwnx_hw, 0x4033b300, 0xFF, rwnx_rx_gain);
-            if(error){
-                return error;
-            }
-       }
+		if (rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DC ||
+		    rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DW) {
+			error = rwnx_send_dbg_mem_mask_write_req(rwnx_hw,
+					0x4033b300, 0xFF, rwnx_rx_gain);
+			if (error)
+				goto out_close;
+		}
 #ifdef CONFIG_COEX
 		if (testmode == 0) {
 			rwnx_send_coex_req(rwnx_hw, 0, 1);
 		}
 #endif
-
-       /* Device is now started */
-    }
+	}
 
 	set_bit(RWNX_DEV_STARTED, &rwnx_vif->drv_flags);
 	rwnx_set_conn_state(rwnx_vif, &rwnx_vif->drv_conn_state, RWNX_DRV_STATUS_DISCONNECTED);
@@ -1386,11 +1473,13 @@ static int rwnx_open(struct net_device *dev)
 				err = rwnx_send_add_if (rwnx_hw, rwnx_hw->p2p_dev_vif->wdev.address,
 											  RWNX_VIF_TYPE(rwnx_hw->p2p_dev_vif), false, &add_if_cfm);
 				if (err) {
-					return -EIO;
+					error = err;
+					goto out_close;
 				}
-
-				if (add_if_cfm.status != 0) {
-					return -EIO;
+				if (add_if_cfm.status != 0 ||
+				    add_if_cfm.inst_nbr >= NX_VIRT_DEV_MAX) {
+					error = -EIO;
+					goto out_close;
 				}
 
 				/* Save the index retrieved from LMAC */
@@ -1409,81 +1498,105 @@ static int rwnx_open(struct net_device *dev)
 		}
 	}
 
-    if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_AP_VLAN) {
-        /* For AP_vlan use same fw and drv indexes. We ensure that this index
-           will not be used by fw for another vif by taking index >= NX_VIRT_DEV_MAX */
-        add_if_cfm.inst_nbr = rwnx_vif->drv_vif_index;
-        netif_tx_stop_all_queues(dev);
+	if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_AP_VLAN) {
+		/* AP VLAN indexes are outside the firmware VIF index range. */
+		if (rwnx_vif->drv_vif_index < NX_VIRT_DEV_MAX ||
+		    rwnx_vif->drv_vif_index >= ARRAY_SIZE(rwnx_hw->vif_table)) {
+			error = -EINVAL;
+			goto out_close;
+		}
+		add_if_cfm.inst_nbr = rwnx_vif->drv_vif_index;
+		netif_tx_stop_all_queues(dev);
 
-        /* Save the index retrieved from LMAC */
-        spin_lock_bh(&rwnx_hw->cb_lock);
-        rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-        rwnx_vif->up = true;
-        rwnx_hw->vif_started++;
-        rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
-        AICWFDBG(LOGDEBUG, "%s ap create vif in rwnx_hw->vif_table[%d] \r\n",
-            __func__, rwnx_vif->vif_index);
-        spin_unlock_bh(&rwnx_hw->cb_lock);
-    } else {
-        /* Forward the information to the LMAC,
-         *     p2p value not used in FMAC configuration, iftype is sufficient */
-        if ((error = rwnx_send_add_if(rwnx_hw, rwnx_vif->wdev.address,
-                                      RWNX_VIF_TYPE(rwnx_vif), false, &add_if_cfm))) {
-            AICWFDBG(LOGERROR, "add if fail\n");
-            return error;
-        }
+		/* Save the index retrieved from LMAC */
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		rwnx_vif->vif_index = add_if_cfm.inst_nbr;
+		rwnx_vif->up = true;
+		rwnx_hw->vif_started++;
+		rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
+		AICWFDBG(LOGDEBUG, "%s ap create vif in rwnx_hw->vif_table[%d] \r\n",
+			__func__, rwnx_vif->vif_index);
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+	} else {
+		/* The interface type suffices to identify P2P in FullMAC mode. */
+		error = rwnx_send_add_if(rwnx_hw, rwnx_vif->wdev.address,
+					 RWNX_VIF_TYPE(rwnx_vif), false, &add_if_cfm);
+		if (error) {
+			AICWFDBG(LOGERROR, "add if fail\n");
+			goto out_close;
+		}
 
-        if (add_if_cfm.status != 0) {
-            RWNX_PRINT_CFM_ERR(add_if);
-            return -EIO;
-        }
+		if (add_if_cfm.status != 0 ||
+		    add_if_cfm.inst_nbr >= NX_VIRT_DEV_MAX) {
+			RWNX_PRINT_CFM_ERR(add_if);
+			error = -EIO;
+			goto out_close;
+		}
 
-        /* Save the index retrieved from LMAC */
-        spin_lock_bh(&rwnx_hw->cb_lock);
-        rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-        rwnx_vif->up = true;
-        rwnx_hw->vif_started++;
-        rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
-        AICWFDBG(LOGDEBUG, "%s sta create vif in rwnx_hw->vif_table[%d] \r\n",
-            __func__, rwnx_vif->vif_index);
-        spin_unlock_bh(&rwnx_hw->cb_lock);
+		/* Save the index retrieved from LMAC */
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		rwnx_vif->vif_index = add_if_cfm.inst_nbr;
+		rwnx_vif->up = true;
+		rwnx_hw->vif_started++;
+		rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
+		AICWFDBG(LOGDEBUG, "%s sta create vif in rwnx_hw->vif_table[%d] \r\n",
+			__func__, rwnx_vif->vif_index);
+		spin_unlock_bh(&rwnx_hw->cb_lock);
 #ifdef CONFIG_USE_P2P0
-        if(rwnx_vif->is_p2p_vif){
-            rwnx_hw->p2p_dev_vif = rwnx_vif;
-            rwnx_hw->is_p2p_alive = 1;
-        }
+		if (rwnx_vif->is_p2p_vif) {
+			rwnx_hw->p2p_dev_vif = rwnx_vif;
+			rwnx_hw->is_p2p_alive = 1;
+		}
 #endif
-    }
+	}
 
-    if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_MONITOR){
-        rwnx_hw->monitor_vif = rwnx_vif->vif_index;
-        if (rwnx_vif->ch_index != RWNX_CH_NOT_SET){
-            //Configure the monitor channel
-            error = rwnx_send_config_monitor_req(rwnx_hw, &rwnx_hw->chanctx_table[rwnx_vif->ch_index].chan_def, NULL);
-        }
-        #if defined(CONFIG_RWNX_MON_XMIT)
-        rwnx_txq_unk_vif_init(rwnx_vif);
-        #endif
-        #if defined(CONFIG_RWNX_MON_RXFILTER)
-        rwnx_send_set_filter(rwnx_hw, (FIF_BCN_PRBRESP_PROMISC | FIF_OTHER_BSS | FIF_PSPOLL | FIF_PROBE_REQ));
-        #endif
-
-	    #if defined(CONFIG_RWNX_MON_XMIT)
-	    netif_carrier_on(dev);
-		AICWFDBG(LOGINFO, "monitor xmit: netif_carrier_on\n");
-	    #endif
-    }
+	if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_MONITOR) {
+#if defined(CONFIG_RWNX_MON_XMIT)
+		rwnx_txq_unk_vif_init(rwnx_vif);
+#endif
+		if (rwnx_vif->ch_index != RWNX_CH_NOT_SET) {
+			if (rwnx_vif->ch_index >= NX_CHAN_CTXT_CNT) {
+				error = -EINVAL;
+				goto out_close;
+			}
+			error = rwnx_send_config_monitor_req(rwnx_hw,
+				&rwnx_hw->chanctx_table[rwnx_vif->ch_index].chan_def,
+				NULL);
+			if (error)
+				goto out_close;
+		}
+#if defined(CONFIG_RWNX_MON_RXFILTER)
+		error = rwnx_send_set_filter(rwnx_hw,
+			FIF_BCN_PRBRESP_PROMISC | FIF_OTHER_BSS |
+			FIF_PSPOLL | FIF_PROBE_REQ);
+		if (error)
+			goto out_close;
+#endif
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		rwnx_hw->monitor_vif = rwnx_vif->vif_index;
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+#if defined(CONFIG_RWNX_MON_XMIT)
+		netif_carrier_on(dev);
+#endif
+	}
 
 #ifdef CONFIG_BR_SUPPORT
-    netdev_br_init(dev);
+	netdev_br_init(dev);
 #endif /* CONFIG_BR_SUPPORT */
 
 	if (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MONITOR)
 		netif_carrier_off(dev);
 
-    netif_start_queue(dev);
+	netif_start_queue(dev);
 
-    return error;
+	return 0;
+
+out_close:
+	vif_added = rwnx_vif->up;
+	rwnx_close(dev);
+	if (firmware_started && !vif_added)
+		rwnx_reset_closed(dev, bus_if);
+	return error;
 }
 
 /**
@@ -1494,227 +1607,197 @@ static int rwnx_open(struct net_device *dev)
  * - Remove interface at fw level
  * - Reset FW if this is the last interface opened
  */
+static bool rwnx_close_bus_ready(struct aicwf_bus *bus_if)
+{
+	if (!bus_if || bus_if->state != BUS_UP_ST)
+		return false;
+
+#if defined(AICWF_USB_SUPPORT)
+	return bus_if->bus_priv.usb &&
+	       bus_if->bus_priv.usb->bus_if == bus_if &&
+	       bus_if->bus_priv.usb->state == USB_UP_ST;
+#elif defined(AICWF_SDIO_SUPPORT)
+	return bus_if->bus_priv.sdio &&
+	       bus_if->bus_priv.sdio->bus_if == bus_if;
+#else
+	return false;
+#endif
+}
+
+static void rwnx_reset_closed(struct net_device *dev, struct aicwf_bus *bus_if)
+{
+	struct rwnx_vif *vif = netdev_priv(dev);
+	struct rwnx_hw *hw = vif->rwnx_hw;
+	int ret;
+
+	if (hw->vif_started || !rwnx_close_bus_ready(bus_if))
+		return;
+	ret = rwnx_send_reset(hw);
+	if (ret) {
+		netdev_warn(dev, "firmware reset failed on close: %d\n", ret);
+		return;
+	}
+#if defined(AICWF_USB_SUPPORT)
+	{
+		struct aic_usb_dev *usbdev = bus_if->bus_priv.usb;
+
+		if (usbdev->chipid != PRODUCT_ID_AIC8801 &&
+		    (testmode != 0 ||
+		     (usbdev->chipid != PRODUCT_ID_AIC8800DC &&
+		      usbdev->chipid != PRODUCT_ID_AIC8800DW &&
+		      usbdev->chipid != PRODUCT_ID_AIC8800DLN &&
+		      usbdev->chipid != PRODUCT_ID_AIC8800D81 &&
+		      usbdev->chipid != PRODUCT_ID_AIC8800D81X2 &&
+		      usbdev->chipid != PRODUCT_ID_AIC8800D89X2 &&
+		      usbdev->chipid != PRODUCT_ID_AIC8800D80N)))
+			return;
+	}
+#endif
+	ret = rwnx_send_me_config_req(hw);
+	if (ret) {
+		netdev_warn(dev, "firmware reconfiguration failed on close: %d\n", ret);
+		return;
+	}
+	ret = rwnx_send_me_chan_config_req(hw, (char *)hw->wiphy->regd->alpha2);
+	if (ret)
+		netdev_warn(dev, "channel reconfiguration failed on close: %d\n", ret);
+}
+
 static int rwnx_close(struct net_device *dev)
 {
-    struct rwnx_vif *rwnx_vif = netdev_priv(dev);
-    struct rwnx_hw *rwnx_hw = rwnx_vif->rwnx_hw;
-    struct aicwf_bus *bus_if = NULL;
-    int ret = 0;
-    int waiting_counter = 20;
-    int test_counter = 0;
-#if defined(AICWF_USB_SUPPORT)
-    struct aic_usb_dev *usbdev = NULL;
-    bus_if = dev_get_drvdata(rwnx_hw->dev);
-    if (bus_if)
-        usbdev = bus_if->bus_priv.usb;
-#endif
-#if defined(AICWF_SDIO_SUPPORT)
-    struct aic_sdio_dev *sdiodev = NULL;
-    bus_if = dev_get_drvdata(rwnx_hw->dev);
-    if (bus_if)
-        sdiodev = bus_if->bus_priv.sdio;
-#endif
+	struct rwnx_vif *rwnx_vif = netdev_priv(dev);
+	struct rwnx_hw *rwnx_hw = rwnx_vif->rwnx_hw;
+	struct aicwf_bus *bus_if = dev_get_drvdata(rwnx_hw->dev);
+	bool monitor = RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_MONITOR;
+	bool was_up = rwnx_vif->up;
+	bool owns_slot;
+	bool carrier;
+	int waiting_counter = 20;
+	int ret;
 
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
+	RWNX_DBG(RWNX_FN_ENTRY_STR);
+	netif_tx_stop_all_queues(dev);
+	if (monitor)
+		netif_carrier_off(dev);
 
-    /*
-     * A CONNECTING/DISCONNECTING state is only left when the firmware answers
-     * the pending request. If the bus is already down the answer can never
-     * arrive: rwnx_send_msg() silently drops the message and returns 0
-     * (rwnx_msg_tx.c), so the wait below would always run its full timeout and
-     * fire the spurious WARN_ON() during USB teardown. Skip the wait when the
-     * bus is down, using the same condition the vif_started path uses below.
-     */
-    if (bus_if &&
-        (usbdev == NULL || (usbdev->bus_if->state != BUS_DOWN_ST &&
-                            usbdev->state != USB_DOWN_ST))) {
-        test_counter = waiting_counter;
-        while(atomic_read(&rwnx_vif->drv_conn_state) == (int)RWNX_DRV_STATUS_DISCONNECTING||
-            atomic_read(&rwnx_vif->drv_conn_state) == (int)RWNX_DRV_STATUS_CONNECTING){
-            AICWFDBG(LOGDEBUG, "%s wifi is connecting or disconnecting, waiting 200ms for state to stable\r\n", __func__);
-            msleep(200);
-            test_counter--;
-            if(test_counter == 0){
-                AICWFDBG(LOGERROR, "%s connecting or disconnecting, not finish\r\n", __func__);
-                WARN_ON(1);
-                break;
-            }
-        }
-    }
-
-#if defined(AICWF_USB_SUPPORT) || defined(AICWF_SDIO_SUPPORT)
-    if (rwnx_hw->scanning){
-        rwnx_hw->scanning = false;
-    }
-
-    if(rwnx_hw->p2p_working){
-	rwnx_hw->p2p_working = false;
-    }
-#endif
-#if 0
-    netdev_info(dev, "CLOSE");
-#endif
-	AICWFDBG(LOGINFO, "%s %s Enter\n", __func__, dev->name);
-
-#if 0
-#ifdef CONFIG_USE_P2P0
-    if(rwnx_hw->p2p_dev_vif){
-        atomic_set(&rwnx_hw->p2p_alive_timer_count, P2P_ALIVE_TIME_MS);
-        rwnx_hw->is_p2p_alive = 0;
-    }
-#endif
-#endif
-
-    rwnx_radar_cancel_cac(&rwnx_hw->radar);
-
-    /* Abort scan request on the vif */
-    if (rwnx_hw->scan_request &&
-        rwnx_hw->scan_request->wdev == &rwnx_vif->wdev) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
-        struct cfg80211_scan_info info = {
-            .aborted = true,
-        };
-
-        cfg80211_scan_done(rwnx_hw->scan_request, &info);
-#else
-        cfg80211_scan_done(rwnx_hw->scan_request, true);
-#endif
-        rwnx_hw->scan_request = NULL;
-		ret = rwnx_send_scanu_cancel_req(rwnx_hw, NULL);
-		mdelay(35);//make sure firmware take affect
-		if (ret) {
-			AICWFDBG(LOGERROR, "scanu_cancel fail\n");
-			return ret;
+	/* A down transport cannot deliver the pending connection indication. */
+	if (rwnx_close_bus_ready(bus_if)) {
+		while (atomic_read(&rwnx_vif->drv_conn_state) ==
+		       RWNX_DRV_STATUS_DISCONNECTING ||
+		       atomic_read(&rwnx_vif->drv_conn_state) ==
+		       RWNX_DRV_STATUS_CONNECTING) {
+			if (!waiting_counter-- || !rwnx_close_bus_ready(bus_if)) {
+				netdev_warn(dev, "connection state did not settle on close\n");
+				break;
+			}
+			msleep(200);
 		}
-    }
+	}
 
-#if defined(AICWF_USB_SUPPORT)
-	if (usbdev != NULL) {
-		if (usbdev->bus_if->state != BUS_DOWN_ST && usbdev->state != USB_DOWN_ST)
-			AICWFDBG(LOGDEBUG, "state: %d %d\n",
-				 (int)usbdev->bus_if->state, (int)usbdev->state);
+	rwnx_hw->p2p_working = false;
+	rwnx_radar_cancel_cac(&rwnx_hw->radar);
 
-		if(RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||
-			RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT){
-			test_counter = waiting_counter;
-			if(atomic_read(&rwnx_vif->drv_conn_state) == (int)RWNX_DRV_STATUS_CONNECTED){
-				rwnx_set_conn_state(rwnx_vif, &rwnx_vif->drv_conn_state, RWNX_DRV_STATUS_DISCONNECTING);
-				/* Same reasoning as above: with the bus down the disconnect
-				 * confirmation cannot arrive, so do not wait for it. */
-				if (usbdev->bus_if->state != BUS_DOWN_ST &&
-				    usbdev->state != USB_DOWN_ST) {
-					rwnx_send_sm_disconnect_req(rwnx_hw, rwnx_vif, 3);
-					while (atomic_read(&rwnx_vif->drv_conn_state) == (int)RWNX_DRV_STATUS_DISCONNECTING) {
-						AICWFDBG(LOGDEBUG, "%s wifi is disconnecting, waiting 100ms for state to stable\r\n", __func__);
-						msleep(100);
-						test_counter--;
-						if (test_counter ==0)
-							break;
-					}
-				}
+	/* Completion and close compete for one detached scan request. */
+	if (rwnx_scan_complete(rwnx_hw, &rwnx_vif->wdev, true) &&
+	    rwnx_close_bus_ready(bus_if)) {
+		ret = rwnx_send_scanu_cancel_req(rwnx_hw, NULL);
+		if (ret)
+			netdev_warn(dev, "scan cancel failed on close: %d\n", ret);
+		/* The command waits for SCANU_CANCEL_CFM; no extra busy wait. */
+	}
+
+	if (was_up && rwnx_close_bus_ready(bus_if)) {
+		if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||
+		    RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT) {
+			if (atomic_read(&rwnx_vif->drv_conn_state) ==
+			    RWNX_DRV_STATUS_CONNECTED) {
+				rwnx_set_conn_state(rwnx_vif,
+						    &rwnx_vif->drv_conn_state,
+						    RWNX_DRV_STATUS_DISCONNECTING);
+				ret = rwnx_send_sm_disconnect_req(rwnx_hw, rwnx_vif, 3);
+				waiting_counter = 20;
+				while (!ret && rwnx_close_bus_ready(bus_if) &&
+				       atomic_read(&rwnx_vif->drv_conn_state) ==
+				       RWNX_DRV_STATUS_DISCONNECTING &&
+				       waiting_counter--)
+					msleep(100);
 			}
 		}
 #ifdef CONFIG_USE_P2P0
-        if(!rwnx_vif->is_p2p_vif || ( rwnx_vif->is_p2p_vif && rwnx_hw->is_p2p_alive)){
+		if (!rwnx_vif->is_p2p_vif || rwnx_hw->is_p2p_alive) {
 			if (rwnx_vif->is_p2p_vif)
 				rwnx_hw->is_p2p_alive = 0;
 #endif
-    		rwnx_send_remove_if(rwnx_hw, rwnx_vif->vif_index, false);
-#ifdef CONFIG_USE_P2P0
-        }
-#endif
-
-    }
-#endif
-#if defined(AICWF_SDIO_SUPPORT)
-    if (sdiodev != NULL ) {
-        if (sdiodev->bus_if->state != BUS_DOWN_ST)
-            rwnx_send_remove_if(rwnx_hw, rwnx_vif->vif_index, false);
-    }
-#endif
-
-    if (rwnx_hw->roc_elem && (rwnx_hw->roc_elem->wdev == &rwnx_vif->wdev)) {
-		AICWFDBG(LOGINFO, "%s clear roc\n", __func__);
-        /* Initialize RoC element pointer to NULL, indicate that RoC can be started */
-        rwnx_hw->roc_elem = NULL;
-    }
-
-    /* Ensure that we won't process disconnect ind */
-    spin_lock_bh(&rwnx_hw->cb_lock);
-
-    rwnx_vif->up = false;
-    AICWFDBG(LOGDEBUG, "%s rwnx_vif[%d] down \r\n", __func__, rwnx_vif->vif_index);
-
-    if (netif_carrier_ok(dev)) {
-        if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||
-            RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT) {
-            cfg80211_disconnected(dev, WLAN_REASON_DEAUTH_LEAVING,
-                                  NULL, 0, true, GFP_ATOMIC);
-            netif_tx_stop_all_queues(dev);
-            netif_carrier_off(dev);
-        } else if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_AP_VLAN) {
-            netif_carrier_off(dev);
-        } else {
-            netdev_warn(dev, "AP not stopped when disabling interface");
+		/* AP VLANs share their master's firmware interface. */
+		if (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_AP_VLAN &&
+		    rwnx_close_bus_ready(bus_if)) {
+			ret = rwnx_send_remove_if(rwnx_hw, rwnx_vif->vif_index,
+						  false);
+			if (ret)
+				netdev_warn(dev, "interface removal failed on close: %d\n",
+					    ret);
 		}
-#ifdef CONFIG_BR_SUPPORT
-        /* if (OPMODE & (WIFI_STATION_STATE | WIFI_ADHOC_STATE)) */
-        {
-            /* void nat25_db_cleanup(_adapter *priv); */
-            nat25_db_cleanup(rwnx_vif);
-        }
-#endif /* CONFIG_BR_SUPPORT */
+#ifdef CONFIG_USE_P2P0
+		}
+#endif
 	}
 
+	if (rwnx_hw->roc_elem &&
+	    rwnx_hw->roc_elem->wdev == &rwnx_vif->wdev)
+		rwnx_hw->roc_elem = NULL;
 
-    rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
-    spin_unlock_bh(&rwnx_hw->cb_lock);
+	/* Retire the RX lookup before releasing channel and queue state. */
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	carrier = netif_carrier_ok(dev);
+	rwnx_vif->up = false;
+	owns_slot = rwnx_vif->vif_index < ARRAY_SIZE(rwnx_hw->vif_table) &&
+		    rwnx_hw->vif_table[rwnx_vif->vif_index] == rwnx_vif;
+	if (owns_slot)
+		rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
+	if (monitor && owns_slot &&
+	    rwnx_hw->monitor_vif == rwnx_vif->vif_index)
+		rwnx_hw->monitor_vif = RWNX_INVALID_VIF;
+	if (was_up) {
+		rwnx_chanctx_unlink(rwnx_vif);
+		if (rwnx_hw->vif_started)
+			rwnx_hw->vif_started--;
+	}
+	spin_unlock_bh(&rwnx_hw->cb_lock);
 
-    rwnx_chanctx_unlink(rwnx_vif);
+	if (carrier) {
+		switch (RWNX_VIF_TYPE(rwnx_vif)) {
+		case NL80211_IFTYPE_STATION:
+		case NL80211_IFTYPE_P2P_CLIENT:
+			cfg80211_disconnected(dev, WLAN_REASON_DEAUTH_LEAVING,
+					      NULL, 0, true, GFP_ATOMIC);
+			break;
+		case NL80211_IFTYPE_MONITOR:
+		case NL80211_IFTYPE_AP_VLAN:
+			break;
+		default:
+			netdev_warn(dev, "AP not stopped when disabling interface\n");
+			break;
+		}
+#ifdef CONFIG_BR_SUPPORT
+		nat25_db_cleanup(rwnx_vif);
+#endif
+	}
+	/* Firmware callbacks may have tried to wake a queue during close. */
+	netif_tx_stop_all_queues(dev);
+	netif_carrier_off(dev);
+#if defined(CONFIG_RWNX_MON_XMIT)
+	if (monitor && was_up)
+		rwnx_txq_unk_vif_deinit(rwnx_vif);
+#endif
 
-    if (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_MONITOR)
-        rwnx_hw->monitor_vif = RWNX_INVALID_VIF;
+	if (was_up)
+		rwnx_reset_closed(dev, bus_if);
 
-
-    rwnx_hw->vif_started--;
-    if (rwnx_hw->vif_started == 0) {
-        /* This also lets both ipc sides remain in sync before resetting */
-        #if 0
-        rwnx_ipc_tx_drain(rwnx_hw);
-        #else
-        #if defined(AICWF_USB_SUPPORT)
-        if (usbdev->bus_if->state != BUS_DOWN_ST && usbdev->state != USB_DOWN_ST)
-        #else
-        if (sdiodev->bus_if->state != BUS_DOWN_ST)
-        #endif
-        {
-            rwnx_send_reset(rwnx_hw);
-            #if defined(AICWF_USB_SUPPORT)
-            if (rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8801 ||
-                    ((rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DC ||
-                      rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DW ||
-                      rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800DLN ||
-                      rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D81 ||
-                      rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D81X2 ||
-                      rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D89X2 ||
-                      rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D80N)&& testmode == 0)) {
-            #endif
-                // Set parameters to firmware
-                rwnx_send_me_config_req(rwnx_hw);
-                // Set channel parameters to firmware
-                rwnx_send_me_chan_config_req(rwnx_hw, (char *)rwnx_hw->wiphy->regd->alpha2);
-            #if defined(AICWF_USB_SUPPORT)
-            }
-            #endif
-        }
-        #endif
-    }
-
+	rwnx_set_conn_state(rwnx_vif, &rwnx_vif->drv_conn_state,
+			    RWNX_DRV_STATUS_DISCONNECTED);
 	clear_bit(RWNX_DEV_STARTED, &rwnx_vif->drv_flags);
-	AICWFDBG(LOGDEBUG, "%s rwnx_vif->drv_flags:%d\r\n", __func__, (int)rwnx_vif->drv_flags);
-    return 0;
+	return 0;
 }
-
 
 /**
  * struct net_device_stats* (*ndo_get_stats)(struct net_device *dev);
@@ -2623,6 +2706,11 @@ static int rwnx_cfg80211_change_iface(struct wiphy *wiphy,
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 	AICWFDBG(LOGINFO, "change_if: %d to %d, %d, %d\r\n", vif->wdev.iftype, type, NL80211_IFTYPE_P2P_CLIENT, NL80211_IFTYPE_STATION);
 
+	/* Monitor queue ownership belongs to ndo_open/ndo_stop. */
+	if (vif->up && (type == NL80211_IFTYPE_MONITOR ||
+			RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_MONITOR))
+		return -EBUSY;
+
 #ifndef CONFIG_RWNX_MON_DATA
     if ((type == NL80211_IFTYPE_MONITOR) &&
        (RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_MONITOR)) {
@@ -2678,66 +2766,39 @@ static int rwnx_cfg80211_change_iface(struct wiphy *wiphy,
         p2p = true;
     }
 	if (vif->up) {
-	    /* Abort scan request on the vif */
-	    if (vif->rwnx_hw->scan_request &&
-	        vif->rwnx_hw->scan_request->wdev == &vif->wdev) {
-#if 0
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
-	        struct cfg80211_scan_info info = {
-	            .aborted = true,
-	        };
-	        cfg80211_scan_done(vif->rwnx_hw->scan_request, &info);
-#else
-	        cfg80211_scan_done(vif->rwnx_hw->scan_request, true);
-#endif
-	        if ((ret = rwnx_send_scanu_cancel_req(vif->rwnx_hw, NULL))) {
-				AICWFDBG(LOGERROR, "scanu_cancel fail\n");
-	            return ret;
-	        }
-	        vif->rwnx_hw->scan_request = NULL;
-#else
-            if ((ret = rwnx_send_scanu_cancel_req(vif->rwnx_hw, NULL))) {
-                AICWFDBG(LOGERROR, "scanu_cancel fail\n");
-                return ret;
-            }
-#endif
-	    }
+		if (rwnx_scan_complete(vif->rwnx_hw, &vif->wdev, true)) {
+			ret = rwnx_send_scanu_cancel_req(vif->rwnx_hw, NULL);
+			if (ret)
+				return ret;
+		}
 
-	    if ((ret = rwnx_send_remove_if(vif->rwnx_hw, vif->vif_index, false))) {
+		ret = rwnx_send_remove_if(vif->rwnx_hw, vif->vif_index, false);
+		if (ret) {
 			AICWFDBG(LOGERROR, "remove_if fail\n");
-	        return ret;
-	    }
+			return ret;
+		}
+		spin_lock_bh(&vif->rwnx_hw->cb_lock);
 		vif->rwnx_hw->vif_table[vif->vif_index] = NULL;
-		AICWFDBG(LOGINFO, "change_if from %d \n", vif->vif_index);
-	    if ((ret = rwnx_send_add_if(vif->rwnx_hw, vif->wdev.address,
-	                                              RWNX_VIF_TYPE(vif), p2p, &add_if_cfm))) {
-	            AICWFDBG(LOGERROR, "add if fail\n");
-	            return ret;
-	    }
-	    if (add_if_cfm.status != 0) {
-				AICWFDBG(LOGERROR, "add if status fail\n");
-	            return -EIO;
-	    }
+		if (vif->rwnx_hw->monitor_vif == vif->vif_index)
+			vif->rwnx_hw->monitor_vif = RWNX_INVALID_VIF;
+		spin_unlock_bh(&vif->rwnx_hw->cb_lock);
+		ret = rwnx_send_add_if(vif->rwnx_hw, vif->wdev.address,
+				       RWNX_VIF_TYPE(vif), p2p, &add_if_cfm);
+		if (ret) {
+			AICWFDBG(LOGERROR, "add if fail\n");
+			return ret;
+		}
+		if (add_if_cfm.status != 0 ||
+		    add_if_cfm.inst_nbr >= NX_VIRT_DEV_MAX) {
+			AICWFDBG(LOGERROR, "add if status fail\n");
+			return -EIO;
+		}
 
-		AICWFDBG(LOGINFO, "change_if to %d \n", add_if_cfm.inst_nbr);
-	    /* Save the index retrieved from LMAC */
-	    spin_lock_bh(&vif->rwnx_hw->cb_lock);
-	    vif->vif_index = add_if_cfm.inst_nbr;
-	    vif->rwnx_hw->vif_table[add_if_cfm.inst_nbr] = vif;
-	    spin_unlock_bh(&vif->rwnx_hw->cb_lock);
+		spin_lock_bh(&vif->rwnx_hw->cb_lock);
+		vif->vif_index = add_if_cfm.inst_nbr;
+		vif->rwnx_hw->vif_table[add_if_cfm.inst_nbr] = vif;
+		spin_unlock_bh(&vif->rwnx_hw->cb_lock);
 	}
-
-    if (type == NL80211_IFTYPE_MONITOR) {
-        vif->rwnx_hw->monitor_vif = vif->vif_index;
-        #if defined(CONFIG_RWNX_MON_XMIT)
-        rwnx_txq_unk_vif_init(vif);
-        #endif
-        #if defined(CONFIG_RWNX_MON_RXFILTER)
-        rwnx_send_set_filter(vif->rwnx_hw, (FIF_BCN_PRBRESP_PROMISC | FIF_OTHER_BSS | FIF_PSPOLL | FIF_PROBE_REQ));
-        #endif
-    } else {
-        vif->rwnx_hw->monitor_vif = RWNX_INVALID_VIF;
-    }
 
     return 0;
 }
@@ -2784,23 +2845,12 @@ static void rwnx_cfgp2p_stop_p2p_device(struct wiphy *wiphy, struct wireless_dev
 	int ret = 0;
 	struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
 	struct rwnx_vif *rwnx_vif = container_of(wdev, struct rwnx_vif, wdev);
-	/* Abort scan request on the vif */
-	if (rwnx_hw->scan_request &&
-		rwnx_hw->scan_request->wdev == &rwnx_vif->wdev) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
-		struct cfg80211_scan_info info = {
-			.aborted = true,
-		};
-
-		cfg80211_scan_done(rwnx_hw->scan_request, &info);
-#else
-		cfg80211_scan_done(rwnx_hw->scan_request, true);
-#endif
-		rwnx_hw->scan_request = NULL;
+	/* Share scan completion ownership with the RX callback and close. */
+	if (rwnx_scan_complete(rwnx_hw, &rwnx_vif->wdev, true) &&
+	    rwnx_close_bus_ready(dev_get_drvdata(rwnx_hw->dev))) {
 		ret = rwnx_send_scanu_cancel_req(rwnx_hw, NULL);
-		if (ret){
+		if (ret)
 			AICWFDBG(LOGERROR, "scanu_cancel fail\n");
-		}
 	}
 
 	if (rwnx_vif == rwnx_hw->p2p_dev_vif) {
@@ -2905,11 +2955,28 @@ static int rwnx_cfg80211_scan(struct wiphy *wiphy,
 		return -EBUSY;
 	}
 
-    rwnx_hw->scan_request = request;
-    if ((error = rwnx_send_scanu_req(rwnx_hw, rwnx_vif, request)))
-        return error;
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	if (rwnx_hw->scan_request) {
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		return -EBUSY;
+	}
+	rwnx_hw->scan_request = request;
+	rwnx_hw->scanning = true;
+	spin_unlock_bh(&rwnx_hw->cb_lock);
 
-    return 0;
+	error = rwnx_send_scanu_req(rwnx_hw, rwnx_vif, request);
+	if (error) {
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		if (rwnx_hw->scan_request == request) {
+			rwnx_hw->scan_request = NULL;
+			rwnx_hw->scanning = false;
+		} else {
+			/* A completion already consumed the accepted request. */
+			error = 0;
+		}
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+	}
+	return error;
 }
 
 bool key_flag = false;

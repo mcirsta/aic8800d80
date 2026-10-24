@@ -943,6 +943,8 @@ void rwnx_chanctx_link(struct rwnx_vif *vif, u8 idx,
                         struct cfg80211_chan_def *chandef);
 void rwnx_chanctx_unlink(struct rwnx_vif *vif);
 int  rwnx_chanctx_valid(struct rwnx_hw *rwnx_hw, u8 idx);
+bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
+			struct wireless_dev *wdev, bool aborted);
 
 extern u8 chip_id;
 static inline bool is_multicast_sta(int sta_idx)

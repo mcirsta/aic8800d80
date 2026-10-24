@@ -4070,10 +4070,12 @@ int rwnx_send_scanu_req(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
     /* Build the SCANU_START_REQ message */
     req = rwnx_msg_zalloc(SCANU_START_REQ, TASK_SCANU, DRV_TASK_ID,
                           sizeof(struct scanu_start_req));
-    if (!req)
-        return -ENOMEM;
+	if (!req)
+		return -ENOMEM;
 
-    rwnx_hw->scanning = 1;
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	rwnx_hw->scanning = true;
+	spin_unlock_bh(&rwnx_hw->cb_lock);
     /* Set parameters */
     req->vif_idx = rwnx_vif->vif_index;
     req->chan_cnt = (u8)min_t(int, SCAN_CHANNEL_MAX, param->n_channels);

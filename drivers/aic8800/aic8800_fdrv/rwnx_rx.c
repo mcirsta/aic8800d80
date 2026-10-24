@@ -1180,7 +1180,7 @@ static void rwnx_rx_add_rtap_hdr(struct rwnx_hw* rwnx_hw,
         struct ieee80211_supported_band* band =
                 rwnx_hw->wiphy->bands[phy_info->phy_band];
         rtap->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_RATE);
-        BUG_ON((rate_idx = legrates_lut[rxvect->leg_rate].idx) == -1);
+	rate_idx = legrates_lut[rxvect->leg_rate].idx;
         if (phy_info->phy_band == NL80211_BAND_5GHZ)
             rate_idx -= 4;  /* rwnx_ratetable_5ghz[0].hw_value == 4 */
         *pos = DIV_ROUND_UP(band->bitrates[rate_idx].bitrate, 5);
@@ -1279,18 +1279,18 @@ static void rwnx_rx_add_rtap_hdr(struct rwnx_hw* rwnx_hw,
             *pos |= IEEE80211_RADIOTAP_VHT_FLAG_STBC;
         pos++;
 
-        // bandwidth
-        if (rxvect->ch_bw == PHY_CHNL_BW_40)
-            *pos++ = 1;
-        if (rxvect->ch_bw == PHY_CHNL_BW_80)
-            *pos++ = 4;
-        else if ((rxvect->ch_bw == PHY_CHNL_BW_160)
-                && phy_info->phy_center2_freq)
-            *pos++ = 0; //80P80
-        else if  (rxvect->ch_bw == PHY_CHNL_BW_160)
-            *pos++ = 11;
-        else // 20 MHz
-            *pos++ = 0;
+	/* Bandwidth occupies exactly one byte in the VHT field. */
+	if (rxvect->ch_bw == PHY_CHNL_BW_40)
+		*pos++ = 1;
+	else if (rxvect->ch_bw == PHY_CHNL_BW_80)
+		*pos++ = 4;
+	else if (rxvect->ch_bw == PHY_CHNL_BW_160 &&
+		 phy_info->phy_center2_freq)
+		*pos++ = 0; /* 80P80 */
+	else if (rxvect->ch_bw == PHY_CHNL_BW_160)
+		*pos++ = 11;
+	else
+		*pos++ = 0; /* 20 MHz */
 
         // MCS/NSS
         *pos = (rate_idx << 4) | vht_nss;
@@ -1397,23 +1397,18 @@ static void rwnx_rx_add_rtap_hdr(struct rwnx_hw* rwnx_hw,
  * rwnx_rx_monitor - Build radiotap header for skb an send it to netdev
  *
  * @rwnx_hw: main driver data
- * @rwnx_vif: vif that received the buffer
+ * @ndev: referenced monitor netdev that received the buffer
  * @skb: sk_buff received
  * @hw_rxhdr_ptr: Pointer to HW RX header
  * @rtap_len: Radiotap Header length
  *
  * Add radiotap header to the receved skb and send it to netdev
  */
-static int rwnx_rx_monitor(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
-                           struct sk_buff *skb,  struct hw_rxhdr *hw_rxhdr_ptr,
-                           u8 rtap_len)
+static void rwnx_rx_monitor(struct rwnx_hw *rwnx_hw, struct net_device *ndev,
+			    struct sk_buff *skb, struct hw_rxhdr *hw_rxhdr_ptr,
+			    u8 rtap_len)
 {
-    skb->dev = rwnx_vif->ndev;
-
-    if (rwnx_vif->wdev.iftype != NL80211_IFTYPE_MONITOR) {
-        netdev_err(rwnx_vif->ndev, "not a monitor vif\n");
-        return -1;
-    }
+	skb->dev = ndev;
 
     /* Add RadioTap Header */
     rwnx_rx_add_rtap_hdr(rwnx_hw, skb, &hw_rxhdr_ptr->hwvect.rx_vect1,
@@ -1432,8 +1427,111 @@ static int rwnx_rx_monitor(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
     local_bh_disable();
     netif_receive_skb(skb);
     local_bh_enable();
+}
 
-    return 0;
+/* The caller drops the netdev reference after handing its packet to the stack. */
+static struct net_device *rwnx_rx_monitor_get_ndev(struct rwnx_hw *rwnx_hw)
+{
+	struct net_device *ndev = NULL;
+	struct rwnx_vif *vif;
+	int vif_idx;
+
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	vif_idx = rwnx_hw->monitor_vif;
+	if (vif_idx >= 0 && vif_idx < NX_VIRT_DEV_MAX) {
+		vif = rwnx_hw->vif_table[vif_idx];
+		if (vif && vif->up && vif->ndev &&
+		    RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_MONITOR) {
+			ndev = vif->ndev;
+			dev_hold(ndev);
+		}
+	}
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	return ndev;
+}
+
+/* Validate device-provided indices before the radiotap builder uses them. */
+static bool rwnx_rx_monitor_vector_valid(struct rwnx_hw *rwnx_hw,
+					 const struct hw_rxhdr *rxhdr)
+{
+	const struct rx_vector_1 *rxvect = &rxhdr->hwvect.rx_vect1;
+	struct ieee80211_supported_band *band;
+	unsigned int band_idx = rxhdr->phy_info.phy_band;
+	int rate_idx;
+
+	if (band_idx >= ARRAY_SIZE(rwnx_hw->wiphy->bands) ||
+	    rxvect->format_mod > FORMATMOD_HE_ER)
+		return false;
+	band = rwnx_hw->wiphy->bands[band_idx];
+	if (!band)
+		return false;
+	if (rxvect->format_mod > FORMATMOD_NON_HT_DUP_OFDM)
+		return true;
+
+	rate_idx = legrates_lut[rxvect->leg_rate].idx;
+	if (band_idx == NL80211_BAND_5GHZ)
+		rate_idx -= 4;
+	return band->bitrates && rate_idx >= 0 && rate_idx < band->n_bitrates;
+}
+
+/* Failure leaves the input owned by the caller, including its data and length. */
+static struct sk_buff *rwnx_rx_monitor_skb(struct sk_buff *skb,
+					unsigned int frame_len, u8 rtap_len,
+					bool preserve)
+{
+	unsigned int frame_offset = sizeof(struct hw_rxhdr) + 4;
+	struct sk_buff *monitor = skb;
+
+	if (frame_offset > skb->len || !frame_len ||
+	    frame_len > skb->len - frame_offset)
+		return NULL;
+
+	/* skb_copy_expand also linearizes and gives the packet private storage. */
+	if (preserve || skb_shared(skb) || skb_cloned(skb) ||
+	    skb_is_nonlinear(skb) ||
+	    (rtap_len > frame_offset &&
+	     skb_headroom(skb) < rtap_len - frame_offset)) {
+		monitor = skb_copy_expand(skb, rtap_len, 0, GFP_ATOMIC);
+		if (!monitor)
+			return NULL;
+	}
+
+	skb_pull(monitor, frame_offset);
+	skb_trim(monitor, frame_len);
+	return monitor;
+}
+
+/* Monitor-only packets are consumed here; a dual-delivery input stays owned. */
+static void rwnx_rx_monitor_frame(struct rwnx_hw *rwnx_hw, struct sk_buff *skb,
+				  const struct hw_rxhdr *rxhdr, bool forward)
+{
+	struct hw_rxhdr monitor_hdr = *rxhdr;
+	struct sk_buff *monitor = NULL;
+	struct net_device *ndev;
+	bool consumed = false;
+	u8 rtap_len;
+
+	ndev = rwnx_rx_monitor_get_ndev(rwnx_hw);
+	if (!ndev)
+		goto out;
+
+	/* Radiotap may overwrite the descriptor headroom, so use a private copy. */
+	rwnx_rx_vector_convert(rwnx_hw, &monitor_hdr.hwvect.rx_vect1,
+			       &monitor_hdr.hwvect.rx_vect2);
+	if (!rwnx_rx_monitor_vector_valid(rwnx_hw, &monitor_hdr))
+		goto put_ndev;
+	rtap_len = rwnx_rx_rtap_hdrlen(&monitor_hdr.hwvect.rx_vect1, false);
+	monitor = rwnx_rx_monitor_skb(skb, le32_to_cpu(monitor_hdr.hwvect.len),
+				    rtap_len, forward);
+	if (monitor) {
+		consumed = monitor == skb;
+		rwnx_rx_monitor(rwnx_hw, ndev, monitor, &monitor_hdr, rtap_len);
+	}
+put_ndev:
+	dev_put(ndev);
+out:
+	if (!forward && !consumed)
+		dev_kfree_skb(skb);
 }
 
 #ifdef AICWF_ARP_OFFLOAD
@@ -2236,7 +2334,8 @@ extern void rwnx_data_dump(char* tag, void* data, unsigned long len);
 
 u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 {
-    struct hw_rxhdr *hw_rxhdr;
+	struct hw_rxhdr hw_rxhdr_copy;
+	struct hw_rxhdr *hw_rxhdr = &hw_rxhdr_copy;
     struct rxdesc_tag *rxdesc = NULL;
     struct rwnx_vif *rwnx_vif;
     struct sk_buff *skb  = hostid;
@@ -2271,7 +2370,9 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 	struct rwnx_sta *cur_sta;
 #endif
     REG_SW_SET_PROFILING(rwnx_hw, SW_PROF_RWNXDATAIND);
-    hw_rxhdr = (struct hw_rxhdr *)skb->data;
+	/* Keep descriptor metadata valid after pulls, copies and skb consumption. */
+	if (skb_copy_bits(skb, 0, hw_rxhdr, sizeof(*hw_rxhdr)))
+		goto drop;
 
 #ifdef AICWF_RX_REORDER
     if(hw_rxhdr->is_monitor_vif) {
@@ -2299,92 +2400,16 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
         goto end;
     }
 
-    /* Check if we need to forward the buffer coming from a monitor interface */
-    if (status & RX_STAT_MONITOR) {
-        struct sk_buff *skb_monitor = NULL;
-        struct hw_rxhdr hw_rxhdr_copy;
-        u8 rtap_len;
-        u16 frm_len = 0;
+	/* Monitor delivery owns the original only when no data copy is needed. */
+	if (status & RX_STAT_MONITOR) {
+		rwnx_rx_monitor_frame(rwnx_hw, skb, hw_rxhdr,
+				      status & RX_STAT_FORWARD);
+		if (!(status & RX_STAT_FORWARD))
+			goto end;
+	} else if (!(status & RX_STAT_FORWARD)) {
+		goto drop;
+	}
 
-        //Check if monitor interface exists and is open
-        rwnx_vif = rwnx_rx_get_vif(rwnx_hw, rwnx_hw->monitor_vif);
-        if (!rwnx_vif) {
-            dev_err(rwnx_hw->dev, "Received monitor frame but there is no monitor interface open, skb->len:%u\n", skb->len);
-            goto check_len_update;
-        }
-
-        rwnx_rx_vector_convert(rwnx_hw,
-                               &hw_rxhdr->hwvect.rx_vect1,
-                               &hw_rxhdr->hwvect.rx_vect2);
-        rtap_len = rwnx_rx_rtap_hdrlen(&hw_rxhdr->hwvect.rx_vect1, false);
-
-        if (status == RX_STAT_MONITOR) 
-        {
-            /* Remove the SK buffer from the rxbuf_elems table. It will also
-               unmap the buffer and then sync the buffer for the cpu */
-            //rwnx_ipc_rxbuf_elem_pull(rwnx_hw, skb);
-            skb->data += (msdu_offset + 2); //sdio/usb word allign
-
-            //Save frame length
-            frm_len = le32_to_cpu(hw_rxhdr->hwvect.len);
-
-            // Reserve space for frame
-            skb->len = frm_len;
-
-            //Check if there is enough space to add the radiotap header
-            if (skb_headroom(skb) > rtap_len) {
-
-                skb_monitor = skb;
-
-                //Duplicate the HW Rx Header to override with the radiotap header
-                memcpy(&hw_rxhdr_copy, hw_rxhdr, sizeof(hw_rxhdr_copy));
-
-                hw_rxhdr = &hw_rxhdr_copy;
-            } else {
-                //Duplicate the skb and extend the headroom
-                skb_monitor = skb_copy_expand(skb, rtap_len, 0, GFP_ATOMIC);
-
-                //Reset original skb->data pointer
-                skb->data = (void*) hw_rxhdr;
-            }
-        } else {
-        #ifdef CONFIG_RWNX_MON_DATA
-        skb_monitor = skb_copy_expand(skb, rtap_len, 0, GFP_ATOMIC);
-        if (skb_monitor) {
-            skb_monitor->data += (msdu_offset + 2); //sdio/usb word allign
-
-            //Save frame length
-            frm_len = le32_to_cpu(hw_rxhdr->hwvect.len);
-        }
-        #endif
-        }
-
-        if (!skb_monitor) {
-            if (status == RX_STAT_MONITOR) {
-                dev_kfree_skb(skb);
-                goto end;
-            }
-
-            goto check_len_update;
-        }
-
-        //skb_reset_tail_pointer(skb);
-        //skb->len = 0;
-        skb_reset_tail_pointer(skb_monitor);
-        skb_monitor->len = 0;
-        skb_put(skb_monitor, frm_len);
-
-        if (rwnx_rx_monitor(rwnx_hw, rwnx_vif, skb_monitor, hw_rxhdr, rtap_len))
-            dev_kfree_skb(skb_monitor);
-
-        if (status == RX_STAT_MONITOR) {
-            if (skb_monitor != skb) {
-                dev_kfree_skb(skb);
-            }
-        }
-    }
-
-check_len_update:
     /* Check if we need to update the length */
     if (status & RX_STAT_LEN_UPDATE) {
         if (rxdesc){
@@ -2421,6 +2446,17 @@ check_len_update:
 
     /* Check if we need to forward the buffer */
     if (status & RX_STAT_FORWARD) {
+	/* The forwarding parser writes the packet and uses direct header access. */
+	if (skb_shared(skb) || skb_cloned(skb) || skb_is_nonlinear(skb)) {
+		skb_tmp = skb_copy(skb, GFP_ATOMIC);
+		if (!skb_tmp)
+			goto drop;
+		dev_kfree_skb(skb);
+		skb = skb_tmp;
+		skb_tmp = NULL;
+	}
+	if (skb->len < msdu_offset + 2 + hdr_len)
+		goto drop;
         rwnx_rx_vector_convert(rwnx_hw,
                                &hw_rxhdr->hwvect.rx_vect1,
                                &hw_rxhdr->hwvect.rx_vect2);
@@ -2443,6 +2479,8 @@ check_len_update:
 			b_4addr = 1;
 		}
 #endif
+		if (skb->len < hdr_len)
+			goto drop;
 
 		frame_ctrl = (skb->data[1] << 8) | skb->data[0];
 		seq_num = ((skb->data[22] & 0xf0) >> 4) | (skb->data[23] << 4);
@@ -2452,6 +2490,8 @@ check_len_update:
 		if ((skb->data[0] & 0x0f) == 0x08) {
 			if ((skb->data[0] & 0x80) == 0x80) {//qos data
 				hdr_len += 2;
+				if (skb->len < hdr_len)
+					goto drop;
 #ifdef CONFIG_SUPPORT_4ADDR
 				tid = b_4addr ? (skb->data[30] & 0x0F) : (skb->data[24] & 0x0F);
 #else
@@ -2474,6 +2514,8 @@ check_len_update:
 
 			if(skb->data[1] & 0x80)// htc
 				hdr_len += 4;
+			if (skb->len < hdr_len)
+				goto drop;
 
 #ifdef CONFIG_SUPPORT_4ADDR
 			if (b_4addr) {
@@ -2532,26 +2574,23 @@ check_len_update:
 			case RWNX_RX_HD_DECR_GCMP128:
 			case RWNX_RX_HD_DECR_GCMP256:
 				pull_len += 8;//ccmp_header
-				//skb_pull(&skb->data[skb->len-8], 8); //ccmp_mic_len
-				memcpy(ether_type, &skb->data[hdr_len + 6 + 8], 2);
 				break;
 			case RWNX_RX_HD_DECR_TKIP:
 				pull_len += 8;//tkip_header
-				memcpy(ether_type, &skb->data[hdr_len + 6 + 8], 2);
 				break;
 			case RWNX_RX_HD_DECR_WEP:
 				pull_len += 4;//wep_header
-				memcpy(ether_type, &skb->data[hdr_len + 6 + 4], 2);
 				break;
 			case RWNX_RX_HD_DECR_WAPI:
                 pull_len += 18;//wapi_header
-                memcpy(ether_type, &skb->data[hdr_len + 6 + 18], 2);
                 break;
 
 			default:
-				memcpy(ether_type, &skb->data[hdr_len + 6], 2);
 				break;
 			}
+			if (skb->len < pull_len)
+				goto drop;
+			memcpy(ether_type, &skb->data[pull_len - 2], 2);
 
 
             if((ether_type[0] == 0x8e && ether_type[1] == 0x88) || (ether_type[0] == 0x88 && ether_type[1] == 0x8e))
@@ -2950,7 +2989,10 @@ check_len_update:
 #endif
         }
     }
+	goto end;
 
+drop:
+	dev_kfree_skb(skb);
 end:
     REG_SW_CLEAR_PROFILING(rwnx_hw, SW_PROF_RWNXDATAIND);
     return 0;
