@@ -1,6 +1,8 @@
 #ifndef _AICBLUETOOTH_H
 #define _AICBLUETOOTH_H
 
+#include <linux/err.h>
+
 struct aicbt_patch_table {
 	char     *name;
 	uint32_t type;
@@ -75,6 +77,7 @@ int rwnx_plat_flash_bin_upload_android(struct aic_usb_dev *usbdev, u32 fw_addr, 
 int8_t rwnx_atoi(char *value);
 uint32_t rwnx_atoli(char *value);
 int aicbt_patch_table_free(struct aicbt_patch_table *head);
+/* Returns a caller-owned table or ERR_PTR(errno); load only borrows it. */
 struct aicbt_patch_table *aicbt_patch_table_alloc(struct aic_usb_dev *usbdev, const char *filename);
 #ifdef CONFIG_LOAD_BT_CONF
 void aicbt_parse_config(struct aic_usb_dev *usbdev, const char *filename);

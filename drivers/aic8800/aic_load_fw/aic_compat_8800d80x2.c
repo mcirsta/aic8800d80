@@ -393,169 +393,173 @@ int system_config_8800d80x2(struct aic_usb_dev *usb_dev){
 
 static int aicbt_ext_patch_data_load(struct aic_usb_dev *usb_dev, struct aicbt_patch_info_t *patch_info, const char *filename)
 {
-    int ret = 0;
-    uint32_t ext_patch_nb = patch_info->ext_patch_nb;
-    char ext_patch_file_name[50];
-    int index = 0;
-    uint32_t id = 0;
-    uint32_t addr = 0;
-    uint32_t mem_w_add = 0;
-    uint32_t mem_w_data = 0;
+	int ret = 0;
+	uint32_t ext_patch_nb = patch_info->ext_patch_nb;
+	char ext_patch_file_name[50];
+	int index = 0;
+	uint32_t id = 0;
+	uint32_t addr = 0;
+	uint32_t mem_w_add = 0;
+	uint32_t mem_w_data = 0;
 
-    if (ext_patch_nb > 0){
-        AICWFDBG(LOGDEBUG, "[0x40480000]: 0x00040220\n");
-        mem_w_add = 0x40580000;
-        mem_w_data = 0x00040220;
-        AICWFDBG(LOGDEBUG, "%s addr:0x%x data:0x%x \n", __func__, mem_w_add, mem_w_data);
-        ret = rwnx_send_dbg_mem_write_req(usb_dev, mem_w_add, mem_w_data);
-        if (ret) {
-            printk("%x wr fail: %d\n", mem_w_add, ret);
-            return ret;
-        }
+	if (ext_patch_nb > 0) {
+		AICWFDBG(LOGDEBUG, "[0x40480000]: 0x00040220\n");
+		mem_w_add = 0x40580000;
+		mem_w_data = 0x00040220;
+		AICWFDBG(LOGDEBUG, "%s addr:0x%x data:0x%x\n", __func__, mem_w_add, mem_w_data);
+		ret = rwnx_send_dbg_mem_write_req(usb_dev, mem_w_add, mem_w_data);
+		if (ret) {
+			pr_err("%x wr fail: %d\n", mem_w_add, ret);
+			return ret;
+		}
 
-        for (index = 0; index < patch_info->ext_patch_nb; index++){
-            id = *(patch_info->ext_patch_param + (index * 2));
-            addr = *(patch_info->ext_patch_param + (index * 2) + 1);
-            memset(ext_patch_file_name, 0, sizeof(ext_patch_file_name));
-            sprintf(ext_patch_file_name,"%s%d.bin",
-                filename,
-                id);
-            AICWFDBG(LOGDEBUG, "%s ext_patch_file_name:%s ext_patch_id:%x ext_patch_addr:%x \r\n",
-                __func__,ext_patch_file_name, id, addr);
+		for (index = 0; index < patch_info->ext_patch_nb; index++) {
+			id = *(patch_info->ext_patch_param + (index * 2));
+			addr = *(patch_info->ext_patch_param + (index * 2) + 1);
+			memset(ext_patch_file_name, 0, sizeof(ext_patch_file_name));
+			sprintf(ext_patch_file_name, "%s%d.bin",
+				filename,
+				id);
+			AICWFDBG(LOGDEBUG, "%s file:%s patch_id:%x patch_addr:%x\n",
+				__func__, ext_patch_file_name, id, addr);
 
-            if (rwnx_plat_bin_fw_upload_android(usb_dev, addr, ext_patch_file_name)) {
-                ret = -1;
-                break;
-            }
-        }
-    }
-    return ret;
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev, addr, ext_patch_file_name);
+			if (ret)
+				break;
+		}
+	}
+	return ret;
 }
 
 
 int aicfw_download_fw_8800d80x2(struct aic_usb_dev *usb_dev)
 {
+	int ret = 0;
+	int i;
 #ifdef CONFIG_USB_BT
-    struct aicbt_patch_table *head = NULL;
-    struct aicbt_patch_info_t patch_info = {
-        .info_len          = 0,
-        .adid_addrinf      = 0,
-        .addr_adid         = 0,
-        .patch_addrinf     = 0,
-        .addr_patch        = 0,
-        .reset_addr        = 0,
-        .reset_val         = 0,
-        .adid_flag_addr    = 0,
-        .adid_flag         = 0,
-    };
-
-    int i = 0;
-
+	struct aicbt_patch_table *head = NULL;
+	struct aicbt_patch_info_t patch_info = {
+		.info_len          = 0,
+		.adid_addrinf      = 0,
+		.addr_adid         = 0,
+		.patch_addrinf     = 0,
+		.addr_patch        = 0,
+		.reset_addr        = 0,
+		.reset_val         = 0,
+		.adid_flag_addr    = 0,
+		.adid_flag         = 0,
+	};
 #ifdef CONFIG_LOAD_BT_CONF
-    aicbt_parse_config(usb_dev, FW_BT_CONF_NAME_8800D80X2);
+	aicbt_parse_config(usb_dev, FW_BT_CONF_NAME_8800D80X2);
 #endif
 
-    if (chip_id < CHIP_REV_U05) {
-        head = aicbt_patch_table_alloc(usb_dev, FW_PATCH_TABLE_NAME_8800D80X2_U03);
-    } else {
-        head = aicbt_patch_table_alloc(usb_dev, FW_PATCH_TABLE_NAME_8800D80X2_U05);
-    }
-    if (head == NULL){
-        printk("aicbt_patch_table_alloc fail\n");
-        return -1;
-    }
+	if (chip_id < CHIP_REV_U05)
+		head = aicbt_patch_table_alloc(usb_dev, FW_PATCH_TABLE_NAME_8800D80X2_U03);
+	else
+		head = aicbt_patch_table_alloc(usb_dev, FW_PATCH_TABLE_NAME_8800D80X2_U05);
+	if (IS_ERR(head)) {
+		pr_err("aicbt_patch_table_alloc fail: %ld\n", PTR_ERR(head));
+		return PTR_ERR(head);
+	}
+	if (chip_id < CHIP_REV_U05) {
+		patch_info.addr_adid = FW_RAM_ADID_BASE_ADDR_8800D80X2_U03;
+		patch_info.addr_patch = FW_RAM_PATCH_BASE_ADDR_8800D80X2_U03;
+	} else {
+		patch_info.addr_adid = FW_RAM_ADID_BASE_ADDR_8800D80X2_U05;
+		patch_info.addr_patch = FW_RAM_PATCH_BASE_ADDR_8800D80X2_U05;
+	}
+	ret = aicbt_patch_info_unpack(&patch_info, head);
+	if (ret)
+		goto out;
+	if (patch_info.info_len == 0) {
+		pr_err("%s, aicbt_patch_info_unpack fail\n", __func__);
+		ret = -EINVAL;
+		goto out;
+	}
 
-    if(head == NULL){
-        return -1;
-    }
-    if (chip_id < CHIP_REV_U05) {
-        patch_info.addr_adid = FW_RAM_ADID_BASE_ADDR_8800D80X2_U03;
-        patch_info.addr_patch = FW_RAM_PATCH_BASE_ADDR_8800D80X2_U03;
-    } else {
-        patch_info.addr_adid = FW_RAM_ADID_BASE_ADDR_8800D80X2_U05;
-        patch_info.addr_patch = FW_RAM_PATCH_BASE_ADDR_8800D80X2_U05;
-    }
-    aicbt_patch_info_unpack(&patch_info, head);
-    if(patch_info.info_len == 0) {
-        printk("%s, aicbt_patch_info_unpack fail\n", __func__);
-        return -1;
-    }
+	pr_info("addr_adid 0x%x, addr_patch 0x%x\n",
+		patch_info.addr_adid, patch_info.addr_patch);
 
-    printk("addr_adid 0x%x, addr_patch 0x%x\n", patch_info.addr_adid, patch_info.addr_patch);
+	if (chip_mcu_id) {
+		u32 retry = 0;
+		const u32 mem_addr = 0x40506030;
+		const u32 mem_addr2 = 0x40506004;
+		u32 mem_data;
+		struct dbg_mem_read_cfm rd_mem_addr_cfm;
 
-    if (chip_mcu_id) {
-        int ret = 0;
-        u32 retry = 0;
-        const u32 mem_addr = 0x40506030;
-        const u32 mem_addr2 = 0x40506004;
-        u32 mem_data;
-        struct dbg_mem_read_cfm rd_mem_addr_cfm;
-        ret = rwnx_send_dbg_mem_read_req(usb_dev, mem_addr, &rd_mem_addr_cfm);
-        if (ret) {
-            printk("%x rd fail: %d\n", mem_addr, ret);
-            return ret;
-        }
-        if (0 == (rd_mem_addr_cfm.memdata & (0x01UL << 2))) {
-            ret = rwnx_send_dbg_mem_read_req(usb_dev, mem_addr2, &rd_mem_addr_cfm);
-            if (ret) {
-                printk("%x rd fail: %d\n", mem_addr2, ret);
-                return ret;
-            }
-            mem_data = (rd_mem_addr_cfm.memdata | (0x01UL << 17)) & (~(0x01UL << 18));
+		ret = rwnx_send_dbg_mem_read_req(usb_dev, mem_addr, &rd_mem_addr_cfm);
+		if (ret) {
+			pr_err("%x rd fail: %d\n", mem_addr, ret);
+			goto out;
+		}
+		if (0 == (rd_mem_addr_cfm.memdata & (0x01UL << 2))) {
+			ret = rwnx_send_dbg_mem_read_req(usb_dev, mem_addr2, &rd_mem_addr_cfm);
+			if (ret) {
+				pr_err("%x rd fail: %d\n", mem_addr2, ret);
+				goto out;
+			}
+			mem_data = (rd_mem_addr_cfm.memdata | (0x01UL << 17)) & (~(0x01UL << 18));
 
-            ret = rwnx_send_dbg_mem_write_req(usb_dev, mem_addr2, mem_data);
-            if (ret) {
-                printk("%x wr fail: %d\n", mem_addr2, ret);
-                return ret;
-            }
-            mdelay(1);
+			ret = rwnx_send_dbg_mem_write_req(usb_dev, mem_addr2, mem_data);
+			if (ret) {
+				pr_err("%x wr fail: %d\n", mem_addr2, ret);
+				goto out;
+			}
+			mdelay(1);
 
-            while (1) {
-                ret = rwnx_send_dbg_mem_read_req(usb_dev, mem_addr, &rd_mem_addr_cfm);
-                if (ret) {
-                    printk("%x rd fail: %d\n", mem_addr, ret);
-                    return ret;
-                }
-                if (0 == (rd_mem_addr_cfm.memdata & (0x01UL << 2))) {
-                    mdelay(1);
-                    retry++;
-                    if (retry > 20) {
-                        printk("bt pwron timeout\n");
-                        return -1;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-    }
+			while (1) {
+				ret = rwnx_send_dbg_mem_read_req(usb_dev,
+					mem_addr,
+					&rd_mem_addr_cfm);
+				if (ret) {
+					pr_err("%x rd fail: %d\n", mem_addr, ret);
+					goto out;
+				}
+				if (0 == (rd_mem_addr_cfm.memdata & (0x01UL << 2))) {
+					mdelay(1);
+					retry++;
+					if (retry > 20) {
+						pr_err("bt pwron timeout\n");
+						ret = -ETIMEDOUT;
+						goto out;
+					}
+				} else {
+					break;
+				}
+			}
+		}
+	}
 #endif
 
-    if(testmode == FW_NORMAL_MODE){
+	if (testmode == FW_NORMAL_MODE) {
 
-        if (chip_id < CHIP_REV_U05){
+		if (chip_id < CHIP_REV_U05) {
 #ifdef CONFIG_USB_BT
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U03)) {
-                return -1;
-            }
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U03)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U03);
+			if (ret)
+				goto out;
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U03);
+			if (ret)
+				goto out;
 
-            if (aicbt_ext_patch_data_load(usb_dev, &patch_info, FW_PATCH_BASE_NAME_8800D80X2_U03_EXT)) {
-                return -1;
-            }
+			ret = aicbt_ext_patch_data_load(usb_dev,
+				&patch_info, FW_PATCH_BASE_NAME_8800D80X2_U03_EXT);
+			if (ret)
+				goto out;
 
-            if (aicbt_patch_table_load(usb_dev, head)) {
-                return -1;
-            }
+			ret = aicbt_patch_table_load(usb_dev, head);
+			if (ret)
+				goto out;
 
-            mdelay(100);
+			mdelay(100);
 #endif
 
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, RAM_FMAC_FW_ADDR_8800D80X2, FW_BASE_NAME_8800D80X2)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				RAM_FMAC_FW_ADDR_8800D80X2, FW_BASE_NAME_8800D80X2);
+			if (ret)
+				goto out;
             #if 0
             if(rwnx_plat_bin_fw_upload_android(usb_dev, FW_RAM_CALIBMODE_ADDR_8800D80X2_U02, FW_CALIBMODE_NAME_8800D80X2_U02)) {
                 return -1;
@@ -563,97 +567,115 @@ int aicfw_download_fw_8800d80x2(struct aic_usb_dev *usb_dev)
             if (rwnx_send_dbg_mem_write_req(usb_dev, 0x40500048, 0x1e0000))
                 return -1;
             #endif
-            if (aicwf_patch_config_8800d80x2(usb_dev)) {
-                return -1;
-            }
-            if (rwnx_send_dbg_start_app_req(usb_dev, RAM_FMAC_FW_ADDR_8800D80X2, HOST_START_APP_AUTO)) {
-                return -1;
-            }
-        }else {
+			ret = aicwf_patch_config_8800d80x2(usb_dev);
+			if (ret)
+				goto out;
+			ret = rwnx_send_dbg_start_app_req(usb_dev,
+				RAM_FMAC_FW_ADDR_8800D80X2, HOST_START_APP_AUTO);
+			if (ret)
+				goto out;
+		} else {
 #ifdef CONFIG_USB_BT
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U05)) {
-                return -1;
-            }
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U05)) {
-                return -1;
-            }
-            if (aicbt_ext_patch_data_load(usb_dev, &patch_info, FW_PATCH_BASE_NAME_8800D80X2_U05_EXT)) {
-                return -1;
-            }
-            if (aicbt_patch_table_load(usb_dev, head)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U05);
+			if (ret)
+				goto out;
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U05);
+			if (ret)
+				goto out;
+			ret = aicbt_ext_patch_data_load(usb_dev,
+				&patch_info, FW_PATCH_BASE_NAME_8800D80X2_U05_EXT);
+			if (ret)
+				goto out;
+			ret = aicbt_patch_table_load(usb_dev, head);
+			if (ret)
+				goto out;
 
-            mdelay(100);
+			mdelay(100);
 #endif
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, RAM_FMAC_FW_ADDR_8800D80X2, FW_BASE_NAME_8800D80X2)) {
-                return -1;
-            }
-            if (aicwf_patch_config_8800d80x2(usb_dev)) {
-                return -1;
-            }
-            if (rwnx_send_dbg_start_app_req(usb_dev, RAM_FMAC_FW_ADDR_8800D80X2, HOST_START_APP_AUTO)) {
-                return -1;
-            }
-        }
-    }else if(testmode == FW_TEST_MODE){
-        if (chip_id < CHIP_REV_U05){
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				RAM_FMAC_FW_ADDR_8800D80X2, FW_BASE_NAME_8800D80X2);
+			if (ret)
+				goto out;
+			ret = aicwf_patch_config_8800d80x2(usb_dev);
+			if (ret)
+				goto out;
+			ret = rwnx_send_dbg_start_app_req(usb_dev,
+				RAM_FMAC_FW_ADDR_8800D80X2, HOST_START_APP_AUTO);
+			if (ret)
+				goto out;
+		}
+	} else if (testmode == FW_TEST_MODE) {
+		if (chip_id < CHIP_REV_U05) {
 #ifdef CONFIG_USB_BT
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U03)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U03);
+			if (ret)
+				goto out;
 
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U03)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U03);
+			if (ret)
+				goto out;
 
-            if (aicbt_ext_patch_data_load(usb_dev, &patch_info, FW_PATCH_BASE_NAME_8800D80X2_U03_EXT)) {
-                return -1;
-            }
+			ret = aicbt_ext_patch_data_load(usb_dev,
+				&patch_info, FW_PATCH_BASE_NAME_8800D80X2_U03_EXT);
+			if (ret)
+				goto out;
 
-            if (aicbt_patch_table_load(usb_dev, head)) {
-                return -1;
-            }
+			ret = aicbt_patch_table_load(usb_dev, head);
+			if (ret)
+				goto out;
 
-            mdelay(100);
+			mdelay(100);
 #endif
 
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, RAM_FMAC_RF_FW_ADDR_8800D80X2, FW_RF_BASE_NAME_8800D80X2)) {
-                AICWFDBG(LOGERROR,"%s wifi fw download fail \r\n", __func__);
-                return -1;
-            }
-            if (rwnx_send_dbg_start_app_req(usb_dev, RAM_FMAC_RF_FW_ADDR_8800D80X2, HOST_START_APP_AUTO)) {
-                return -1;
-            }
-        } else {
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				RAM_FMAC_RF_FW_ADDR_8800D80X2, FW_RF_BASE_NAME_8800D80X2);
+			if (ret) {
+				AICWFDBG(LOGERROR, "%s wifi fw download fail \r\n", __func__);
+				goto out;
+			}
+			ret = rwnx_send_dbg_start_app_req(usb_dev,
+				RAM_FMAC_RF_FW_ADDR_8800D80X2, HOST_START_APP_AUTO);
+			if (ret)
+				goto out;
+		} else {
 #ifdef CONFIG_USB_BT
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U05)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_adid, FW_ADID_BASE_NAME_8800D80X2_U05);
+			if (ret)
+				goto out;
 
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U05)) {
-                return -1;
-            }
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				patch_info.addr_patch, FW_PATCH_BASE_NAME_8800D80X2_U05);
+			if (ret)
+				goto out;
 
-            if (aicbt_ext_patch_data_load(usb_dev, &patch_info, FW_PATCH_BASE_NAME_8800D80X2_U05_EXT)) {
-                return -1;
-            }
+			ret = aicbt_ext_patch_data_load(usb_dev,
+				&patch_info, FW_PATCH_BASE_NAME_8800D80X2_U05_EXT);
+			if (ret)
+				goto out;
 
-            if (aicbt_patch_table_load(usb_dev, head)) {
-                return -1;
-            }
+			ret = aicbt_patch_table_load(usb_dev, head);
+			if (ret)
+				goto out;
 
-            mdelay(100);
+			mdelay(100);
 #endif
-            if(rwnx_plat_bin_fw_upload_android(usb_dev, RAM_FMAC_RF_FW_ADDR_8800D80X2, FW_RF_BASE_NAME_8800D80X2)) {
-             AICWFDBG(LOGERROR,"%s wifi fw download fail \r\n", __func__);
-                    return -1;
-            }
-            if (rwnx_send_dbg_start_app_req(usb_dev, RAM_FMAC_RF_FW_ADDR_8800D80X2, HOST_START_APP_AUTO)) {
-                    return -1;
-            }
-	    }
-    }else if(testmode == FW_BLE_SCAN_AD_FILTER_MODE){
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				RAM_FMAC_RF_FW_ADDR_8800D80X2, FW_RF_BASE_NAME_8800D80X2);
+			if (ret) {
+				AICWFDBG(LOGERROR, "%s wifi fw download fail \r\n", __func__);
+				goto out;
+			}
+			ret = rwnx_send_dbg_start_app_req(usb_dev,
+				RAM_FMAC_RF_FW_ADDR_8800D80X2, HOST_START_APP_AUTO);
+			if (ret)
+				goto out;
+		}
+	} else if (testmode == FW_BLE_SCAN_AD_FILTER_MODE) {
 /*
         data and ad_data_filter_mask instructions for use
         ex.
@@ -666,7 +688,6 @@ int aicfw_download_fw_8800d80x2(struct aic_usb_dev *usb_dev)
         data & mask = "0x46 0x00" 0x00 0x00 0x00 0x00 0x00 0x00 0x00 "0x30 0xff 0xff 0x43 0x52 0x45 0x4c 0x42"
         using data & mask value condition to wakeup host_wake_bt gpio
 */
-		int ret;
         struct ble_wakeup_param_t* wakeup_param = (struct ble_wakeup_param_t*)kmalloc(sizeof(struct ble_wakeup_param_t), GFP_KERNEL);
         uint32_t *write_blocks = (uint32_t *)wakeup_param;
 
@@ -809,11 +830,17 @@ int aicfw_download_fw_8800d80x2(struct aic_usb_dev *usb_dev)
 
         kfree(wakeup_param);
 
-        return -1;
+		ret = -1;
+		goto out;
 
+	} else {
+		ret = -EOPNOTSUPP;
     }
 
-    return 0;
+out:
+#ifdef CONFIG_USB_BT
+	aicbt_patch_table_free(head);
+#endif
+	return ret;
 }
-
 

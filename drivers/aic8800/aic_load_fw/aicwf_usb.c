@@ -1137,15 +1137,14 @@ static int system_config_8800(struct aic_usb_dev *usb_dev){
 
 static int system_config(struct aic_usb_dev *usb_dev)
 {
-    if(usb_dev->chipid == PRODUCT_ID_AIC8800){
-        return system_config_8800(usb_dev);
-    }else if(usb_dev->chipid == PRODUCT_ID_AIC8800D80){
-        return system_config_8800d80(usb_dev);
-    }else if(usb_dev->chipid == PRODUCT_ID_AIC8800D80X2){
-        return system_config_8800d80x2(usb_dev);
-    }else{
-        return -1;
-    }
+	if (usb_dev->chipid == PRODUCT_ID_AIC8800)
+		return system_config_8800(usb_dev);
+	else if (usb_dev->chipid == PRODUCT_ID_AIC8800D80)
+		return system_config_8800d80(usb_dev);
+	else if (usb_dev->chipid == PRODUCT_ID_AIC8800D80X2)
+		return system_config_8800d80x2(usb_dev);
+	else
+		return -ENODEV;
 }
 
 
@@ -1179,47 +1178,53 @@ static int rf_config(struct aic_usb_dev *usb_dev)
 
 static int patch_config(struct aic_usb_dev *usb_dev)
 {
-
-    int ret = 0;
-    int    cnt = 0;
-    int patch_num = 0;
-    uint32_t start_addr = 0x1e6000;
-    u32 patch_addr = start_addr;
-    u32 config_base;
-    struct dbg_mem_read_cfm rd_patch_addr_cfm;
-    const u32 rd_patch_addr = RAM_FW_ADDR + 0x0180;
+	int ret = 0;
+	int cnt = 0;
+	int patch_num = 0;
+	uint32_t start_addr = 0x1e6000;
+	u32 patch_addr = start_addr;
+	u32 config_base;
+	struct dbg_mem_read_cfm rd_patch_addr_cfm;
+	const u32 rd_patch_addr = RAM_FW_ADDR + 0x0180;
 	int tmp_cnt = 0;
 	int adap_patch_num = 0;
 
-    printk("%s enter \r\n", __func__);
+	//if (testmode) {
+	patch_num = sizeof(patch_tbl) / 4;
 
-    //if (testmode) {
-        patch_num = sizeof(patch_tbl)/4;
+	pr_info("Read FW mem: %08x\n", rd_patch_addr);
+	ret = rwnx_send_dbg_mem_read_req(usb_dev, rd_patch_addr, &rd_patch_addr_cfm);
+	if (ret) {
+		pr_err("patch rd fail\n");
+		return ret;
+	}
 
-        printk("Read FW mem: %08x\n", rd_patch_addr);
-        if ((ret = rwnx_send_dbg_mem_read_req(usb_dev, rd_patch_addr, &rd_patch_addr_cfm))) {
-            printk("patch rd fail\n");
-        }
+	pr_info("%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
+	config_base = rd_patch_addr_cfm.memdata;
 
-        printk("%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
-        config_base = rd_patch_addr_cfm.memdata;
+	//if (testmode == FW_NORMAL_MODE) {
+	ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e5318, patch_addr);
+	if (ret) {
+		pr_err("%x write fail\n", 0x1e5318);
+		return ret;
+	}
 
-		//if (testmode == FW_NORMAL_MODE) {
-	        if((ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e5318, patch_addr))) {
-	            printk("%x write fail\n", 0x1e5318);
-	        }
-            
-			if(adap_test){
-				printk("%s for adaptivity test \r\n", __func__);
-				adap_patch_num = sizeof(adaptivity_patch_tbl)/4;
-		        if((ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e531c, patch_num + adap_patch_num))) {
-		            printk("%x write fail\n", 0x1e531c);
-		        }
-			}else{
-		        if((ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e531c, patch_num))) {
-		            printk("%x write fail\n", 0x1e531c);
-		        }
-			}
+	if (adap_test) {
+		pr_info("%s for adaptivity test\n", __func__);
+		adap_patch_num = sizeof(adaptivity_patch_tbl) / 4;
+		ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e531c,
+						     patch_num + adap_patch_num);
+		if (ret) {
+			pr_err("%x write fail\n", 0x1e531c);
+			return ret;
+		}
+	} else {
+		ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e531c, patch_num);
+		if (ret) {
+			pr_err("%x write fail\n", 0x1e531c);
+			return ret;
+		}
+	}
 		//}else if(testmode == FW_TEST_MODE){//for old rf fw
 	    //    if((ret = rwnx_send_dbg_mem_write_req(usb_dev, 0x1e4d78, patch_addr))) {
 	    //        printk("%x write fail\n", 0x1e4d80);
@@ -1229,34 +1234,45 @@ static int patch_config(struct aic_usb_dev *usb_dev)
 	    //    }
 		//}
 
-        for(cnt = 0; cnt < patch_num/2; cnt+=1)
-        {
-            if((ret = rwnx_send_dbg_mem_write_req(usb_dev, start_addr+8*cnt, patch_tbl[cnt][0]+config_base))) {
-                printk("%x write fail\n", start_addr+8*cnt);
-            }
-
-            if((ret = rwnx_send_dbg_mem_write_req(usb_dev, start_addr+8*cnt+4, patch_tbl[cnt][1]))) {
-                printk("%x write fail\n", start_addr+8*cnt+4);
-            }
-
-        }
-
-		tmp_cnt = cnt;
-
-		if(adap_test){
-			for(cnt = 0; cnt < adap_patch_num/2; cnt+=1)
-			{
-				if((ret = rwnx_send_dbg_mem_write_req(usb_dev, start_addr+8*(cnt+tmp_cnt), adaptivity_patch_tbl[cnt][0]+config_base))) {
-					printk("%x write fail\n", start_addr+8*cnt);
-				}
-
-				if((ret = rwnx_send_dbg_mem_write_req(usb_dev, start_addr+8*(cnt+tmp_cnt)+4, adaptivity_patch_tbl[cnt][1]))) {
-					printk("%x write fail\n", start_addr+8*cnt+4);
-				}
-			}
+	for (cnt = 0; cnt < patch_num / 2; cnt += 1) {
+		ret = rwnx_send_dbg_mem_write_req(usb_dev, start_addr + 8 * cnt,
+						     patch_tbl[cnt][0] + config_base);
+		if (ret) {
+			pr_err("%x write fail\n", start_addr + 8 * cnt);
+			return ret;
 		}
 
-        return ret;
+		ret = rwnx_send_dbg_mem_write_req(usb_dev, start_addr + 8 * cnt + 4,
+						     patch_tbl[cnt][1]);
+		if (ret) {
+			pr_err("%x write fail\n", start_addr + 8 * cnt + 4);
+			return ret;
+		}
+	}
+
+	tmp_cnt = cnt;
+
+	if (adap_test) {
+		for (cnt = 0; cnt < adap_patch_num / 2; cnt += 1) {
+			ret = rwnx_send_dbg_mem_write_req(usb_dev,
+					start_addr + 8 * (cnt + tmp_cnt),
+					adaptivity_patch_tbl[cnt][0] + config_base);
+			if (ret) {
+				pr_err("%x write fail\n", start_addr + 8 * cnt);
+				return ret;
+			}
+
+			ret = rwnx_send_dbg_mem_write_req(usb_dev,
+					start_addr + 8 * (cnt + tmp_cnt) + 4,
+					adaptivity_patch_tbl[cnt][1]);
+			if (ret) {
+				pr_err("%x write fail\n", start_addr + 8 * cnt + 4);
+				return ret;
+			}
+		}
+	}
+
+	return ret;
 #if 0
     } else {
         patch_num = sizeof(patch_tbl) / sizeof(u32) / 2;
@@ -1375,9 +1391,9 @@ static int aicloadfw_chipmatch(struct aic_usb_dev *usb_dev, u16 vid, u16 pid){
 	usb_dev->chipid = PRODUCT_ID_AIC8800D81;
 	AICWFDBG(LOGINFO, "%s USE AIC8800D81 (368b:8d81)\r\n", __func__);
 	return 0;
-    }else{
-        return -1;
-    }
+	} else {
+		return -ENODEV;
+	}
 }
 
 int aicfw_download_fw_8800(struct aic_usb_dev *usb_dev){
@@ -1386,6 +1402,7 @@ int aicfw_download_fw_8800(struct aic_usb_dev *usb_dev){
 	int paring_id_num = 0;
 	int i = 0;
     const u32 fw_addr = RAM_FW_ADDR;
+	int ret;
     
 #ifdef CONFIG_M2D_OTA_AUTO_SUPPORT
         if(testmode == FW_M2D_OTA_MODE){
@@ -1597,37 +1614,45 @@ int aicfw_download_fw_8800(struct aic_usb_dev *usb_dev){
 
             return -1;
         }else {
-            if (rwnx_plat_bin_fw_upload_android(usb_dev, RAM_FW_ADDR, FW_BASE_NAME)) {
-                return -1;;
-            }
-            if (chip_id == CHIP_REV_U03) {
-                if(rwnx_plat_bin_fw_upload_android(usb_dev, FW_RAM_ADID_BASE_ADDR, FW_ADID_BASE_NAME_U03)) {
-                    return -1;;
-                }
-    
-                if(rwnx_plat_bin_fw_upload_android(usb_dev, FW_RAM_PATCH_BASE_ADDR_U03, FW_PATCH_BASE_NAME_U03)) {
-                    return -1;;
-                }
-            } else {
-                if(rwnx_plat_bin_fw_upload_android(usb_dev, FW_RAM_ADID_BASE_ADDR, FW_ADID_BASE_NAME)) {
-                    return -1;;
-                }
-    
-                if(rwnx_plat_bin_fw_upload_android(usb_dev, FW_RAM_PATCH_BASE_ADDR, FW_PATCH_BASE_NAME)) {
-                    return -1;;
-                }
-            }
-        }
-        if (chip_id == CHIP_REV_U03) {
-            if (rwnx_plat_bin_fw_patch_table_upload_android(usb_dev, FW_PATCH_TABLE_NAME_U03)) {
-                return -1;;
-            }
-        } else {
-            if (rwnx_plat_bin_fw_patch_table_upload_android(usb_dev, FW_PATCH_TABLE_NAME)) {
-                return -1;;
-            }
-        }
-    
+		ret = rwnx_plat_bin_fw_upload_android(usb_dev, RAM_FW_ADDR, FW_BASE_NAME);
+		if (ret)
+			return ret;
+		if (chip_id == CHIP_REV_U03) {
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				FW_RAM_ADID_BASE_ADDR,
+				FW_ADID_BASE_NAME_U03);
+			if (ret)
+				return ret;
+
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				FW_RAM_PATCH_BASE_ADDR_U03,
+				FW_PATCH_BASE_NAME_U03);
+			if (ret)
+				return ret;
+		} else {
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				FW_RAM_ADID_BASE_ADDR,
+				FW_ADID_BASE_NAME);
+			if (ret)
+				return ret;
+
+			ret = rwnx_plat_bin_fw_upload_android(usb_dev,
+				FW_RAM_PATCH_BASE_ADDR,
+				FW_PATCH_BASE_NAME);
+			if (ret)
+				return ret;
+		}
+	}
+	if (chip_id == CHIP_REV_U03) {
+		ret = rwnx_plat_bin_fw_patch_table_upload_android(usb_dev, FW_PATCH_TABLE_NAME_U03);
+		if (ret)
+			return ret;
+	} else {
+		ret = rwnx_plat_bin_fw_patch_table_upload_android(usb_dev, FW_PATCH_TABLE_NAME);
+		if (ret)
+			return ret;
+	}
+
 #if 0
         if(testmode == FW_TEST_MODE){
             if(rwnx_plat_bin_fw_upload_android(usb_dev, FW_PATCH_TEST_BASE_ADDR, FW_PATCH_TEST_BASE_NAME)) {
@@ -1636,36 +1661,35 @@ int aicfw_download_fw_8800(struct aic_usb_dev *usb_dev){
         }
 #endif
     
-        if (rwnx_plat_userconfig_upload_android(usb_dev, FW_USERCONFIG_NAME)){
-            return -1;
-        }
-    
-        if (patch_config(usb_dev)) {
-            return -1;;
-        }
-    
-        if (rf_config(usb_dev)){
-            return -1;;
-        }
-        if (rwnx_send_dbg_start_app_req(usb_dev, fw_addr, HOST_START_APP_AUTO)) {
-            return -1;
-        }
-        
-    return 0;
+	ret = rwnx_plat_userconfig_upload_android(usb_dev, FW_USERCONFIG_NAME);
+	if (ret)
+		return ret;
+
+	ret = patch_config(usb_dev);
+	if (ret)
+		return ret;
+
+	ret = rf_config(usb_dev);
+	if (ret)
+		return ret;
+	ret = rwnx_send_dbg_start_app_req(usb_dev, fw_addr, HOST_START_APP_AUTO);
+	if (ret)
+		return ret;
+
+	return 0;
 }
 
 
 int aicfw_download_fw(struct aic_usb_dev *usb_dev)
 {
-    if(usb_dev->chipid == PRODUCT_ID_AIC8800){
-        return aicfw_download_fw_8800(usb_dev);
-    }else if(usb_dev->chipid == PRODUCT_ID_AIC8800D80){
-        return aicfw_download_fw_8800d80(usb_dev);
-    }else if(usb_dev->chipid == PRODUCT_ID_AIC8800D80X2){
-        return aicfw_download_fw_8800d80x2(usb_dev);
-    }else{
-        return -1;
-    }
+	if (usb_dev->chipid == PRODUCT_ID_AIC8800)
+		return aicfw_download_fw_8800(usb_dev);
+	else if (usb_dev->chipid == PRODUCT_ID_AIC8800D80)
+		return aicfw_download_fw_8800d80(usb_dev);
+	else if (usb_dev->chipid == PRODUCT_ID_AIC8800D80X2)
+		return aicfw_download_fw_8800d80x2(usb_dev);
+	else
+		return -ENODEV;
 }
 
 
