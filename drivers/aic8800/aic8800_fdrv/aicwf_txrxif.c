@@ -150,6 +150,7 @@ int aicwf_bus_init(uint bus_hdrlen, struct device *dev)
 	tasklet_init(&((bus_if->bus_priv.usb)->recv_tasklet),
 		(void(*)(unsigned long))aicwf_tasklet_rxframes,
 		(unsigned long)(bus_if->bus_priv.usb)->rx_priv);
+	bus_if->bus_priv.usb->rx_tasklet_initialized = true;
 #endif
 
 #ifdef CONFIG_TX_TASKLET//AIDEN tasklet
@@ -252,8 +253,7 @@ void aicwf_bus_deinit(struct device *dev)
         bus_if->bustx_thread = NULL;
     }
 
-    if (usb->rx_priv)
-        aicwf_rx_deinit(usb->rx_priv);
+	aicwf_usb_rx_stop(usb);
 
     rwnx_cmd_mgr_deinit(&usb->cmd_mgr);
 
@@ -358,7 +358,8 @@ static int aicwf_process_rx_buffer(struct aicwf_rx_priv *rx_priv,
 				   const u8 *data, size_t len, gfp_t flags,
 				   bool aggregate)
 {
-	struct rwnx_hw *hw = rx_priv->usbdev->rwnx_hw;
+	/* Pairs with the initialized owner publication in cfg80211 init. */
+	struct rwnx_hw *hw = smp_load_acquire(&rx_priv->usbdev->rwnx_hw);
 	struct aicwf_rx_record record;
 	struct sk_buff *skb;
 	u32 cfm[2];
@@ -432,11 +433,14 @@ static int aicwf_process_rx_skb(struct aicwf_rx_priv *rx_priv,
 		if (ret)
 			return ret;
 		if (!record.config) {
-			if (!rx_priv->usbdev->rwnx_hw)
+			struct rwnx_hw *hw;
+
+			/* Observe initialized fields before using the published owner. */
+			hw = smp_load_acquire(&rx_priv->usbdev->rwnx_hw);
+			if (!hw)
 				return -ENODEV;
 			skb_trim(skb, record.length);
-			rwnx_rxdataind_aicwf(rx_priv->usbdev->rwnx_hw, skb,
-					     rx_priv);
+			rwnx_rxdataind_aicwf(hw, skb, rx_priv);
 			return 1;
 		}
 	}
@@ -734,7 +738,10 @@ void aicwf_rx_deinit(struct aicwf_rx_priv* rx_priv)
 #ifdef AICWF_USB_SUPPORT
 
 #ifdef CONFIG_RX_TASKLET//AIDEN tasklet
-	tasklet_kill(&rx_priv->usbdev->recv_tasklet);
+	if (rx_priv->usbdev->rx_tasklet_initialized) {
+		tasklet_kill(&rx_priv->usbdev->recv_tasklet);
+		rx_priv->usbdev->rx_tasklet_initialized = false;
+	}
 #endif
     if (rx_priv->usbdev->bus_if->busrx_thread) {
         complete_all(&rx_priv->usbdev->bus_if->busrx_trgg);

@@ -1931,23 +1931,30 @@ int rwnx_dbgfs_register(struct rwnx_hw *rwnx_hw, const char *name)
     struct rwnx_debugfs *rwnx_debugfs = &rwnx_hw->debugfs;
     struct dentry *dir_drv, *dir_diags;
 
-    if (!(dir_drv = debugfs_create_dir(name, phyd)))
-        return -ENOMEM;
+	/* The owner must unregister partial state after draining RX on failure. */
+	rwnx_debugfs->unregistering = true;
+#ifdef CONFIG_RWNX_FULLMAC
+	INIT_WORK(&rwnx_debugfs->rc_stat_work, rwnx_rc_stat_work);
+	INIT_LIST_HEAD(&rwnx_debugfs->rc_config_save);
+	rwnx_debugfs->rc_write = rwnx_debugfs->rc_read = 0;
+	memset(rwnx_debugfs->rc_sta, 0xFF, sizeof(rwnx_debugfs->rc_sta));
+#endif
+	dir_drv = debugfs_create_dir(name, phyd);
+	if (IS_ERR_OR_NULL(dir_drv))
+		return -ENOMEM;
 
     rwnx_debugfs->dir = dir_drv;
     rwnx_debugfs->unregistering = false;
 
-    if (!(dir_diags = debugfs_create_dir("diags", dir_drv)))
-        goto err;
+	dir_diags = debugfs_create_dir("diags", dir_drv);
+	if (IS_ERR_OR_NULL(dir_diags))
+		goto err;
 
 #ifdef CONFIG_RWNX_FULLMAC
-    if (!(dir_rc = debugfs_create_dir("rc", dir_drv)))
-        goto err;
-    rwnx_debugfs->dir_rc = dir_rc;
-    INIT_WORK(&rwnx_debugfs->rc_stat_work, rwnx_rc_stat_work);
-    INIT_LIST_HEAD(&rwnx_debugfs->rc_config_save);
-    rwnx_debugfs->rc_write = rwnx_debugfs->rc_read = 0;
-    memset(rwnx_debugfs->rc_sta, 0xFF, sizeof(rwnx_debugfs->rc_sta));
+	dir_rc = debugfs_create_dir("rc", dir_drv);
+	if (IS_ERR_OR_NULL(dir_rc))
+		goto err;
+	rwnx_debugfs->dir_rc = dir_rc;
 #endif
 
     DEBUGFS_ADD_U32(tcp_pacing_shift, dir_drv, &rwnx_hw->tcp_pacing_shift,
@@ -1966,8 +1973,9 @@ int rwnx_dbgfs_register(struct rwnx_hw *rwnx_hw, const char *name)
     {
         /* Create a p2p directory */
         struct dentry *dir_p2p;
-        if (!(dir_p2p = debugfs_create_dir("p2p", dir_drv)))
-            goto err;
+		dir_p2p = debugfs_create_dir("p2p", dir_drv);
+		if (IS_ERR_OR_NULL(dir_p2p))
+			goto err;
 
         /* Add file allowing to control Opportunistic PS */
         DEBUGFS_ADD_FILE(oppps, dir_p2p, S_IRUSR);
@@ -1976,15 +1984,17 @@ int rwnx_dbgfs_register(struct rwnx_hw *rwnx_hw, const char *name)
     }
 #endif /* CONFIG_RWNX_P2P_DEBUGFS */
 
-    if (rwnx_hw->fwlog_en) {
-        rwnx_fw_log_init(&rwnx_hw->debugfs.fw_log);
-        DEBUGFS_ADD_FILE(fw_log, dir_drv, S_IWUSR | S_IRUSR);
-    }
+	if (rwnx_hw->fwlog_en) {
+		if (rwnx_fw_log_init(&rwnx_debugfs->fw_log))
+			goto err;
+		DEBUGFS_ADD_FILE(fw_log, dir_drv, 0600);
+	}
 #ifdef CONFIG_RWNX_RADAR
     {
         struct dentry *dir_radar, *dir_sec;
-        if (!(dir_radar = debugfs_create_dir("radar", dir_drv)))
-            goto err;
+		dir_radar = debugfs_create_dir("radar", dir_drv);
+		if (IS_ERR_OR_NULL(dir_radar))
+			goto err;
 
         DEBUGFS_ADD_FILE(pulses_prim, dir_radar, S_IRUSR);
         DEBUGFS_ADD_FILE(detected,    dir_radar, S_IRUSR);
@@ -1993,8 +2003,9 @@ int rwnx_dbgfs_register(struct rwnx_hw *rwnx_hw, const char *name)
         if (rwnx_hw->phy.cnt == 2) {
             DEBUGFS_ADD_FILE(pulses_sec, dir_radar, S_IRUSR);
 
-            if (!(dir_sec = debugfs_create_dir("sec", dir_radar)))
-                goto err;
+			dir_sec = debugfs_create_dir("sec", dir_radar);
+			if (IS_ERR_OR_NULL(dir_sec))
+				goto err;
 
 			DEBUGFS_ADD_FILE(band,    dir_sec, 0400);
 			DEBUGFS_ADD_FILE(type,    dir_sec, 0400);
@@ -2007,7 +2018,7 @@ int rwnx_dbgfs_register(struct rwnx_hw *rwnx_hw, const char *name)
     return 0;
 
 err:
-    rwnx_dbgfs_unregister(rwnx_hw);
+    /* RX may still own the firmware log buffer until the caller quiesces it. */
     return -ENOMEM;
 }
 
@@ -2018,6 +2029,13 @@ void rwnx_dbgfs_unregister(struct rwnx_hw *rwnx_hw)
         struct rwnx_rc_config_save *cfg, *next;
 #endif
 
+	rwnx_debugfs->unregistering = true;
+#ifdef CONFIG_RWNX_FULLMAC
+	flush_work(&rwnx_debugfs->rc_stat_work);
+#endif
+	debugfs_remove_recursive(rwnx_debugfs->dir);
+	rwnx_debugfs->dir = NULL;
+
 #ifdef CONFIG_RWNX_FULLMAC
     list_for_each_entry_safe(cfg, next, &rwnx_debugfs->rc_config_save, list) {
         list_del(&cfg->list);
@@ -2025,18 +2043,11 @@ void rwnx_dbgfs_unregister(struct rwnx_hw *rwnx_hw)
     }
 #endif /* CONFIG_RWNX_FULLMAC */
 
-    if (rwnx_hw->fwlog_en)
-        rwnx_fw_log_deinit(&rwnx_hw->debugfs.fw_log);
-
-    if (!rwnx_hw->debugfs.dir)
-        return;
-
-    rwnx_debugfs->unregistering = true;
-#ifdef CONFIG_RWNX_FULLMAC
-    flush_work(&rwnx_debugfs->rc_stat_work);
-#endif
-    debugfs_remove_recursive(rwnx_hw->debugfs.dir);
-    rwnx_hw->debugfs.dir = NULL;
+	if (rwnx_debugfs->fw_log.buf.data) {
+		rwnx_fw_log_deinit(&rwnx_debugfs->fw_log);
+		rwnx_debugfs->fw_log.buf.data = NULL;
+		rwnx_debugfs->fw_log.buf.dataend = NULL;
+	}
 }
 
 #endif //

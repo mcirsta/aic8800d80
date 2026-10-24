@@ -2314,6 +2314,7 @@ void defrag_timeout_cb(struct timer_list *t)
 #endif
 {
 	struct defrag_ctrl_info *defrag_ctrl = NULL;
+	struct rwnx_hw *rwnx_hw;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
 	defrag_ctrl = (struct defrag_ctrl_info *)data;
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
@@ -2322,12 +2323,47 @@ void defrag_timeout_cb(struct timer_list *t)
 	defrag_ctrl = timer_container_of(defrag_ctrl, t, defrag_timer);
 #endif
 
-	printk("%s:%p\r\n", __func__, defrag_ctrl);
-	spin_lock_bh(&defrag_ctrl->rwnx_hw->defrag_lock);
+	rwnx_hw = defrag_ctrl->rwnx_hw;
+	spin_lock_bh(&rwnx_hw->defrag_lock);
+	/* A detached entry belongs to its synchronous completion/drain owner. */
+	if (list_empty(&defrag_ctrl->list)) {
+		spin_unlock_bh(&rwnx_hw->defrag_lock);
+		return;
+	}
 	list_del_init(&defrag_ctrl->list);
+	spin_unlock_bh(&rwnx_hw->defrag_lock);
 	dev_kfree_skb(defrag_ctrl->skb);
 	kfree(defrag_ctrl);
-	spin_unlock_bh(&defrag_ctrl->rwnx_hw->defrag_lock);
+}
+
+static void rwnx_defrag_timer_cancel(struct defrag_ctrl_info *defrag_ctrl)
+{
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
+	timer_delete_sync(&defrag_ctrl->defrag_timer);
+#else
+	del_timer_sync(&defrag_ctrl->defrag_timer);
+#endif
+}
+
+/* Call after RX producers stop, before releasing the hw that timers retain. */
+void rwnx_rx_defrag_deinit(struct rwnx_hw *rwnx_hw)
+{
+	struct defrag_ctrl_info *defrag_ctrl;
+
+	for (;;) {
+		spin_lock_bh(&rwnx_hw->defrag_lock);
+		if (list_empty(&rwnx_hw->defrag_list)) {
+			spin_unlock_bh(&rwnx_hw->defrag_lock);
+			break;
+		}
+		defrag_ctrl = list_first_entry(&rwnx_hw->defrag_list,
+					     struct defrag_ctrl_info, list);
+		list_del_init(&defrag_ctrl->list);
+		spin_unlock_bh(&rwnx_hw->defrag_lock);
+		rwnx_defrag_timer_cancel(defrag_ctrl);
+		dev_kfree_skb(defrag_ctrl->skb);
+		kfree(defrag_ctrl);
+	}
 }
 
 extern void rwnx_data_dump(char* tag, void* data, unsigned long len);
@@ -2686,16 +2722,19 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 						defrag_info->frm_len = skb->len;
 						defrag_info->rwnx_hw = rwnx_hw;
 						//printk("first:%p,%p,%p,%p,%p, %d,%d\r\n", defrag_info, defrag_info->skb, defrag_info->skb->head, defrag_info->skb->tail, defrag_info->skb->end, defrag_info->frm_len, skb->len);
-						list_add_tail(&defrag_info->list, &rwnx_hw->defrag_list);
-						spin_unlock_bh(&rwnx_hw->defrag_lock);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
-						init_timer(&defrag_info->defrag_timer);
-						defrag_info->defrag_timer.data = (unsigned long)defrag_info;
-						defrag_info->defrag_timer.function = defrag_timeout_cb;
+						__setup_timer(&defrag_info->defrag_timer,
+							      defrag_timeout_cb,
+							      (unsigned long)defrag_info,
+							      TIMER_IRQSAFE);
 #else
-						timer_setup(&defrag_info->defrag_timer, defrag_timeout_cb, 0);
+						timer_setup(&defrag_info->defrag_timer,
+							    defrag_timeout_cb, TIMER_IRQSAFE);
 #endif
+						list_add_tail(&defrag_info->list,
+							      &rwnx_hw->defrag_list);
 						ret = mod_timer(&defrag_info->defrag_timer, jiffies + msecs_to_jiffies(DEFRAG_MAX_WAIT));
+						spin_unlock_bh(&rwnx_hw->defrag_lock);
 						dev_kfree_skb(skb);
 						return 0;
 					}
@@ -2739,15 +2778,9 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 
 							skb_tmp = defrag_info->skb;
 							list_del_init(&defrag_info->list);
-							if (timer_pending(&defrag_info->defrag_timer)) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-								ret = timer_delete(&defrag_info->defrag_timer);
-#else
-								ret = del_timer(&defrag_info->defrag_timer);
-#endif
-							}
-							kfree(defrag_info);
 							spin_unlock_bh(&rwnx_hw->defrag_lock);
+							rwnx_defrag_timer_cancel(defrag_info);
+							kfree(defrag_info);
 
 							if (!rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb_tmp, hw_rxhdr))
 								dev_kfree_skb(skb_tmp);

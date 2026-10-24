@@ -224,6 +224,7 @@ struct aic_usb_dev {
 
 #ifdef CONFIG_RX_TASKLET//AIDEN tasklet
 	struct tasklet_struct recv_tasklet;
+	bool rx_tasklet_initialized;
 #endif
 #ifdef CONFIG_TX_TASKLET//AIDEN tasklet
 	struct tasklet_struct xmit_tasklet;
@@ -245,6 +246,7 @@ void rwnx_wake_sta_all_queues(void *sta, struct rwnx_hw *rwnx_hw);
 void aicwf_usb_cancel_all_urbs(struct aic_usb_dev *usb_dev);
 void aicwf_usb_tx_stop(struct aic_usb_dev *usb_dev);
 void aicwf_usb_rx_stop(struct aic_usb_dev *usb_dev);
+void aicwf_usb_rx_quiesce(struct aic_usb_dev *usb_dev);
 
 extern void aicwf_hostif_ready(void);
 

@@ -301,12 +301,14 @@ static void aicwf_usb_rx_complete(struct urb *urb)
         //printk("%s %d \r\n", __func__, atomic_read(&rx_urb_cnt));
     }
 
-    if(!usb_dev->rwnx_hw){
-        aicwf_prealloc_rxbuff_free(rx_buff, &rx_priv->rxbuff_lock);
-        aicwf_usb_rx_buf_put(usb_dev, usb_buf);
-        AICWFDBG(LOGERROR, "usb_dev->rwnx_hw is not ready \r\n");
-        return;
-    }
+	/* Pairs with the initialized owner publication in cfg80211 init. */
+	if (!smp_load_acquire(&usb_dev->rwnx_hw)) {
+		aicwf_prealloc_rxbuff_free(rx_buff, &rx_priv->rxbuff_lock);
+		aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+		/* Keep reply buffers available until initialization publishes hw. */
+		aicwf_usb_rx_submit_all_urb_(usb_dev);
+		return;
+	}
 
     if (urb->actual_length > urb->transfer_buffer_length) {
         aicwf_prealloc_rxbuff_free(rx_buff, &rx_priv->rxbuff_lock);
@@ -376,10 +378,12 @@ static void aicwf_usb_rx_complete(struct urb *urb)
 		//printk("%s %d \r\n", __func__, atomic_read(&rx_urb_cnt));
 	}
 
-	if(!usb_dev->rwnx_hw){
+	/* Pairs with the initialized owner publication in cfg80211 init. */
+	if (!smp_load_acquire(&usb_dev->rwnx_hw)) {
 		aicwf_dev_skb_free(skb);
-        aicwf_usb_rx_buf_put(usb_dev, usb_buf);
-		AICWFDBG(LOGERROR, "usb_dev->rwnx_hw is not ready \r\n");
+		aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+		/* The refill helper refuses submissions once teardown sets DOWN. */
+		aicwf_usb_rx_submit_all_urb_(usb_dev);
 		return;
 	}
 
@@ -1971,12 +1975,14 @@ static void aicwf_usb_bus_stop(struct device *dev)
     //aicwf_usb_cancel_all_urbs(usb_dev);//AIDEN
 }
 
-/* Keep transport callbacks from outliving the wiphy and its private state. */
-void aicwf_usb_rx_stop(struct aic_usb_dev *usb)
+/* Drain callbacks while keeping their private state available to the owner. */
+void aicwf_usb_rx_quiesce(struct aic_usb_dev *usb)
 {
 	struct aicwf_bus *bus = usb->bus_if;
 
 	aicwf_usb_state_change(usb, USB_DOWN_ST);
+	/* state_change() may return early when USB was already down. */
+	WRITE_ONCE(bus->state, BUS_DOWN_ST);
 	cancel_work_sync(&usb->rx_urb_work);
 #ifdef CONFIG_USB_MSG_IN_EP
 	if (usb->msg_in_pipe)
@@ -1988,7 +1994,10 @@ void aicwf_usb_rx_stop(struct aic_usb_dev *usb)
 		usb_kill_anchored_urbs(&usb->msg_rx_submitted);
 #endif
 #ifdef CONFIG_RX_TASKLET
-	tasklet_kill(&usb->recv_tasklet);
+	if (usb->rx_tasklet_initialized) {
+		tasklet_kill(&usb->recv_tasklet);
+		usb->rx_tasklet_initialized = false;
+	}
 #endif
 	if (bus->busrx_thread) {
 		complete_all(&bus->busrx_trgg);
@@ -2002,6 +2011,18 @@ void aicwf_usb_rx_stop(struct aic_usb_dev *usb)
 		bus->msg_busrx_thread = NULL;
 	}
 #endif
+	/* An active RX consumer may have queued a refill during its drain. */
+	cancel_work_sync(&usb->rx_urb_work);
+#ifdef CONFIG_USB_MSG_IN_EP
+	if (usb->msg_in_pipe)
+		cancel_work_sync(&usb->msg_rx_urb_work);
+#endif
+}
+
+/* Keep transport callbacks from outliving the wiphy and its private state. */
+void aicwf_usb_rx_stop(struct aic_usb_dev *usb)
+{
+	aicwf_usb_rx_quiesce(usb);
 	if (usb->rx_priv) {
 		aicwf_rx_deinit(usb->rx_priv);
 		usb->rx_priv = NULL;
@@ -2045,6 +2066,12 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
 
     usb_dev->tbusy = false;
     usb_dev->state = USB_DOWN_ST;
+	/* The allocation-error unwind also cancels these work items. */
+	INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
+#ifdef CONFIG_USB_MSG_IN_EP
+	if (usb_dev->msg_in_pipe)
+		INIT_WORK(&usb_dev->msg_rx_urb_work, aicwf_usb_msg_rx_urb_work);
+#endif
 
     init_waitqueue_head(&usb_dev->msg_wait);
     init_usb_anchor(&usb_dev->rx_submitted);
@@ -2108,13 +2135,6 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
         ret = ENOMEM;
         goto error;
     }
-
-    INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
-#ifdef CONFIG_USB_MSG_IN_EP
-	if(usb_dev->msg_in_pipe){
-		INIT_WORK(&usb_dev->msg_rx_urb_work, aicwf_usb_msg_rx_urb_work);
-	}
-#endif
 
     return ret;
     error:

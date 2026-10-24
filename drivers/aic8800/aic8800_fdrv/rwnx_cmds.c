@@ -365,6 +365,10 @@ void cmd_mgr_task_process(struct work_struct *work)
     while(1) {
         next = NULL;
         spin_lock_bh(&cmd_mgr->lock);
+		if (cmd_mgr->state == RWNX_CMD_MGR_STATE_CRASHED) {
+			spin_unlock_bh(&cmd_mgr->lock);
+			break;
+		}
 
         list_for_each_entry(cur, &cmd_mgr->cmds, list) {
             if (cur->flags & RWNX_CMD_FLAG_WAIT_PUSH) { //just judge the first
@@ -573,16 +577,32 @@ void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr)
     }
 }
 
+/* Call after command producers stop, while the hw and wakeup sources exist. */
+void rwnx_cmd_mgr_quiesce(struct rwnx_cmd_mgr *cmd_mgr)
+{
+	if (!cmd_mgr->cmd_wq)
+		return;
+
+	spin_lock_bh(&cmd_mgr->lock);
+	cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+	spin_unlock_bh(&cmd_mgr->lock);
+	/* A running command keeps its descriptor until its existing wait ends. */
+	cancel_work_sync(&cmd_mgr->cmdWork);
+}
+
 void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr)
 {
-    if(cmd_mgr->print && cmd_mgr->drain){
-        cmd_mgr->print(cmd_mgr);
-        cmd_mgr->drain(cmd_mgr);
-        cmd_mgr->print(cmd_mgr);
-        flush_workqueue(cmd_mgr->cmd_wq);
-        destroy_workqueue(cmd_mgr->cmd_wq);
-        memset(cmd_mgr, 0, sizeof(*cmd_mgr));
-    }
+	if (!cmd_mgr->print || !cmd_mgr->drain)
+		return;
+
+	/* The worker owns its active command outside cmd_mgr->lock. */
+	rwnx_cmd_mgr_quiesce(cmd_mgr);
+	cmd_mgr->print(cmd_mgr);
+	cmd_mgr->drain(cmd_mgr);
+	cmd_mgr->print(cmd_mgr);
+	if (cmd_mgr->cmd_wq)
+		destroy_workqueue(cmd_mgr->cmd_wq);
+	memset(cmd_mgr, 0, sizeof(*cmd_mgr));
 }
 
 

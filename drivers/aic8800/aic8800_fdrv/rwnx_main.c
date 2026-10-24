@@ -9096,10 +9096,87 @@ extern int get_adap_test(void);
 
 extern void *aicwf_prealloc_txq_alloc(size_t size);
 extern char default_ccode[];
+struct rwnx_init_state {
+	bool aic_initialized;
+	bool ack_initialized;
+	bool mu_initialized;
+	bool radar_initialized;
+	bool wiphy_registered;
+	bool debugfs_initialized;
+};
+
+/* RX can already be running when firmware setup or registration fails. */
+static void rwnx_cfg80211_init_cleanup(struct rwnx_hw *rwnx_hw,
+				     const struct rwnx_init_state *state)
+{
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
+#endif
+#ifdef AICWF_USB_SUPPORT
+	/* Keep RX private state alive for work queued by the last callback. */
+	aicwf_usb_tx_stop(rwnx_hw->usbdev);
+	aicwf_usb_rx_quiesce(rwnx_hw->usbdev);
+#endif
+#ifdef CONFIG_FILTER_TCP_ACK
+	if (state->ack_initialized)
+		tcp_ack_deinit(rwnx_hw);
+#endif
+	if (rwnx_hw->apmStaloss_wq) {
+		cancel_work_sync(&rwnx_hw->apmStalossWork);
+		destroy_workqueue(rwnx_hw->apmStaloss_wq);
+		rwnx_hw->apmStaloss_wq = NULL;
+	}
+#ifdef CONFIG_RWNX_RADAR
+	if (state->radar_initialized) {
+		cancel_work_sync(&rwnx_hw->radar.detection_work);
+#ifdef CONFIG_RWNX_FULLMAC
+		cancel_delayed_work_sync(&rwnx_hw->radar.cac_work);
+#endif
+	}
+#endif
+#ifdef CONFIG_RWNX_MUMIMO_TX
+	if (state->mu_initialized)
+		cancel_delayed_work_sync(&rwnx_hw->mu.group_work);
+#endif
+	/* A later interface allocation can fail after the first one registered. */
+	rwnx_wdev_unregister(rwnx_hw);
+#ifdef CONFIG_DEBUG_FS
+	if (state->debugfs_initialized)
+		rwnx_dbgfs_unregister(rwnx_hw);
+#endif
+	if (state->wiphy_registered)
+		wiphy_unregister(rwnx_hw->wiphy);
+	if (state->aic_initialized)
+		rwnx_cmd_mgr_quiesce(rwnx_hw->cmd_mgr);
+	rwnx_platform_off(rwnx_hw, NULL);
+#ifdef AICWF_USB_SUPPORT
+	/* No callback or dependent worker may retain this storage now. */
+	aicwf_usb_rx_stop(rwnx_hw->usbdev);
+#endif
+	rwnx_rx_defrag_deinit(rwnx_hw);
+#ifdef CONFIG_USE_WIRELESS_EXT
+	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
+#endif
+	if (state->radar_initialized)
+		rwnx_radar_detection_deinit(&rwnx_hw->radar);
+	kmem_cache_destroy(rwnx_hw->sw_txhdr_cache);
+	aicwf_wakeup_lock_deinit(rwnx_hw);
+#ifdef AICWF_USB_SUPPORT
+	if (rwnx_hw->usbdev->rwnx_hw == rwnx_hw)
+		WRITE_ONCE(rwnx_hw->usbdev->rwnx_hw, NULL);
+#endif
+#ifdef AICWF_SDIO_SUPPORT
+	if (rwnx_hw->sdiodev->rwnx_hw == rwnx_hw)
+		WRITE_ONCE(rwnx_hw->sdiodev->rwnx_hw, NULL);
+#endif
+	wiphy_free(rwnx_hw->wiphy);
+}
+
 int rwnx_cfg80211_init(struct rwnx_plat *rwnx_plat, void **platform_data)
 {
     struct rwnx_hw *rwnx_hw;
-    struct rwnx_conf_file init_conf;
+	struct rwnx_init_state state = {};
+	struct rwnx_conf_file init_conf;
     int ret = 0;
     struct wiphy *wiphy;
     struct rwnx_vif *vif;
@@ -9118,6 +9195,7 @@ int rwnx_cfg80211_init(struct rwnx_plat *rwnx_plat, void **platform_data)
 
     int nx_remote_sta_max = NX_REMOTE_STA_MAX;
     RWNX_DBG(RWNX_FN_ENTRY_STR);
+	*platform_data = NULL;
 
 
 if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
@@ -9148,16 +9226,25 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 
     rwnx_hw = wiphy_priv(wiphy);
 	spin_lock_init(&rwnx_hw->tx_lock);
-    rwnx_hw->wiphy = wiphy;
+	spin_lock_init(&rwnx_hw->cb_lock);
+	spin_lock_init(&rwnx_hw->defrag_lock);
+	INIT_LIST_HEAD(&rwnx_hw->vifs);
+	INIT_LIST_HEAD(&rwnx_hw->defrag_list);
+	mutex_init(&rwnx_hw->mutex);
+	mutex_init(&rwnx_hw->dbgdump_elem.mutex);
+#ifdef CONFIG_USE_WIRELESS_EXT
+	INIT_LIST_HEAD(&rwnx_hw->wext_scanre_list);
+#endif
+	tasklet_init(&rwnx_hw->task, rwnx_task, (unsigned long)rwnx_hw);
+	INIT_WORK(&rwnx_hw->apmStalossWork, apm_staloss_work_process);
+	rwnx_hw->wiphy = wiphy;
     rwnx_hw->plat = rwnx_plat;
     rwnx_hw->dev = rwnx_platform_get_dev(rwnx_plat);
 #ifdef AICWF_SDIO_SUPPORT
     rwnx_hw->sdiodev = rwnx_plat->sdiodev;
-    rwnx_plat->sdiodev->rwnx_hw = rwnx_hw;
     rwnx_hw->cmd_mgr = &rwnx_plat->sdiodev->cmd_mgr;
 #else
     rwnx_hw->usbdev = rwnx_plat->usbdev;
-    rwnx_plat->usbdev->rwnx_hw = rwnx_hw;
     rwnx_hw->cmd_mgr = &rwnx_plat->usbdev->cmd_mgr;
 #endif
     rwnx_hw->mod_params = &rwnx_mod_params;
@@ -9169,22 +9256,30 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 
     aicwf_wakeup_lock_init(rwnx_hw);
 
-    rwnx_init_aic(rwnx_hw);
-    /* set device pointer for wiphy */
+	ret = rwnx_init_aic(rwnx_hw);
+	state.aic_initialized = true;
+	if (ret)
+		goto err_cleanup;
+	if (!rwnx_hw->cmd_mgr->cmd_wq) {
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
+	/* set device pointer for wiphy */
     set_wiphy_dev(wiphy, rwnx_hw->dev);
 
     /* Create cache to allocate sw_txhdr */
-    rwnx_hw->sw_txhdr_cache = KMEM_CACHE(rwnx_sw_txhdr, 0);
-    if (!rwnx_hw->sw_txhdr_cache) {
-        wiphy_err(wiphy, "Cannot allocate cache for sw TX header\n");
-        ret = -ENOMEM;
-        goto err_cache;
-    }
+	rwnx_hw->sw_txhdr_cache = KMEM_CACHE(rwnx_sw_txhdr, 0);
+	if (!rwnx_hw->sw_txhdr_cache) {
+		wiphy_err(wiphy, "Cannot allocate cache for sw TX header\n");
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
 
 
 #ifdef CONFIG_FILTER_TCP_ACK
      AICWFDBG(LOGINFO, "%s: FILTER_TCP_ACK\n", __func__);
     tcp_ack_init(rwnx_hw);
+	state.ack_initialized = true;
 #endif
 
 #if 0
@@ -9219,6 +9314,10 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 
 #ifdef CONFIG_PREALLOC_TXQ
     rwnx_hw->txq = (struct rwnx_txq*)aicwf_prealloc_txq_alloc(sizeof(struct rwnx_txq)*NX_NB_TXQ);
+	if (!rwnx_hw->txq) {
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
 #endif
 
     for (i = 0; i < NX_NB_TXQ; i++) {
@@ -9226,27 +9325,18 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     }
 
     rwnx_mu_group_init(rwnx_hw);
+	state.mu_initialized = true;
 
     /* Initialize RoC element pointer to NULL, indicate that RoC can be started */
     rwnx_hw->roc_elem = NULL;
     /* Cookie can not be 0 */
     rwnx_hw->roc_cookie_cnt = 1;
 
-    INIT_LIST_HEAD(&rwnx_hw->vifs);
-    INIT_LIST_HEAD(&rwnx_hw->defrag_list);
-    spin_lock_init(&rwnx_hw->defrag_lock);
-    mutex_init(&rwnx_hw->mutex);
-    mutex_init(&rwnx_hw->dbgdump_elem.mutex);
-    spin_lock_init(&rwnx_hw->cb_lock);
-#ifdef CONFIG_USE_WIRELESS_EXT
-	INIT_LIST_HEAD(&rwnx_hw->wext_scanre_list);
-#endif
-
-	INIT_WORK(&rwnx_hw->apmStalossWork, apm_staloss_work_process);
 	rwnx_hw->apmStaloss_wq = create_singlethread_workqueue("apmStaloss_wq");
 	if (!rwnx_hw->apmStaloss_wq) {
 		txrx_err("insufficient memory to create apmStaloss workqueue.\n");
-		goto err_cache;
+		ret = -ENOMEM;
+		goto err_cleanup;
 	}
 
     wiphy->mgmt_stypes = rwnx_default_mgmt_stypes;
@@ -9259,9 +9349,22 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 	rwnx_hw->scanning = false;
 	rwnx_hw->scan_submitted = false;
     rwnx_hw->p2p_working = false;
+	if (!rwnx_radar_detection_init(&rwnx_hw->radar)) {
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
+	state.radar_initialized = true;
+	/* All state reachable by RX must exist before publishing its owner. */
+#ifdef AICWF_SDIO_SUPPORT
+	/* Publish callback-visible fields before the transport observes hw. */
+	smp_store_release(&rwnx_plat->sdiodev->rwnx_hw, rwnx_hw);
+#else
+	/* Pairs with the USB RX acquire reads before any hw field access. */
+	smp_store_release(&rwnx_plat->usbdev->rwnx_hw, rwnx_hw);
+#endif
 	//init ic system
 	if((ret = rwnx_ic_system_init(rwnx_hw))){
-		goto err_lmac_reqs;
+		goto err_cleanup;
 	}
 
 #ifdef USE_5G
@@ -9283,9 +9386,8 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     }
 #endif
 
-    if (ret){
-        goto err_lmac_reqs;
-    }
+	if (ret)
+		goto err_cleanup;
 
 	AICWFDBG(LOGINFO, "is 5g support = %d, vendor_info = 0x%02X\n", set_start_cfm.is_5g_support, set_start_cfm.vendor_info);
 	rwnx_hw->band_5g_support = set_start_cfm.is_5g_support;
@@ -9389,15 +9491,16 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     wiphy->max_sched_scan_ie_len = 2048;
 #endif//CONFIG_SCHED_SCAN
 
-    tasklet_init(&rwnx_hw->task, rwnx_task, (unsigned long)rwnx_hw);
 
 	//init ic rf
 	if((ret = rwnx_ic_rf_init(rwnx_hw))){
-		goto err_lmac_reqs;
+		goto err_cleanup;
 	}
 
-    if ((ret = rwnx_send_get_macaddr_req(rwnx_hw, (struct mm_get_mac_addr_cfm *)mac_addr_efuse)))
-        goto err_lmac_reqs;
+	ret = rwnx_send_get_macaddr_req(rwnx_hw,
+			(struct mm_get_mac_addr_cfm *)mac_addr_efuse);
+	if (ret)
+		goto err_cleanup;
     if (mac_addr_efuse[0] | mac_addr_efuse[1] | mac_addr_efuse[2] | mac_addr_efuse[3])
     {
         memcpy(init_conf.mac_addr, mac_addr_efuse, ETH_ALEN);
@@ -9411,22 +9514,24 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     memcpy(wiphy->perm_addr, init_conf.mac_addr, ETH_ALEN);
 
     /* Reset FW */
-    if ((ret = rwnx_send_reset(rwnx_hw)))
-        goto err_lmac_reqs;
+	ret = rwnx_send_reset(rwnx_hw);
+	if (ret)
+		goto err_cleanup;
 
 #ifdef CONFIG_TEMP_COMP
 	rwnx_send_set_temp_comp_req(rwnx_hw, &swconfig_cfm);
 #endif
 
-    if ((ret = rwnx_send_version_req(rwnx_hw, &rwnx_hw->version_cfm)))
-        goto err_lmac_reqs;
-    rwnx_set_vers(rwnx_hw);
+	ret = rwnx_send_version_req(rwnx_hw, &rwnx_hw->version_cfm);
+	if (ret)
+		goto err_cleanup;
+	rwnx_set_vers(rwnx_hw);
 
-    if ((ret = rwnx_handle_dynparams(rwnx_hw, rwnx_hw->wiphy)))
-        goto err_lmac_reqs;
+	ret = rwnx_handle_dynparams(rwnx_hw, rwnx_hw->wiphy);
+	if (ret)
+		goto err_cleanup;
 
     rwnx_enable_mesh(rwnx_hw);
-    rwnx_radar_detection_init(&rwnx_hw->radar);
 
 #ifdef CONFIG_RADAR_OR_IR_DETECT
 	rwnx_radar_set_domain(&rwnx_hw->radar, NL80211_DFS_FCC);
@@ -9453,12 +9558,15 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 
     aicwf_vendor_init(wiphy);
 
-    if ((ret = wiphy_register(wiphy))) {
-        wiphy_err(wiphy, "Could not register wiphy device\n");
-        goto err_register_wiphy;
-    }
+	ret = wiphy_register(wiphy);
+	if (ret) {
+		wiphy_err(wiphy, "Could not register wiphy device\n");
+		goto err_cleanup;
+	}
 
-    /* Update regulatory (if needed) and set channel parameters to firmware
+	state.wiphy_registered = true;
+
+	/* Update regulatory (if needed) and set channel parameters to firmware
        (must be done after WiPHY registration) */
     rwnx_custregd(rwnx_hw, wiphy);
 	if (rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8801 ||
@@ -9471,13 +9579,15 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 		rwnx_hw->usbdev->chipid == PRODUCT_ID_AIC8800D80N) && testmode == 0)) {
 		rwnx_send_me_chan_config_req(rwnx_hw, default_ccode);
 	}
-    *platform_data = rwnx_hw;
 
 #ifdef CONFIG_DEBUG_FS
-    if ((ret = rwnx_dbgfs_register(rwnx_hw, "rwnx"))) {
-        wiphy_err(wiphy, "Failed to register debugfs entries");
-        goto err_debugfs;
-    }
+	/* The registrar leaves partial objects for the RX-drained unwind. */
+	state.debugfs_initialized = true;
+	ret = rwnx_dbgfs_register(rwnx_hw, "rwnx");
+	if (ret) {
+		wiphy_err(wiphy, "Failed to register debugfs entries");
+		goto err_cleanup;
+	}
 #endif
     rtnl_lock();
 
@@ -9485,19 +9595,19 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     vif = rwnx_interface_add(rwnx_hw, "wlan%d", NET_NAME_UNKNOWN,
                                 NL80211_IFTYPE_STATION, NULL);
 
-    #ifdef CONFIG_RWNX_MON_DATA
-    /* Add an initial station interface */
-    vif = rwnx_interface_add(rwnx_hw, "wlan%d", 1,
-                                NL80211_IFTYPE_MONITOR, NULL);
-    #endif
+#ifdef CONFIG_RWNX_MON_DATA
+	if (vif)
+		vif = rwnx_interface_add(rwnx_hw, "wlan%d", NET_NAME_UNKNOWN,
+				 NL80211_IFTYPE_MONITOR, NULL);
+#endif
 
     rtnl_unlock();
 
-    if (!vif) {
-        wiphy_err(wiphy, "Failed to instantiate a network device\n");
-        ret = -ENOMEM;
-        goto err_add_interface;
-    }
+	if (!vif) {
+		wiphy_err(wiphy, "Failed to instantiate a network device\n");
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
 
 #if 0
     wiphy_info(wiphy, "New interface create %s", vif->ndev->name);
@@ -9505,20 +9615,20 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 
 	AICWFDBG(LOGINFO, "New interface create %s\r\n", vif->ndev->name);
 
-#ifdef  CONFIG_USE_P2P0
+#ifdef CONFIG_USE_P2P0
+	rtnl_lock();
+	/* Add an initial p2p0 interface. */
+	vif = rwnx_interface_add(rwnx_hw, "p2p%d", NET_NAME_UNKNOWN,
+				 NL80211_IFTYPE_STATION, NULL);
+	if (vif)
+		vif->is_p2p_vif = 1;
+	rtnl_unlock();
 
-        rtnl_lock();
-        /* Add an initial p2p0 interface */
-        vif = rwnx_interface_add(rwnx_hw, "p2p%d", NET_NAME_UNKNOWN,
-                                    NL80211_IFTYPE_STATION, NULL);
-        vif->is_p2p_vif = 1;
-        rtnl_unlock();
-
-        if (!vif) {
-            wiphy_err(wiphy, "Failed to instantiate a network device\n");
-            ret = -ENOMEM;
-            goto err_add_interface;
-        }
+	if (!vif) {
+		wiphy_err(wiphy, "Failed to instantiate a network device\n");
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
 
         //wiphy_info(wiphy, "New interface create %s", vif->ndev->name);
         AICWFDBG(LOGINFO, "New interface create %s \r\n", vif->ndev->name);
@@ -9588,35 +9698,11 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 	aicwf_nl_init();
 #endif
 
-    return 0;
+	*platform_data = rwnx_hw;
+	return 0;
 
-err_add_interface:
-#ifdef CONFIG_DEBUG_FS
-    rwnx_dbgfs_unregister(rwnx_hw);
-err_debugfs:
-#endif
-if(rwnx_hw->wiphy){
-    wiphy_unregister(rwnx_hw->wiphy);
-}
-err_register_wiphy:
-err_lmac_reqs:
-#ifdef CONFIG_USE_WIRELESS_EXT
-	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
-#endif
-    AICWFDBG(LOGERROR, "err_lmac_reqs\n");
-    flush_workqueue(rwnx_hw->apmStaloss_wq);
-    destroy_workqueue(rwnx_hw->apmStaloss_wq);
-    //rwnx_fw_trace_dump(rwnx_hw);
-    rwnx_platform_off(rwnx_hw, NULL);
-    kmem_cache_destroy(rwnx_hw->sw_txhdr_cache);
-//err_platon:
-//err_config:
-err_cache:
-    aicwf_wakeup_lock_deinit(rwnx_hw);
-#ifdef AICWF_USB_SUPPORT
-	rwnx_plat->usbdev->rwnx_hw = NULL;
-#endif
-    wiphy_free(wiphy);
+err_cleanup:
+	rwnx_cfg80211_init_cleanup(rwnx_hw, &state);
 err_out:
     return ret;
 }
@@ -9628,7 +9714,6 @@ err_out:
 void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 {
     struct mm_set_stack_start_cfm set_start_cfm;
-    struct defrag_ctrl_info *defrag_ctrl = NULL;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
@@ -9639,6 +9724,7 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 
 #ifdef AICWF_USB_SUPPORT
 	aicwf_usb_tx_stop(rwnx_hw->usbdev);
+	aicwf_usb_rx_quiesce(rwnx_hw->usbdev);
 #endif
     rwnx_hw->fwlog_en = 0;
     rwnx_hw->scanning = 0;
@@ -9670,22 +9756,7 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 #endif
 
 
-    spin_lock_bh(&rwnx_hw->defrag_lock);
-    if (!list_empty(&rwnx_hw->defrag_list)) {
-        list_for_each_entry(defrag_ctrl, &rwnx_hw->defrag_list, list) {
-            list_del_init(&defrag_ctrl->list);
-            if (timer_pending(&defrag_ctrl->defrag_timer)) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-                timer_delete_sync(&defrag_ctrl->defrag_timer);
-#else
-                del_timer_sync(&defrag_ctrl->defrag_timer);
-#endif
-	    }
-            dev_kfree_skb(defrag_ctrl->skb);
-            kfree(defrag_ctrl);
-        }
-    }
-    spin_unlock_bh(&rwnx_hw->defrag_lock);
+	rwnx_rx_defrag_deinit(rwnx_hw);
 
 #ifdef CONFIG_DEBUG_FS
     rwnx_dbgfs_unregister(rwnx_hw);
@@ -9708,10 +9779,11 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 		AICWFDBG(LOGINFO, "%s wiphy_unregister \r\n", __func__);
     	wiphy_unregister(rwnx_hw->wiphy);
 	}
+	rwnx_cmd_mgr_quiesce(rwnx_hw->cmd_mgr);
     rwnx_radar_detection_deinit(&rwnx_hw->radar);
     rwnx_platform_off(rwnx_hw, NULL);
     kmem_cache_destroy(rwnx_hw->sw_txhdr_cache);
-    aicwf_wakeup_lock_deinit(rwnx_hw);
+	aicwf_wakeup_lock_deinit(rwnx_hw);
 
 #ifdef AICWF_USB_SUPPORT
 	rwnx_hw->usbdev->rwnx_hw = NULL;

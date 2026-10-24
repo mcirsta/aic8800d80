@@ -25,10 +25,11 @@ struct rwnx_sta;
 /* some macros taken from iwlwifi */
 /* TODO: replace with generic read and fill read buffer in open to avoid double
  * reads */
-#define DEBUGFS_ADD_FILE(name, parent, mode) do {               \
-    if (!debugfs_create_file(#name, mode, parent, rwnx_hw,      \
-                &rwnx_dbgfs_##name##_ops))                      \
-    goto err;                                                   \
+#define DEBUGFS_ADD_FILE(name, parent, mode) do {                    \
+	if (IS_ERR_OR_NULL(debugfs_create_file(#name, mode, parent,    \
+					       rwnx_hw,                    \
+					       &rwnx_dbgfs_##name##_ops)))  \
+		goto err;                                                   \
 } while (0)
 
 #define DEBUGFS_ADD_BOOL(name, parent, ptr) do {                \

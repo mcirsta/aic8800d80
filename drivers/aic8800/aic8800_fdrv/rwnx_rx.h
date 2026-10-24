@@ -392,6 +392,7 @@ void defrag_timeout_cb(ulong data);
 #else
 void defrag_timeout_cb(struct timer_list *t);
 #endif
+void rwnx_rx_defrag_deinit(struct rwnx_hw *rwnx_hw);
 
 #endif
 void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb, u8 vif_idx,
