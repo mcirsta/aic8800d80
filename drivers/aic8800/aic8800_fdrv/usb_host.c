@@ -133,27 +133,54 @@ void aicwf_usb_host_tx_cfm_handler(struct usb_host_env_tag *env, u32 *data)
 	spin_unlock_bh(&hw->tx_lock);
 }
 
+/* The remaining vendor globals permit only one runtime USB platform. */
+static DEFINE_MUTEX(aicwf_usb_platform_lock);
+
 int aicwf_rwnx_usb_platform_init(struct aic_usb_dev *usbdev)
 {
-    struct rwnx_plat *rwnx_plat = NULL;
-    void *drvdata;
-    int ret = -ENODEV;
+	struct rwnx_plat *plat;
+	void *drvdata = NULL;
+	int ret;
 
-    rwnx_plat = kzalloc(sizeof(struct rwnx_plat), GFP_KERNEL);
+	mutex_lock(&aicwf_usb_platform_lock);
+	if (usbdev->plat || READ_ONCE(g_rwnx_plat)) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	plat = kzalloc(sizeof(*plat), GFP_KERNEL);
+	if (!plat) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	plat->usbdev = usbdev;
+	usbdev->plat = plat;
+	ret = rwnx_platform_init(plat, &drvdata);
+	if (ret) {
+		/* cfg80211_init has already drained and released partial hw. */
+		if (READ_ONCE(g_rwnx_plat) == plat)
+			WRITE_ONCE(g_rwnx_plat, NULL);
+		usbdev->plat = NULL;
+		kfree(plat);
+	}
+out_unlock:
+	mutex_unlock(&aicwf_usb_platform_lock);
+	return ret;
+}
 
-    if (!rwnx_plat)
-        return -ENOMEM;
+void aicwf_rwnx_usb_platform_deinit(struct aic_usb_dev *usbdev)
+{
+	struct rwnx_plat *plat;
 
-//    rwnx_plat->pci_dev = pci_dev;
-    rwnx_plat->usbdev = usbdev;
-
-    ret = rwnx_platform_init(rwnx_plat, &drvdata);
-#if 0
-    pci_set_drvdata(pci_dev, drvdata);
-
-    if (ret)
-        rwnx_plat->deinit(rwnx_plat);
-#endif
-    return ret;
+	mutex_lock(&aicwf_usb_platform_lock);
+	plat = usbdev->plat;
+	if (plat) {
+		if (usbdev->rwnx_hw)
+			rwnx_platform_deinit(usbdev->rwnx_hw);
+		if (READ_ONCE(g_rwnx_plat) == plat)
+			WRITE_ONCE(g_rwnx_plat, NULL);
+		usbdev->plat = NULL;
+		kfree(plat);
+	}
+	mutex_unlock(&aicwf_usb_platform_lock);
 }
 

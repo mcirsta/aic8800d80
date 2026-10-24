@@ -82,115 +82,96 @@ void rxbuff_queue_flush(struct aicwf_rx_priv* rx_priv)
 
 int aicwf_bus_init(uint bus_hdrlen, struct device *dev)
 {
-    int ret = 0;
-    struct aicwf_bus *bus_if;
+	struct aicwf_bus *bus_if;
+	int ret;
 
-    if (!dev) {
-        AICWFDBG(LOGERROR, "device not found\n");
-        return -1;
-    }
-    bus_if = dev_get_drvdata(dev);
-    #if defined CONFIG_USB_SUPPORT && defined CONFIG_USB_NO_TRANS_DMA_MAP
-    #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
-    bus_if->cmd_buf = usb_alloc_coherent(bus_if->bus_priv.usb->udev, CMD_BUF_MAX, (in_interrupt() ? GFP_ATOMIC : GFP_KERNEL), &bus_if->bus_priv.usb->cmd_dma_trans_addr);
-    #else
-    bus_if->cmd_buf = usb_buffer_alloc(bus_if->bus_priv.usb->udev, CMD_BUF_MAX, (in_interrupt() ? GFP_ATOMIC : GFP_KERNEL), &bus_if->bus_priv.usb->cmd_dma_trans_addr);
-    #endif
-    #else
-    bus_if->cmd_buf = kzalloc(CMD_BUF_MAX, GFP_KERNEL);
-    #endif
-    if(!bus_if->cmd_buf) {
-        ret = -ENOMEM;
-        AICWFDBG(LOGERROR, "proto_attach failed\n");
-        goto fail;
-    }
-    memset(bus_if->cmd_buf, '\0', CMD_BUF_MAX);
-
-    init_completion(&bus_if->bustx_trgg);
-    init_completion(&bus_if->busrx_trgg);
+	if (!dev)
+		return -ENODEV;
+	bus_if = dev_get_drvdata(dev);
+	if (!bus_if)
+		return -ENODEV;
+	/* Every partial unwind may wake/join these consumers. */
+	init_completion(&bus_if->bustx_trgg);
+	init_completion(&bus_if->busrx_trgg);
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(bus_if->bus_priv.usb->msg_in_pipe) {
+	if (bus_if->bus_priv.usb->msg_in_pipe)
 		init_completion(&bus_if->msg_busrx_trgg);
-	}
-#endif
-
-#ifdef AICWF_SDIO_SUPPORT
-    bus_if->bustx_thread = kthread_run(sdio_bustx_thread, (void *)bus_if, "aicwf_bustx_thread");
-    bus_if->busrx_thread = kthread_run(sdio_busrx_thread, (void *)bus_if->bus_priv.sdio->rx_priv, "aicwf_busrx_thread");
 #endif
 #ifdef AICWF_USB_SUPPORT
-    bus_if->busrx_thread = kthread_run(usb_busrx_thread, (void *)bus_if->bus_priv.usb->rx_priv, "aicwf_busrx_thread");
-    bus_if->bustx_thread = kthread_run(usb_bustx_thread, (void *)bus_if, "aicwf_bustx_thread");
-
-#if 1
-	//waiting for rx/tx thread init finish
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
-	while(bus_if->busrx_thread->__state != TASK_INTERRUPTIBLE ||
-		bus_if->bustx_thread->__state != TASK_INTERRUPTIBLE)
-#else
-	while(bus_if->busrx_thread->state != TASK_INTERRUPTIBLE ||
-		bus_if->bustx_thread->state != TASK_INTERRUPTIBLE)
-#endif
-	{
-		AICWFDBG(LOGINFO, "%s waiting for rx/tx thread init finish \r\n", __func__);
-		msleep(100);
-	}
-	//waiting for rx/tx thread Initialization finish
-#endif
-	
-#ifdef CONFIG_USB_MSG_IN_EP
-	if(bus_if->bus_priv.usb->msg_in_pipe)
-	{
-		bus_if->msg_busrx_thread = kthread_run(usb_msg_busrx_thread, (void *)bus_if->bus_priv.usb->rx_priv, "aicwf_msg_busrx_thread");
-	}
-#endif
-
-#ifdef CONFIG_RX_TASKLET//AIDEN tasklet
-	AICWFDBG(LOGINFO, "%s use tasklet for rx \r\n", __func__);
-	tasklet_init(&((bus_if->bus_priv.usb)->recv_tasklet),
-		(void(*)(unsigned long))aicwf_tasklet_rxframes,
-		(unsigned long)(bus_if->bus_priv.usb)->rx_priv);
+#ifdef CONFIG_RX_TASKLET
+	tasklet_init(&bus_if->bus_priv.usb->recv_tasklet,
+		(void (*)(unsigned long))aicwf_tasklet_rxframes,
+		(unsigned long)bus_if->bus_priv.usb->rx_priv);
 	bus_if->bus_priv.usb->rx_tasklet_initialized = true;
 #endif
-
-#ifdef CONFIG_TX_TASKLET//AIDEN tasklet
-	AICWFDBG(LOGINFO, "%s use tasklet for tx \r\n", __func__);
-	tasklet_init(&((bus_if->bus_priv.usb)->xmit_tasklet),
-		(void(*)(unsigned long))aicwf_tasklet_tx_process,
-		(unsigned long)(bus_if->bus_priv.usb));
+#ifdef CONFIG_TX_TASKLET
+	tasklet_init(&bus_if->bus_priv.usb->xmit_tasklet,
+		(void (*)(unsigned long))aicwf_tasklet_tx_process,
+		(unsigned long)bus_if->bus_priv.usb);
 #endif
-
-
 #endif
-
-    if (IS_ERR(bus_if->bustx_thread)) {
-        bus_if->bustx_thread  = NULL;
-        AICWFDBG(LOGERROR, "aicwf_bustx_thread run fail\n");
-        goto fail;
-    }
-
-    if (IS_ERR(bus_if->busrx_thread)) {
-        bus_if->busrx_thread  = NULL;
-        AICWFDBG(LOGERROR, "aicwf_bustx_thread run fail\n");
-        goto fail;
-    }
-
+#if defined(CONFIG_USB_SUPPORT) && defined(CONFIG_USB_NO_TRANS_DMA_MAP)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35)
+	bus_if->cmd_buf = usb_alloc_coherent(bus_if->bus_priv.usb->udev,
+		CMD_BUF_MAX, GFP_KERNEL,
+		&bus_if->bus_priv.usb->cmd_dma_trans_addr);
+#else
+	bus_if->cmd_buf = usb_buffer_alloc(bus_if->bus_priv.usb->udev,
+		CMD_BUF_MAX, GFP_KERNEL,
+		&bus_if->bus_priv.usb->cmd_dma_trans_addr);
+#endif
+#else
+	bus_if->cmd_buf = kzalloc(CMD_BUF_MAX, GFP_KERNEL);
+#endif
+	if (!bus_if->cmd_buf) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	memset(bus_if->cmd_buf, 0, CMD_BUF_MAX);
+#ifdef AICWF_SDIO_SUPPORT
+	bus_if->bustx_thread = kthread_run(sdio_bustx_thread, bus_if,
+					"aicwf_bustx_thread");
+	if (IS_ERR(bus_if->bustx_thread)) {
+		ret = PTR_ERR(bus_if->bustx_thread);
+		bus_if->bustx_thread = NULL;
+		goto fail;
+	}
+	bus_if->busrx_thread = kthread_run(sdio_busrx_thread,
+		bus_if->bus_priv.sdio->rx_priv, "aicwf_busrx_thread");
+#endif
+#ifdef AICWF_USB_SUPPORT
+	bus_if->busrx_thread = kthread_run(usb_busrx_thread,
+		bus_if->bus_priv.usb->rx_priv, "aicwf_busrx_thread");
+#endif
+	if (IS_ERR(bus_if->busrx_thread)) {
+		ret = PTR_ERR(bus_if->busrx_thread);
+		bus_if->busrx_thread = NULL;
+		goto fail;
+	}
+#ifdef AICWF_USB_SUPPORT
+	bus_if->bustx_thread = kthread_run(usb_bustx_thread, bus_if,
+					"aicwf_bustx_thread");
+	if (IS_ERR(bus_if->bustx_thread)) {
+		ret = PTR_ERR(bus_if->bustx_thread);
+		bus_if->bustx_thread = NULL;
+		goto fail;
+	}
 #ifdef CONFIG_USB_MSG_IN_EP
-	if(bus_if->bus_priv.usb->msg_in_pipe){
+	if (bus_if->bus_priv.usb->msg_in_pipe) {
+		bus_if->msg_busrx_thread = kthread_run(usb_msg_busrx_thread,
+			bus_if->bus_priv.usb->rx_priv, "aicwf_msg_busrx_thread");
 		if (IS_ERR(bus_if->msg_busrx_thread)) {
-			bus_if->msg_busrx_thread  = NULL;
-			txrx_err("aicwf_msg_busrx_thread run fail\n");
+			ret = PTR_ERR(bus_if->msg_busrx_thread);
+			bus_if->msg_busrx_thread = NULL;
 			goto fail;
 		}
 	}
 #endif
-
-
-    return ret;
+#endif
+	return 0;
 fail:
-    aicwf_bus_deinit(dev);
-
-    return ret;
+	/* Both USB probe and SDIO release own the single partial unwind. */
+	return ret;
 }
 
 void aicwf_usb_cancel_all_urbs(struct aic_usb_dev *usb_dev);
@@ -212,17 +193,15 @@ void aicwf_bus_deinit(struct device *dev)
 	AICWFDBG(LOGINFO, "%s Enter\r\n", __func__);
 
     bus_if = dev_get_drvdata(dev);
+	if (!bus_if)
+		return;
     aicwf_bus_stop(bus_if);
 
 #ifdef AICWF_USB_SUPPORT
     usb = bus_if->bus_priv.usb;
 	aicwf_usb_cancel_all_urbs(usb);//AIDEN
 
-    if(g_rwnx_plat && g_rwnx_plat->enabled){
-        rwnx_platform_deinit(usb->rwnx_hw);
-    }else{
-    	AICWFDBG(LOGINFO, "%s g_rwnx_plat->enabled is false\r\n", __func__);
-	}
+	aicwf_rwnx_usb_platform_deinit(usb);
 
 #endif
 #ifdef AICWF_SDIO_SUPPORT

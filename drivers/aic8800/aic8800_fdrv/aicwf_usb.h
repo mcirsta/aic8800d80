@@ -148,6 +148,17 @@ struct aicwf_usb_buf {
 	u8* usb_align_data;
 };
 
+struct rwnx_plat;
+
+enum aicwf_usb_recovery_state {
+	AICWF_RECOVERY_IDLE,
+	AICWF_RECOVERY_QUEUED,
+	AICWF_RECOVERY_RUNNING,
+	AICWF_RECOVERY_WAIT_DISCONNECT,
+	AICWF_RECOVERY_FAILED,
+	AICWF_RECOVERY_STOPPED,
+};
+
 struct aic_usb_dev {
     struct rwnx_hw *rwnx_hw;
     struct aicwf_bus *bus_if;
@@ -156,6 +167,14 @@ struct aic_usb_dev {
     struct aicwf_rx_priv* rx_priv;
     enum aicwf_usb_state state;
     struct rwnx_cmd_mgr cmd_mgr;
+	struct rwnx_plat *plat;
+	spinlock_t recovery_lock;
+	struct work_struct recovery_work;
+	struct delayed_work recovery_timeout_work;
+	enum aicwf_usb_recovery_state recovery_state;
+	bool recovery_armed;
+	bool recovery_stopping;
+	int recovery_reason;
 
 #ifdef CONFIG_USB_TX_AGGR
     struct aicwf_tx_priv *tx_priv;
@@ -249,6 +268,13 @@ void aicwf_usb_cancel_all_urbs(struct aic_usb_dev *usb_dev);
 void aicwf_usb_tx_stop(struct aic_usb_dev *usb_dev);
 void aicwf_usb_rx_stop(struct aic_usb_dev *usb_dev);
 void aicwf_usb_rx_quiesce(struct aic_usb_dev *usb_dev);
+
+void aicwf_usb_recovery_init(struct aic_usb_dev *usb);
+void aicwf_usb_recovery_start(struct aic_usb_dev *usb);
+void aicwf_usb_recovery_request(struct aic_usb_dev *usb, int reason);
+void aicwf_usb_recovery_stop(struct aic_usb_dev *usb);
+int aicwf_usb_send_reboot(struct aic_usb_dev *usb);
+void aicwf_rwnx_usb_platform_deinit(struct aic_usb_dev *usb);
 
 extern void aicwf_hostif_ready(void);
 

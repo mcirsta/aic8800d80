@@ -53,11 +53,19 @@ static void cmd_mgr_abort(struct rwnx_cmd_mgr *cmd_mgr,
 			  struct rwnx_cmd *failed, int result)
 {
 	struct rwnx_cmd *cmd, *next;
+#ifdef AICWF_USB_SUPPORT
+	bool recover = failed && cmd_mgr->state == RWNX_CMD_MGR_STATE_INITED;
+#endif
 
 	lockdep_assert_held(&cmd_mgr->lock);
 	cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
 	list_for_each_entry_safe(cmd, next, &cmd_mgr->cmds, list)
 		cmd_complete(cmd_mgr, cmd, !failed || cmd == failed ? result : -EPIPE);
+#ifdef AICWF_USB_SUPPORT
+	if (recover)
+		aicwf_usb_recovery_request(container_of(cmd_mgr, struct aic_usb_dev, cmd_mgr),
+					   result);
+#endif
 }
 
 static void cmd_mgr_user_put(struct rwnx_cmd_mgr *cmd_mgr)
@@ -360,7 +368,7 @@ void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr)
 	cmd_mgr->state = RWNX_CMD_MGR_STATE_DEINIT;
 }
 
-/* Only the manager worker may use the shared command buffer/transport URB. */
+/* The worker owns TX; recovery may send only after the manager is quiesced. */
 int aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len)
 {
 	struct aicwf_bus *bus;
@@ -398,3 +406,31 @@ int aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len)
 	memcpy(&buffer[index], msg->param, msg->param_len);
 	return aicwf_bus_txmsg(bus, buffer, len + 8);
 }
+
+#ifdef AICWF_USB_SUPPORT
+/* The recovery worker has drained normal commands; never reopen their queue. */
+int aicwf_usb_send_reboot(struct aic_usb_dev *usb)
+{
+	struct dbg_start_app_req *req;
+	struct lmac_msg *msg;
+	size_t len = sizeof(*msg) + sizeof(*req);
+	int ret;
+
+	if (!usb)
+		return -EINVAL;
+	msg = kzalloc(len, GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+	msg->id = DBG_START_APP_REQ;
+	msg->dest_id = TASK_DBG;
+	msg->src_id = DRV_TASK_ID;
+	msg->param_len = sizeof(*req);
+	req = (void *)msg->param;
+	req->bootaddr = 2000;
+	req->boottype = HOST_START_APP_REBOOT;
+	/* A successful USB transfer is not proof of a firmware reboot. */
+	ret = aicwf_set_cmd_tx(usb, msg, len);
+	kfree(msg);
+	return ret;
+}
+#endif

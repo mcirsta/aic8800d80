@@ -2465,191 +2465,139 @@ static int aicwf_usb_chipmatch(struct aic_usb_dev *usb_dev, u16_l vid, u16_l pid
 
 static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
-    int ret = 0;
-    struct usb_device *usb = interface_to_usbdev(intf);
-    struct aicwf_bus *bus_if = NULL;
-    struct device *dev = NULL;
-    struct aicwf_rx_priv* rx_priv = NULL;
-    struct aic_usb_dev *usb_dev = NULL;
-    #ifdef CONFIG_USB_TX_AGGR
-    struct aicwf_tx_priv *tx_priv = NULL;
-    #endif
+	struct usb_device *udev = interface_to_usbdev(intf);
+	struct aicwf_bus *bus = NULL;
+	struct aic_usb_dev *usb;
+	bool bus_initialized = false;
+	int ret;
 
-    usb_dev = kzalloc(sizeof(struct aic_usb_dev), GFP_ATOMIC);
-
-    AICWFDBG(LOGDEBUG, "%s usb_dev:%d usb_tx_buf:%d usb_rx_buf:%d\r\n", 
-        __func__, 
-        (int)sizeof(struct aic_usb_dev),
-        (int)sizeof(struct aicwf_usb_buf) * AICWF_USB_TX_URBS,
-        (int)sizeof(struct aicwf_usb_buf) * AICWF_USB_RX_URBS);
-
-
-    if (!usb_dev) {
-        AICWFDBG(LOGERROR, "%s usb_dev kzalloc fail\r\n", __func__);
-        return -ENOMEM;
-    }
-
-    usb_dev->usb_tx_buf = vmalloc(sizeof(struct aicwf_usb_buf) * AICWF_USB_TX_URBS);
-    usb_dev->usb_rx_buf = vmalloc(sizeof(struct aicwf_usb_buf) * AICWF_USB_RX_URBS);
-
-    if(!usb_dev->usb_tx_buf || !usb_dev->usb_rx_buf){
-        if(usb_dev->usb_tx_buf){
-            vfree(usb_dev);
-        }
-        
-        if(usb_dev->usb_tx_buf){
-            vfree(usb_dev);
-        }
-        
-        if(usb_dev){
-            kfree(usb_dev);
-        }
-        AICWFDBG(LOGERROR, "%s usb_tx_buf or usb_rx_buf vmalloc fail\r\n", __func__);
-        return -ENOMEM;
-    }
-
-    memset(usb_dev->usb_tx_buf, 
-        0, 
-        (int)(sizeof(struct aicwf_usb_buf) * AICWF_USB_TX_URBS));
-
-    memset(usb_dev->usb_rx_buf, 
-        0, 
-        (int)(sizeof(struct aicwf_usb_buf) * AICWF_USB_RX_URBS));
-
-
-    usb_dev->udev = usb;
-    usb_dev->dev = &usb->dev;
-    usb_set_intfdata(intf, usb_dev);
-
-	ret = aicwf_usb_chipmatch(usb_dev, id->idVendor, id->idProduct);
-
-	if (ret < 0) {
-        AICWFDBG(LOGERROR, "%s pid:0x%04X vid:0x%04X unsupport\n", 
-			__func__, id->idVendor, id->idProduct);
-        goto out_free_bus;
-    }
-
-    ret = aicwf_parse_usb(usb_dev, intf);
-    if (ret) {
-        AICWFDBG(LOGERROR, "aicwf_parse_usb err %d\n", ret);
-        goto out_free;
-    }
-
-    ret = aicwf_usb_init(usb_dev);
-    if (ret) {
-        AICWFDBG(LOGERROR, "aicwf_usb_init err %d\n", ret);
-        goto out_free;
-    }
-
-    bus_if = kzalloc(sizeof(struct aicwf_bus), GFP_ATOMIC);
-    if (!bus_if) {
-        ret = -ENOMEM;
-        goto out_free_usb;
-    }
-
-    dev = usb_dev->dev;
-    bus_if->dev = dev;
-    usb_dev->bus_if = bus_if;
-    bus_if->bus_priv.usb = usb_dev;
-    dev_set_drvdata(dev, bus_if);
-
-    bus_if->ops = &aicwf_usb_bus_ops;
-
-    rx_priv = aicwf_rx_init(usb_dev);
-    if(!rx_priv) {
-       AICWFDBG(LOGERROR, "rx init failed\n");
-        ret = -1;
-        goto out_free_bus;
-    }
-    usb_dev->rx_priv = rx_priv;
-
+	usb = kzalloc(sizeof(*usb), GFP_KERNEL);
+	if (!usb)
+		return -ENOMEM;
+	usb->udev = udev;
+	usb->dev = &udev->dev;
+	aicwf_usb_recovery_init(usb);
+	usb_set_intfdata(intf, usb);
+	usb->usb_tx_buf = vzalloc(sizeof(*usb->usb_tx_buf) * AICWF_USB_TX_URBS);
+	usb->usb_rx_buf = vzalloc(sizeof(*usb->usb_rx_buf) * AICWF_USB_RX_URBS);
+	if (!usb->usb_tx_buf || !usb->usb_rx_buf) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+	ret = aicwf_usb_chipmatch(usb, id->idVendor, id->idProduct);
+	if (ret) {
+		ret = -ENODEV;
+		goto out_free;
+	}
+	ret = aicwf_parse_usb(usb, intf);
+	if (ret)
+		goto out_free;
+	ret = aicwf_usb_init(usb);
+	if (ret) {
+		/* usb_init releases its own partial URBs. */
+		if (ret > 0)
+			ret = -ret;
+		goto out_free;
+	}
+	bus = kzalloc(sizeof(*bus), GFP_KERNEL);
+	if (!bus) {
+		ret = -ENOMEM;
+		goto out_free_usb;
+	}
+	bus->dev = usb->dev;
+	bus->bus_priv.usb = usb;
+	bus->ops = &aicwf_usb_bus_ops;
+	usb->bus_if = bus;
+	dev_set_drvdata(usb->dev, bus);
+	usb->rx_priv = aicwf_rx_init(usb);
+	if (!usb->rx_priv) {
+		ret = -ENOMEM;
+		goto out_free_bus;
+	}
 #ifdef CONFIG_USB_TX_AGGR
-    tx_priv = aicwf_tx_init(usb_dev);
-    if(!tx_priv) {
-        usb_err("tx init fail\n");
-        goto out_free_bus;
-    }
-    usb_dev->tx_priv = tx_priv;
-    aicwf_frame_queue_init(&tx_priv->txq, 8, TXQLEN);
-    spin_lock_init(&tx_priv->txqlock);
-    spin_lock_init(&tx_priv->txdlock);
+	usb->tx_priv = aicwf_tx_init(usb);
+	if (!usb->tx_priv) {
+		ret = -ENOMEM;
+		goto out_free_bus;
+	}
+	aicwf_frame_queue_init(&usb->tx_priv->txq, 8, TXQLEN);
+	spin_lock_init(&usb->tx_priv->txqlock);
+	spin_lock_init(&usb->tx_priv->txdlock);
 #endif
-
-    ret = aicwf_bus_init(0, dev);
-    if (ret < 0) {
-        AICWFDBG(LOGERROR, "aicwf_bus_init err %d\n", ret);
-        goto out_free_bus;
-    }
-
-    ret = aicwf_bus_start(bus_if);
-    if (ret < 0) {
-        AICWFDBG(LOGERROR, "aicwf_bus_start err %d\n", ret);
-        goto out_free_bus;
-    }
-
-    ret = aicwf_rwnx_usb_platform_init(usb_dev);
-	if (ret < 0) {
-        AICWFDBG(LOGERROR, "aicwf_rwnx_usb_platform_init err %d\n", ret);
-        goto out_free_bus;
-    }
-    aicwf_hostif_ready();
-
+	bus_initialized = true;
+	ret = aicwf_bus_init(0, usb->dev);
+	if (ret)
+		goto out_free_bus;
+	ret = aicwf_bus_start(bus);
+	if (ret)
+		goto out_free_bus;
+	ret = aicwf_rwnx_usb_platform_init(usb);
+	if (ret)
+		goto out_free_bus;
+	aicwf_hostif_ready();
 #ifdef CONFIG_GPIO_WAKEUP
-	rwnx_register_hostwake_irq(usb_dev->dev);
+	rwnx_register_hostwake_irq(usb->dev);
 #endif
-
-    return 0;
+	aicwf_usb_recovery_start(usb);
+	return 0;
 
 out_free_bus:
-    aicwf_bus_deinit(dev);
-    kfree(bus_if);
+	aicwf_usb_recovery_stop(usb);
+	if (bus_initialized)
+		aicwf_bus_deinit(usb->dev);
+	else if (usb->rx_priv) {
+		/* No bus thread or URB has been started yet. */
+		aicwf_rx_deinit(usb->rx_priv);
+		usb->rx_priv = NULL;
+	}
+#ifdef CONFIG_USB_TX_AGGR
+	if (usb->tx_priv) {
+		aicwf_tx_deinit(usb->tx_priv);
+		usb->tx_priv = NULL;
+	}
+#endif
+	dev_set_drvdata(usb->dev, NULL);
+	usb->bus_if = NULL;
+	kfree(bus);
 out_free_usb:
-    aicwf_usb_deinit(usb_dev);
+	aicwf_usb_deinit(usb);
 out_free:
-    usb_err("failed with errno %d\n", ret);
-    vfree(usb_dev->usb_tx_buf);
-    vfree(usb_dev->usb_rx_buf);
-    kfree(usb_dev);
-    usb_set_intfdata(intf, NULL);
-    return ret;
+	aicwf_usb_recovery_stop(usb);
+	usb_set_intfdata(intf, NULL);
+	vfree(usb->usb_tx_buf);
+	vfree(usb->usb_rx_buf);
+	kfree(usb);
+	return ret;
 }
 
 static void aicwf_usb_disconnect(struct usb_interface *intf)
 {
-    struct aic_usb_dev *usb_dev =
-            (struct aic_usb_dev *) usb_get_intfdata(intf);
-    AICWFDBG(LOGINFO, "%s Enter\r\n", __func__);
+	struct aic_usb_dev *usb = usb_get_intfdata(intf);
 
-	if(g_rwnx_plat->wait_disconnect_cb == false){
-		atomic_set(&aicwf_deinit_atomic, 0);
-		down(&aicwf_deinit_sem);
-	}
-
-    if (!usb_dev){
-		AICWFDBG(LOGERROR, "%s usb_dev is null \r\n", __func__);
-        return;
-    }
-
-#if 0
-	if(timer_pending(&usb_dev->rwnx_hw->p2p_alive_timer) && usb_dev->rwnx_hw->is_p2p_alive == 1){
-		printk("%s del timer rwnx_hw->p2p_alive_timer \r\n", __func__);
-		rwnx_del_timer(&usb_dev->rwnx_hw->p2p_alive_timer);
-	}
-#endif
-    aicwf_bus_deinit(usb_dev->dev);
-    aicwf_usb_deinit(usb_dev);
-
+	if (!usb)
+		return;
+	/* Join recovery before taking any teardown lock it could wait behind. */
+	aicwf_usb_recovery_stop(usb);
+	usb_set_intfdata(intf, NULL);
+	down(&aicwf_deinit_sem);
+	atomic_set(&aicwf_deinit_atomic, 0);
 #ifdef CONFIG_GPIO_WAKEUP
-	rwnx_unregister_hostwake_irq(usb_dev->dev);
+	rwnx_unregister_hostwake_irq(usb->dev);
 #endif
-
-    kfree(usb_dev->bus_if);
-    vfree(usb_dev->usb_tx_buf);
-    vfree(usb_dev->usb_rx_buf);
-    kfree(usb_dev);
-	AICWFDBG(LOGINFO, "%s exit\r\n", __func__);
-	up(&aicwf_deinit_sem);
+	aicwf_bus_deinit(usb->dev);
+	aicwf_usb_deinit(usb);
+#ifdef CONFIG_USB_TX_AGGR
+	if (usb->tx_priv)
+		aicwf_tx_deinit(usb->tx_priv);
+#endif
+	dev_set_drvdata(usb->dev, NULL);
+	kfree(usb->bus_if);
+	usb->bus_if = NULL;
+	vfree(usb->usb_tx_buf);
+	vfree(usb->usb_rx_buf);
+	kfree(usb);
 	atomic_set(&aicwf_deinit_atomic, 1);
+	up(&aicwf_deinit_sem);
 }
 
 static int aicwf_usb_suspend(struct usb_interface *intf, pm_message_t state)
@@ -2788,54 +2736,6 @@ void aicwf_usb_register(void)
 
 void aicwf_usb_exit(void)
 {
-    int retry = 5;
-    AICWFDBG(LOGINFO, "%s Enter\r\n", __func__);
-
-    AICWFDBG(LOGDEBUG, "%s in_interrupt:%d in_softirq:%d in_atomic:%d\r\n", __func__, (int)in_interrupt(), (int)in_softirq(), (int)in_atomic());
-
-    do{
-        AICWFDBG(LOGINFO, "aicwf_deinit_atomic is busy. waiting for 500ms retry:%d \r\n",
-            retry);
-        mdelay(500);
-        retry--;
-        if(retry == 0){
-            break;
-        }
-    }while(atomic_read(&aicwf_deinit_atomic) == 0);
-
-	atomic_set(&aicwf_deinit_atomic, 0);
-	if(down_timeout(&aicwf_deinit_sem, msecs_to_jiffies(SEM_TIMOUT)) != 0){
-		AICWFDBG(LOGERROR, "%s semaphore waiting timeout\r\n", __func__);
-	}
-
-	if(g_rwnx_plat){
-		g_rwnx_plat->wait_disconnect_cb = false;
-	}
-	
-
-
-	if(!g_rwnx_plat || !g_rwnx_plat->enabled){
-		AICWFDBG(LOGINFO, "g_rwnx_plat is not ready. waiting for 500ms\r\n");
-		mdelay(500);
-	}
-
-#if 1
-    if(g_rwnx_plat && g_rwnx_plat->enabled){
-        rwnx_platform_deinit(g_rwnx_plat->usbdev->rwnx_hw);
-    }
-#endif
-
-	up(&aicwf_deinit_sem);
-	atomic_set(&aicwf_deinit_atomic, 1);
-
-	AICWFDBG(LOGINFO, "%s usb_deregister \r\n", __func__);
-
-    usb_deregister(&aicwf_usbdrvr);
-	//mdelay(500);
-	if(g_rwnx_plat){
-    	kfree(g_rwnx_plat);
-	}
-	
-	AICWFDBG(LOGINFO, "%s exit\r\n", __func__);
-
+	/* USB core drains each binding through disconnect exactly once. */
+	usb_deregister(&aicwf_usbdrvr);
 }
