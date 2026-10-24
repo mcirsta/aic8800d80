@@ -215,6 +215,8 @@ struct aic_usb_dev {
 #endif
 
     int msg_finished;
+	int msg_status;
+	unsigned int msg_actual_length;
     wait_queue_head_t msg_wait;
     ulong msg_busy;
     struct urb *msg_out_urb;

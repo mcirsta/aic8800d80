@@ -71,21 +71,6 @@ const int chnl2bw[] = {
     [PHY_CHNL_BW_80P80]   = NL80211_CHAN_WIDTH_80P80,
 };
 
-#define RWNX_CMD_ARRAY_SIZE 40
-#define RWNX_CMD_HIGH_WATER_SIZE RWNX_CMD_ARRAY_SIZE/2
-//#define RWNX_MSG_ARRAY_SIZE 20
-
-struct rwnx_cmd cmd_array[RWNX_CMD_ARRAY_SIZE];
-//struct lmac_msg msg_array[RWNX_MSG_ARRAY_SIZE];
-
-static spinlock_t cmd_array_lock;
-//static spinlock_t msg_array_lock;
-
-//int msg_array_index = 0;
-int cmd_array_index = 0;
-
-
-
 /*****************************************************************************/
 /*
  * Parse the ampdu density to retrieve the value in usec, according to the
@@ -125,11 +110,14 @@ static inline bool use_pairwise_key(struct cfg80211_crypto_settings *crypto)
 
 static inline bool is_non_blocking_msg(int id)
 {
-    return ((id == MM_TIM_UPDATE_REQ) || (id == ME_RC_SET_RATE_REQ) ||
-            (id == MM_BFMER_ENABLE_REQ) || (id == ME_TRAFFIC_IND_REQ) ||
-            (id == TDLS_PEER_TRAFFIC_IND_REQ) ||
-            (id == MESH_PATH_CREATE_REQ) || (id == MESH_PROXY_ADD_REQ) ||
-            (id == SM_EXTERNAL_AUTH_REQUIRED_RSP));
+	return ((id == MM_TIM_UPDATE_REQ) || (id == ME_RC_SET_RATE_REQ) ||
+#ifdef AICWF_ARP_OFFLOAD
+		(id == MM_SET_ARPOFFLOAD_REQ) ||
+#endif
+		(id == MM_BFMER_ENABLE_REQ) || (id == ME_TRAFFIC_IND_REQ) ||
+		(id == TDLS_PEER_TRAFFIC_IND_REQ) ||
+		(id == MESH_PATH_CREATE_REQ) || (id == MESH_PROXY_ADD_REQ) ||
+		(id == SM_EXTERNAL_AUTH_REQUIRED_RSP));
 }
 
 static inline u8_l get_chan_flags(uint32_t flags)
@@ -171,70 +159,32 @@ static inline void limit_chan_bw(u8_l *bw, u16_l primary, u16_l *center1)
     *center1 = primary + new_oft;
 }
 
-struct rwnx_cmd *rwnx_cmd_malloc(void){
-	struct rwnx_cmd *cmd = NULL;
-	unsigned long flags = 0;
+struct rwnx_cmd *rwnx_cmd_malloc(void)
+{
+	struct rwnx_cmd *cmd;
 
-	spin_lock_irqsave(&cmd_array_lock, flags);
+	cmd = kzalloc(sizeof(*cmd), GFP_ATOMIC);
+	if (!cmd)
+		return NULL;
 
-	for(cmd_array_index = 0; cmd_array_index < RWNX_CMD_ARRAY_SIZE; cmd_array_index++){
-		if(cmd_array[cmd_array_index].used == 0){
-			AICWFDBG(LOGTRACE, "%s get cmd_array[%d]:%p \r\n", __func__, cmd_array_index,&cmd_array[cmd_array_index]);
-			cmd = &cmd_array[cmd_array_index];
-			cmd_array[cmd_array_index].used = 1;
-			break;
-		}
-	}
-
-	if(cmd_array_index >= RWNX_CMD_HIGH_WATER_SIZE){
-		AICWFDBG(LOGERROR, "%s cmd(%d) was pending...\r\n", __func__, cmd_array_index);
-		mdelay(100);
-	}
-
-	if(!cmd){
-		AICWFDBG(LOGERROR, "%s array is empty...\r\n", __func__);
-	}
-
-	spin_unlock_irqrestore(&cmd_array_lock, flags);
-
+	refcount_set(&cmd->refs, 1);
+	INIT_LIST_HEAD(&cmd->list);
+	init_completion(&cmd->complete);
 	return cmd;
 }
 
-void rwnx_cmd_free(struct rwnx_cmd *cmd){
-	unsigned long flags = 0;
-
-	spin_lock_irqsave(&cmd_array_lock, flags);
-	cmd->used = 0;
-	cmd->flags = 0;
-	AICWFDBG(LOGTRACE, "%s cmd_array[%d]:%p \r\n", __func__, cmd->array_id, cmd);
-	spin_unlock_irqrestore(&cmd_array_lock, flags);
+void rwnx_cmd_get(struct rwnx_cmd *cmd)
+{
+	refcount_inc(&cmd->refs);
 }
 
+void rwnx_cmd_free(struct rwnx_cmd *cmd)
+{
+	if (!refcount_dec_and_test(&cmd->refs))
+		return;
 
-int rwnx_init_cmd_array(void){
-
-	AICWFDBG(LOGTRACE, "%s Enter \r\n", __func__);
-	spin_lock_init(&cmd_array_lock);
-
-	for(cmd_array_index = 0; cmd_array_index < RWNX_CMD_ARRAY_SIZE; cmd_array_index++){
-		AICWFDBG(LOGTRACE, "%s cmd_queue[%d]:%p \r\n", __func__, cmd_array_index, &cmd_array[cmd_array_index]);
-		cmd_array[cmd_array_index].used = 0;
-		cmd_array[cmd_array_index].array_id = cmd_array_index;
-	}
-	AICWFDBG(LOGTRACE, "%s Exit \r\n", __func__);
-
-	return 0;
-}
-
-void rwnx_free_cmd_array(void){
-
-	AICWFDBG(LOGTRACE, "%s Enter \r\n", __func__);
-
-	for(cmd_array_index = 0; cmd_array_index < RWNX_CMD_ARRAY_SIZE; cmd_array_index++){
-		cmd_array[cmd_array_index].used = 0;
-	}
-
-	AICWFDBG(LOGTRACE, "%s Exit \r\n", __func__);
+	kfree(cmd->a2e_msg);
+	kfree(cmd);
 }
 
 
@@ -432,6 +382,9 @@ static int rwnx_send_msg_common(struct rwnx_hw *rwnx_hw, const void *msg_params,
 {
 	struct lmac_msg *msg = container_of((void *)msg_params, struct lmac_msg, param);
 	struct rwnx_cmd *cmd;
+	bool atomic_context = in_interrupt() || irqs_disabled();
+	bool nonblocking = force_defer || is_non_blocking_msg(msg->id) ||
+		(!reqcfm && atomic_context);
 
 #ifdef AICWF_USB_SUPPORT
 	if (rwnx_hw->usbdev->state == USB_DOWN_ST) {
@@ -446,14 +399,14 @@ static int rwnx_send_msg_common(struct rwnx_hw *rwnx_hw, const void *msg_params,
 	}
 #endif
 
-	if (!reqcfm) {
-#ifdef AICWF_SDIO_SUPPORT
-		aicwf_set_cmd_tx(rwnx_hw->sdiodev, msg, sizeof(*msg) + msg->param_len);
-#else
-		aicwf_set_cmd_tx(rwnx_hw->usbdev, msg, sizeof(*msg) + msg->param_len);
-#endif
+	/* Deferred commands must never retain a caller's reply buffer. */
+	if (cfm && (nonblocking || !reqcfm)) {
 		rwnx_msg_free(rwnx_hw, msg_params);
-		return 0;
+		return -EINVAL;
+	}
+	if (atomic_context && !nonblocking) {
+		rwnx_msg_free(rwnx_hw, msg_params);
+		return -EWOULDBLOCK;
 	}
 
 	cmd = rwnx_cmd_malloc();
@@ -461,7 +414,10 @@ static int rwnx_send_msg_common(struct rwnx_hw *rwnx_hw, const void *msg_params,
 		rwnx_msg_free(rwnx_hw, msg_params);
 		return -ENOMEM;
 	}
-	cmd->flags = RWNX_CMD_FLAG_REQ_CFM;
+	if (reqcfm)
+		cmd->flags |= RWNX_CMD_FLAG_REQ_CFM;
+	if (nonblocking)
+		cmd->flags |= RWNX_CMD_FLAG_NONBLOCK;
 	cmd->result = -EINTR;
 	cmd->id = msg->id;
 	cmd->reqid = reqid;
@@ -470,7 +426,6 @@ static int rwnx_send_msg_common(struct rwnx_hw *rwnx_hw, const void *msg_params,
 	cmd->e2a_msg_len = cfm ? cfm_len : 0;
 	cmd->e2a_msg_min_len = rwnx_cfm_min_len(msg, reqid, cmd->e2a_msg_len);
 	if (cmd->e2a_msg_min_len > cmd->e2a_msg_len) {
-		rwnx_msg_free(rwnx_hw, msg_params);
 		rwnx_cmd_free(cmd);
 		return -EINVAL;
 	}

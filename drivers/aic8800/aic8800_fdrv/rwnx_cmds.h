@@ -13,6 +13,8 @@
 
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/refcount.h>
+#include <linux/workqueue.h>
 #include <linux/module.h>
 #include "lmac_msg.h"
 
@@ -83,8 +85,7 @@ struct rwnx_cmd {
 
     struct completion complete;
 	int result;
-	u8 used;
-	int array_id;
+	refcount_t refs;
     #ifdef CONFIG_RWNX_FHOST
     struct rwnx_term_stream *stream;
     #endif
@@ -106,6 +107,11 @@ struct rwnx_cmd_mgr {
     void (*print)(struct rwnx_cmd_mgr *);
     void (*drain)(struct rwnx_cmd_mgr *);
 
+	struct rwnx_hw *hw;
+	struct rwnx_cmd *active;
+	unsigned int users;
+	struct completion users_idle;
+
     struct work_struct cmdWork;
     struct workqueue_struct *cmd_wq;
 };
@@ -115,11 +121,11 @@ struct rwnx_cmd_mgr {
         queue_work((cmd_mgr)->cmd_wq, &cmd_mgr->cmdWork); \
     } while (0)
 
-void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr);
+void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_hw *hw);
 void rwnx_cmd_mgr_quiesce(struct rwnx_cmd_mgr *cmd_mgr);
 void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr);
 int cmd_mgr_queue_force_defer(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd);
-void aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len);
+int aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len);
 void cmd_mgr_task_process(struct work_struct *work);
 
 #endif /* _RWNX_CMDS_H_ */

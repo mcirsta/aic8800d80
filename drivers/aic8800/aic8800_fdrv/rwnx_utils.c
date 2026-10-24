@@ -28,7 +28,7 @@ int rwnx_init_aic(struct rwnx_hw *rwnx_hw)
 #else
 	aicwf_usb_host_init(&(rwnx_hw->usb_env), NULL, NULL, rwnx_hw);
 #endif
-    rwnx_cmd_mgr_init(rwnx_hw->cmd_mgr);
+	rwnx_cmd_mgr_init(rwnx_hw->cmd_mgr, rwnx_hw);
 
 	testmode = get_testmode();
 	memset(aic_fw_path, 0, 200);

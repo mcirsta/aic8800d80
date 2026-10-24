@@ -585,9 +585,6 @@ void rwnx_skb_align_8bytes(struct sk_buff *skb){
 #endif
 }
 
-int rwnx_init_cmd_array(void);
-void rwnx_free_cmd_array(void);
-
 void rwnx_data_dump(char* tag, void* data, unsigned long len){
 	unsigned long i = 0;
 	char* data_ = (char* )data;
@@ -9839,8 +9836,6 @@ static int __init rwnx_mod_init(void)
     RWNX_DBG(RWNX_FN_ENTRY_STR);
     rwnx_print_version();
 	AICWFDBG(LOGINFO, "RELEASE DATE:%s \r\n", RELEASE_DATE);
-	rwnx_init_cmd_array();
-
 	sema_init(&aicwf_deinit_sem, 1);
 	atomic_set(&aicwf_deinit_atomic, 1);
 
@@ -9886,7 +9881,6 @@ static void __exit rwnx_mod_exit(void)
 #ifdef AICWF_USB_SUPPORT
     aicwf_usb_exit();
 #endif
-	rwnx_free_cmd_array();
 	AICWFDBG(LOGINFO, "%s exit\r\n", __func__);
 }
 module_param(wifi_mac_addr,charp, 0);
