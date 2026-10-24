@@ -10,6 +10,7 @@
 #include "rwnx_msg_tx.h"
 #include "aicwf_wext_linux.h"
 #include "rwnx_defs.h"
+#include "rwnx_main.h"
 
 #define WLAN_CAPABILITY_ESS		(1<<0)
 #define WLAN_CAPABILITY_IBSS	(1<<1)
@@ -927,82 +928,126 @@ static int aicwf_get_wap(struct net_device *dev,
 }
 
 
-static int aicwf_set_scan(struct net_device *dev, struct iw_request_info *a,
-			   union iwreq_data *wrqu, char *extra)
+/* One caller-owned allocation includes the SSID and the flexible channel tail. */
+static struct rwnx_wext_scan *
+aicwf_wext_scan_alloc(struct net_device *dev, union iwreq_data *wrqu, char *extra)
 {
-	int ret = 0;
-	struct rwnx_vif* rwnx_vif = netdev_priv(dev);
-	struct rwnx_hw* rwnx_hw = rwnx_vif->rwnx_hw;
+	struct rwnx_vif *vif = netdev_priv(dev);
+	struct rwnx_hw *hw = vif->rwnx_hw;
+	struct wiphy *wiphy = hw->wiphy;
 	struct cfg80211_scan_request *request;
-	int index = 0;
-	struct wiphy *wiphy = priv_to_wiphy(rwnx_hw);
-	unsigned long wext_scan_timeout;
+	const struct iw_scan_req *iwreq = NULL;
+	struct rwnx_wext_scan *scan;
+	bool passive = false;
+	int count = hw->support_freqs_number;
+	int i;
 
-	AICWFDBG(LOGTRACE, "%s Enter", __func__);
-
-	if(wiphy == NULL){
-		printk("aic_wiphy error \r\n");
-
+	if (!wiphy || count <= 0 || count > ARRAY_SIZE(hw->support_freqs))
+		return ERR_PTR(-EINVAL);
+	if (wrqu->data.flags & ~IW_SCAN_THIS_ESSID)
+		return ERR_PTR(-EOPNOTSUPP);
+	if (wrqu->data.length) {
+		if (wrqu->data.length != sizeof(*iwreq) || !extra)
+			return ERR_PTR(-EINVAL);
+		iwreq = (const struct iw_scan_req *)extra;
+		if (iwreq->scan_type != IW_SCAN_TYPE_ACTIVE &&
+		    iwreq->scan_type != IW_SCAN_TYPE_PASSIVE)
+			return ERR_PTR(-EINVAL);
+		passive = iwreq->scan_type == IW_SCAN_TYPE_PASSIVE;
+	}
+	if (wrqu->data.flags & IW_SCAN_THIS_ESSID) {
+		if (!iwreq || iwreq->essid_len > IEEE80211_MAX_SSID_LEN)
+			return ERR_PTR(-EINVAL);
+		if (passive)
+			return ERR_PTR(-EOPNOTSUPP);
 	}
 
-    if (rwnx_hw->wext_scan || rwnx_hw->scanning) {
-        AICWFDBG(LOGINFO, "is scanning, abort\n");
-	ret =  rwnx_send_scanu_cancel_req(rwnx_hw, NULL);
-	if (ret)
-            return ret;
-	msleep(150);
-    }
-	
-	rwnx_hw->wext_scan = 1;
+	scan = kzalloc(struct_size(scan, request.channels, count), GFP_KERNEL);
+	if (!scan)
+		return ERR_PTR(-ENOMEM);
+	init_completion(&scan->done);
+	scan->result = -EINPROGRESS;
+	request = &scan->request;
+	request->wiphy = wiphy;
+	request->wdev = &vif->wdev;
+	request->ssids = &scan->ssid;
+	/* A zero-length SSID requests active wildcard probes; zero SSIDs is passive. */
+	request->n_ssids = passive ? 0 : 1;
+	if (wrqu->data.flags & IW_SCAN_THIS_ESSID) {
+		scan->ssid.ssid_len = iwreq->essid_len;
+		memcpy(scan->ssid.ssid, iwreq->essid, iwreq->essid_len);
+	}
+	for (i = 0; i < count; i++) {
+		struct ieee80211_channel *chan;
 
-	request = (struct cfg80211_scan_request *)vmalloc(sizeof(struct cfg80211_scan_request));
-
-	request->n_channels = rwnx_hw->support_freqs_number;
-	request->n_ssids = 0;
-	request->no_cck = false;
-	request->ie = NULL;
-	request->ie_len = 0;
-
-	for(index = 0;index < rwnx_hw->support_freqs_number; index++){
-		request->channels[index] = ieee80211_get_channel(wiphy, 
-			rwnx_hw->support_freqs[index]);
-		if(request->channels[index] == NULL){
-			AICWFDBG(LOGERROR, "%s ERROR!!! channels is NULL", __func__);
+		chan = ieee80211_get_channel(wiphy, hw->support_freqs[i]);
+		if (!chan || (chan->flags & IEEE80211_CHAN_DISABLED))
 			continue;
-		}
+		request->channels[request->n_channels++] = chan;
+	}
+	if (!request->n_channels) {
+		kfree(scan);
+		return ERR_PTR(-EINVAL);
+	}
+	return scan;
+}
+
+static int aicwf_set_scan(struct net_device *dev, struct iw_request_info *a,
+			  union iwreq_data *wrqu, char *extra)
+{
+	struct rwnx_vif *vif = netdev_priv(dev);
+	struct rwnx_hw *hw = vif->rwnx_hw;
+	struct rwnx_wext_scan *scan;
+	bool submitted = false;
+	long waited;
+	int ret;
+
+	if (!vif->up || !netif_running(dev))
+		return -ENETDOWN;
+	if (testmode ||
+	    ((RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_STATION ||
+	      RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_P2P_CLIENT) &&
+	     vif->sta.external_auth) ||
+	    atomic_read(&vif->drv_conn_state) == RWNX_DRV_STATUS_CONNECTING ||
+	    hw->plat->wait_disconnect_cb)
+		return -EBUSY;
+	scan = aicwf_wext_scan_alloc(dev, wrqu, extra);
+	if (IS_ERR(scan))
+		return PTR_ERR(scan);
+
+	/* Do not cancel or replace another caller's scan, including a drain fence. */
+	spin_lock_bh(&hw->cb_lock);
+	if (hw->scan_request || hw->scanning || hw->wext_scan) {
+		spin_unlock_bh(&hw->cb_lock);
+		kfree(scan);
+		return -EBUSY;
+	}
+	hw->scan_request = &scan->request;
+	hw->wext_scan = scan;
+	hw->scanning = true;
+	hw->scan_submitted = false;
+	spin_unlock_bh(&hw->cb_lock);
+
+	/* Completion only detaches/signals; it never frees the sender's storage. */
+	ret = rwnx_send_scanu_req(hw, vif, &scan->request, &submitted);
+	if (ret) {
+		if (rwnx_wext_scan_abort(hw, scan, ret, submitted) && submitted)
+			rwnx_send_scanu_cancel_req(hw, NULL);
+	} else {
+		waited = wait_for_completion_killable_timeout(&scan->done,
+							    msecs_to_jiffies(5000));
+		if (waited <= 0 &&
+		    rwnx_wext_scan_abort(hw, scan,
+					 waited ? (int)waited : -ETIMEDOUT, true))
+			rwnx_send_scanu_cancel_req(hw, NULL);
 	}
 
-#if WIRELESS_EXT >= 17
-		if (wrqu->data.length == sizeof(struct iw_scan_req)) {
-			struct iw_scan_req *req = (struct iw_scan_req *)extra;
-
-			if (wrqu->data.flags & IW_SCAN_THIS_ESSID) {
-				int len = min((int)req->essid_len, 32);
-				request->ssids = kmalloc(sizeof(struct cfg80211_ssid), GFP_KERNEL);
-				if(!request->ssids){
-					AICWFDBG(LOGERROR, "%s Failied to alloc memory for ssids", __func__);
-					return -ENOMEM;
-				}
-				memset(request->ssids, 0, sizeof(struct cfg80211_ssid));
-				memcpy(request->ssids[0].ssid, req->essid, len);
-				request->ssids[0].ssid_len = len;
-				request->n_ssids = 1;
-				AICWFDBG(LOGDEBUG,"IW_SCAN_THIS_ESSID, ssid=%s, len=%d\n", req->essid, req->essid_len);
-			} else if (req->scan_type == IW_SCAN_TYPE_PASSIVE)
-				AICWFDBG(LOGDEBUG,"aic_set_scan, req->scan_type == IW_SCAN_TYPE_PASSIVE\n");
-		}
-#endif
-	if ((ret = rwnx_send_scanu_req(rwnx_hw, rwnx_vif, request))){
-        return ret;
-	}
-
-	rwnx_vif->rwnx_hw->scan_request = request;
-	wext_scan_timeout = msecs_to_jiffies(5000);
-
-	if (!wait_for_completion_killable_timeout(&rwnx_hw->wext_scan_com, wext_scan_timeout)) {
-		AICWFDBG(LOGERROR, "%s WEXT scan timeout", __func__);
-	}
-	return 0;
+	/* Synchronize with the completer before the caller's final free. */
+	spin_lock_bh(&hw->cb_lock);
+	ret = scan->result;
+	spin_unlock_bh(&hw->cb_lock);
+	kfree(scan);
+	return ret;
 }
 
 static int aicwf_get_scan(struct net_device *dev, struct iw_request_info *a,
@@ -1217,8 +1262,6 @@ void aicwf_set_wireless_ext( struct net_device *ndev, struct rwnx_hw *rwnx_hw){
 
 	AICWFDBG(LOGINFO, "%s Enter", __func__);
 	
-	init_completion(&rwnx_hw->wext_scan_com);
-	INIT_LIST_HEAD(&rwnx_hw->wext_scanre_list);
 	
 	ndev->wireless_handlers = (struct iw_handler_def *)&aic_handlers_def;
 }

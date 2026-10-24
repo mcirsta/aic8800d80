@@ -774,6 +774,17 @@ struct sta_tx_flowctrl {
     u8 flowctrl;
 };
 
+#ifdef CONFIG_USE_WIRELESS_EXT
+/* The WEXT caller owns this allocation until submission and waiting finish. */
+struct rwnx_wext_scan {
+	struct completion done;
+	int result;
+	struct cfg80211_ssid ssid;
+	/* Keep last: request contains the flexible channel-pointer array. */
+	struct cfg80211_scan_request request;
+};
+#endif
+
 struct rwnx_hw {
     struct rwnx_mod_params *mod_params;
     struct device *dev;
@@ -872,6 +883,8 @@ struct rwnx_hw {
     bool band_5g_support;
     bool fwlog_en;
     bool scanning;
+	/* Protected by cb_lock; a start attempt may outlive its host request. */
+	bool scan_submitted;
     bool p2p_working;
 
     struct list_head defrag_list;
@@ -905,8 +918,7 @@ struct rwnx_hw {
 #endif
 
 #ifdef CONFIG_USE_WIRELESS_EXT
-	bool wext_scan;
-	struct completion wext_scan_com;
+	struct rwnx_wext_scan *wext_scan;
 	struct list_head wext_scanre_list;
 	char wext_essid[33];
 	int support_freqs[SCAN_CHANNEL_MAX];
@@ -945,6 +957,10 @@ void rwnx_chanctx_unlink(struct rwnx_vif *vif);
 int  rwnx_chanctx_valid(struct rwnx_hw *rwnx_hw, u8 idx);
 bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
 			struct wireless_dev *wdev, bool aborted);
+#ifdef CONFIG_USE_WIRELESS_EXT
+bool rwnx_wext_scan_abort(struct rwnx_hw *rwnx_hw,
+			 struct rwnx_wext_scan *scan, int result, bool pending);
+#endif
 
 extern u8 chip_id;
 static inline bool is_multicast_sta(int sta_idx)

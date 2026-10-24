@@ -103,7 +103,7 @@ int rwnx_send_apm_start_req(struct rwnx_hw *rwnx_hw, struct rwnx_vif *vif,
                             struct rwnx_ipc_elem_var *elem);
 int rwnx_send_apm_stop_req(struct rwnx_hw *rwnx_hw, struct rwnx_vif *vif);
 int rwnx_send_scanu_req(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
-                        struct cfg80211_scan_request *param);
+			struct cfg80211_scan_request *param, bool *submitted);
 int rwnx_send_scanu_cancel_req(struct rwnx_hw *rwnx_hw,
                               struct scan_cancel_cfm *cfm);
 

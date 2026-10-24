@@ -4056,144 +4056,130 @@ void rwnx_insert_vendor_extension_data(struct scanu_vendor_ie_req *ie_req){
 #endif//CONFIG_SET_VENDOR_EXTENSION_IE
 
 int rwnx_send_scanu_req(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
-                        struct cfg80211_scan_request *param)
+			struct cfg80211_scan_request *param, bool *submitted)
 {
-    struct scanu_start_req *req = NULL;
-    struct scanu_vendor_ie_req *ie_req = NULL;
-    struct mm_add_if_cfm add_if_cfm;
-    int i;
-    uint8_t chan_flags = 0;
-    int err;
+	struct scanu_start_req *req;
+	struct scanu_vendor_ie_req *ie_req = NULL;
+	struct mm_add_if_cfm add_if_cfm;
+	u8 chan_flags = 0;
+	int err = -ENOMEM;
+	int i;
 
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
+	RWNX_DBG(RWNX_FN_ENTRY_STR);
+	*submitted = false;
 
-    /* Build the SCANU_START_REQ message */
-    req = rwnx_msg_zalloc(SCANU_START_REQ, TASK_SCANU, DRV_TASK_ID,
-                          sizeof(struct scanu_start_req));
+	req = rwnx_msg_zalloc(SCANU_START_REQ, TASK_SCANU, DRV_TASK_ID,
+			     sizeof(*req));
 	if (!req)
 		return -ENOMEM;
 
-	spin_lock_bh(&rwnx_hw->cb_lock);
-	rwnx_hw->scanning = true;
-	spin_unlock_bh(&rwnx_hw->cb_lock);
-    /* Set parameters */
-    req->vif_idx = rwnx_vif->vif_index;
-    req->chan_cnt = (u8)min_t(int, SCAN_CHANNEL_MAX, param->n_channels);
-    req->ssid_cnt = (u8)min_t(int, SCAN_SSID_MAX, param->n_ssids);
-    req->bssid = mac_addr_bcst;
-    req->no_cck = param->no_cck;
+	req->vif_idx = rwnx_vif->vif_index;
+	req->chan_cnt = min_t(int, SCAN_CHANNEL_MAX, param->n_channels);
+	req->ssid_cnt = min_t(int, SCAN_SSID_MAX, param->n_ssids);
+	req->bssid = mac_addr_bcst;
+	req->no_cck = param->no_cck;
 
 #ifdef CONFIG_RADAR_OR_IR_DETECT
-    if (req->ssid_cnt == 0)
-        chan_flags |= CHAN_NO_IR;
+	if (!req->ssid_cnt)
+		chan_flags |= CHAN_NO_IR;
 #endif
-    for (i = 0; i < req->ssid_cnt; i++) {
-        int j;
-        for (j = 0; j < param->ssids[i].ssid_len; j++)
-            req->ssid[i].array[j] = param->ssids[i].ssid[j];
-        req->ssid[i].length = param->ssids[i].ssid_len;
+	for (i = 0; i < req->ssid_cnt; i++) {
+		int j;
 
-        if (!memcmp(P2P_WILDCARD_SSID, param->ssids[i].ssid,
-            P2P_WILDCARD_SSID_LEN)) {
-            AICWFDBG(LOGINFO, "p2p scanu:%d,%d,%d\n",rwnx_vif->vif_index, rwnx_vif->is_p2p_vif, rwnx_hw->is_p2p_alive);
+		for (j = 0; j < param->ssids[i].ssid_len; j++)
+			req->ssid[i].array[j] = param->ssids[i].ssid[j];
+		req->ssid[i].length = param->ssids[i].ssid_len;
+
+		if (!memcmp(P2P_WILDCARD_SSID, param->ssids[i].ssid,
+			    P2P_WILDCARD_SSID_LEN)) {
 #ifdef CONFIG_USE_P2P0
-            if (rwnx_vif->is_p2p_vif && !rwnx_hw->is_p2p_alive) {
+			if (rwnx_vif->is_p2p_vif && !rwnx_hw->is_p2p_alive) {
 #else
-            if (rwnx_vif == rwnx_hw->p2p_dev_vif && !rwnx_vif->up) {
+			if (rwnx_vif == rwnx_hw->p2p_dev_vif && !rwnx_vif->up) {
 #endif
-				err = rwnx_send_add_if (rwnx_hw, rwnx_vif->wdev.address,
-											  RWNX_VIF_TYPE(rwnx_vif), false, &add_if_cfm);
+				err = rwnx_send_add_if(rwnx_hw, rwnx_vif->wdev.address,
+						      RWNX_VIF_TYPE(rwnx_vif), false,
+						      &add_if_cfm);
 				if (err)
-				   goto error;
+					goto error;
+				if (add_if_cfm.status) {
+					err = -EIO;
+					goto error;
+				}
 
-				/*
-                			if ((err = rwnx_send_add_if(rwnx_hw, rwnx_vif->wdev.address,
-                                              RWNX_VIF_TYPE(rwnx_vif), false, &add_if_cfm)))
-                  			goto error;
-                   	*/
-
-                if (add_if_cfm.status != 0) {
-                    return -EIO;
-                }
-
-                /* Save the index retrieved from LMAC */
-                spin_lock_bh(&rwnx_hw->cb_lock);
-                rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-                rwnx_vif->up = true;
-                rwnx_hw->vif_started++;
-                rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
-                spin_unlock_bh(&rwnx_hw->cb_lock);
-            }
-            rwnx_hw->is_p2p_alive = 1;
+				spin_lock_bh(&rwnx_hw->cb_lock);
+				rwnx_vif->vif_index = add_if_cfm.inst_nbr;
+				rwnx_vif->up = true;
+				rwnx_hw->vif_started++;
+				rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
+				spin_unlock_bh(&rwnx_hw->cb_lock);
+			}
+			rwnx_hw->is_p2p_alive = 1;
 #ifndef CONFIG_USE_P2P0
-            mod_timer(&rwnx_hw->p2p_alive_timer, jiffies + msecs_to_jiffies(1000));
-            atomic_set(&rwnx_hw->p2p_alive_timer_count, 0);
+			mod_timer(&rwnx_hw->p2p_alive_timer,
+				  jiffies + msecs_to_jiffies(1000));
+			atomic_set(&rwnx_hw->p2p_alive_timer_count, 0);
 #endif
-            AICWFDBG(LOGINFO ,"p2p scan start\n");
 #ifdef CONFIG_STA_SCAN_WHEN_P2P_WORKING
 			rwnx_hw->p2p_working = false;
 #else
 			rwnx_hw->p2p_working = true;
 #endif
-        }
-    }
+		}
+	}
 
-#if 1
-    if (param->ie) {
-        #if 0
-        if (rwnx_ipc_elem_var_allocs(rwnx_hw, &rwnx_hw->scan_ie,
-                                     param->ie_len, DMA_TO_DEVICE,
-                                     NULL, param->ie, NULL))
-            goto error;
-
-        req->add_ie_len = param->ie_len;
-        req->add_ies = rwnx_hw->scan_ie.dma_addr;
-        #else
-        ie_req = rwnx_msg_zalloc(SCANU_VENDOR_IE_REQ, TASK_SCANU, DRV_TASK_ID,
-                              sizeof(struct scanu_vendor_ie_req));
-        if (!ie_req)
-            return -ENOMEM;
-
-        ie_req->add_ie_len = param->ie_len;
-        ie_req->vif_idx = rwnx_vif->vif_index;
-        memcpy(ie_req->ie, param->ie, param->ie_len);
+	if (param->ie) {
+		if (param->ie_len > sizeof(ie_req->ie)) {
+			err = -EINVAL;
+			goto error;
+		}
+		ie_req = rwnx_msg_zalloc(SCANU_VENDOR_IE_REQ, TASK_SCANU,
+					DRV_TASK_ID, sizeof(*ie_req));
+		if (!ie_req) {
+			err = -ENOMEM;
+			goto error;
+		}
+		ie_req->add_ie_len = param->ie_len;
+		ie_req->vif_idx = rwnx_vif->vif_index;
+		memcpy(ie_req->ie, param->ie, param->ie_len);
 #ifdef CONFIG_SET_VENDOR_EXTENSION_IE
 		rwnx_insert_vendor_extension_data(ie_req);
-#endif //CONFIG_SET_VENDOR_EXTENSION_IE
-        req->add_ie_len = 0;
-        req->add_ies = 0;
-
-		err = rwnx_send_msg(rwnx_hw, ie_req, 1, SCANU_VENDOR_IE_CFM, NULL, 0);
+#endif
+		err = rwnx_send_msg(rwnx_hw, ie_req, 1,
+				    SCANU_VENDOR_IE_CFM, NULL, 0);
+		/* rwnx_send_msg consumes the message on every return path. */
+		ie_req = NULL;
 		if (err)
 			goto error;
-        #endif
-        }
-    else {
-        req->add_ie_len = 0;
-        req->add_ies = 0;
-    }
-#else
-        req->add_ie_len = 0;
-        req->add_ies = 0;
-#endif
+	}
 
-    for (i = 0; i < req->chan_cnt; i++) {
-        struct ieee80211_channel *chan = param->channels[i];
-		AICWFDBG(LOGDEBUG, "scan channel:%d(%d) \r\n", ieee80211_frequency_to_channel(chan->center_freq), chan->center_freq);
-        req->chan[i].band = chan->band;
-        req->chan[i].freq = chan->center_freq;
-        req->chan[i].flags = chan_flags | get_chan_flags(chan->flags);
-        req->chan[i].tx_power = chan_to_fw_pwr(chan->max_reg_power);
-    }
+	for (i = 0; i < req->chan_cnt; i++) {
+		struct ieee80211_channel *chan = param->channels[i];
 
-    /* Send the SCANU_START_REQ message to LMAC FW */
-	return rwnx_send_msg(rwnx_hw, req, 1,  SCANU_START_CFM_ADDTIONAL, NULL, 0);
+		req->chan[i].band = chan->band;
+		req->chan[i].freq = chan->center_freq;
+		req->chan[i].flags = chan_flags | get_chan_flags(chan->flags);
+		req->chan[i].tx_power = chan_to_fw_pwr(chan->max_reg_power);
+	}
+
+	/* A prepare-time abort must not launch a now-unowned scan. */
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	if (rwnx_hw->scan_request != param) {
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		err = -ECANCELED;
+		goto error;
+	}
+	*submitted = true;
+	rwnx_hw->scan_submitted = true;
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	return rwnx_send_msg(rwnx_hw, req, 1, SCANU_START_CFM_ADDTIONAL,
+			     NULL, 0);
+
 error:
-    if (req != NULL)
-        rwnx_msg_free(rwnx_hw, req);
-    if (ie_req != NULL)
-        rwnx_msg_free(rwnx_hw, ie_req);
-    return -ENOMEM;
+	rwnx_msg_free(rwnx_hw, req);
+	if (ie_req)
+		rwnx_msg_free(rwnx_hw, ie_req);
+	return err;
 }
 
 int rwnx_send_scanu_cancel_req(struct rwnx_hw *rwnx_hw, struct scan_cancel_cfm *cfm)

@@ -1327,7 +1327,7 @@ bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
 {
 	struct cfg80211_scan_request *request;
 #ifdef CONFIG_USE_WIRELESS_EXT
-	bool wext_scan = false;
+	struct rwnx_wext_scan *wext_scan;
 #endif
 #ifdef CONFIG_SCHED_SCAN
 	struct cfg80211_sched_scan_request *sched_request;
@@ -1337,21 +1337,12 @@ bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
 	spin_lock_bh(&rwnx_hw->cb_lock);
 	request = rwnx_hw->scan_request;
 	if (!request) {
-		if (!wdev) {
+		/* Only the terminal firmware event drains an aborted scan. */
+		if (!wdev && !aborted) {
 			rwnx_hw->scanning = false;
-#ifdef CONFIG_USE_WIRELESS_EXT
-			wext_scan = rwnx_hw->wext_scan;
-			rwnx_hw->wext_scan = false;
-#endif
+			rwnx_hw->scan_submitted = false;
 		}
 		spin_unlock_bh(&rwnx_hw->cb_lock);
-#ifdef CONFIG_USE_WIRELESS_EXT
-		/* Legacy WEXT publishes its request after sending the scan. */
-		if (wext_scan) {
-			complete(&rwnx_hw->wext_scan_com);
-			return true;
-		}
-#endif
 		return false;
 	}
 	if (wdev && request->wdev != wdev) {
@@ -1359,10 +1350,19 @@ bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
 		return false;
 	}
 	rwnx_hw->scan_request = NULL;
-	rwnx_hw->scanning = false;
+	/* A cancel acknowledgment does not identify a terminal scan event. */
+	rwnx_hw->scanning = aborted && rwnx_hw->scan_submitted;
+	rwnx_hw->scan_submitted = rwnx_hw->scanning;
 #ifdef CONFIG_USE_WIRELESS_EXT
 	wext_scan = rwnx_hw->wext_scan;
-	rwnx_hw->wext_scan = false;
+	rwnx_hw->wext_scan = NULL;
+	if (wext_scan) {
+		/* No callback may retain the caller-owned context after unlock. */
+		wext_scan->result = aborted ? -ECANCELED : 0;
+		complete(&wext_scan->done);
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		return true;
+	}
 #endif
 #ifdef CONFIG_SCHED_SCAN
 	sched_scan = rwnx_hw->is_sched_scan;
@@ -1370,14 +1370,6 @@ bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
 	rwnx_hw->is_sched_scan = false;
 #endif
 	spin_unlock_bh(&rwnx_hw->cb_lock);
-
-#ifdef CONFIG_USE_WIRELESS_EXT
-	if (wext_scan) {
-		vfree(request);
-		complete(&rwnx_hw->wext_scan_com);
-		return true;
-	}
-#endif
 #ifdef CONFIG_SCHED_SCAN
 	if (sched_scan) {
 		if (!aborted && sched_request) {
@@ -1403,6 +1395,28 @@ bool rwnx_scan_complete(struct rwnx_hw *rwnx_hw,
 #endif
 	return true;
 }
+
+#ifdef CONFIG_USE_WIRELESS_EXT
+bool rwnx_wext_scan_abort(struct rwnx_hw *rwnx_hw,
+			 struct rwnx_wext_scan *scan, int result, bool pending)
+{
+	bool owned;
+
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	owned = scan && rwnx_hw->wext_scan == scan &&
+		rwnx_hw->scan_request == &scan->request;
+	if (owned) {
+		rwnx_hw->wext_scan = NULL;
+		rwnx_hw->scan_request = NULL;
+		rwnx_hw->scanning = pending && rwnx_hw->scan_submitted;
+		rwnx_hw->scan_submitted = rwnx_hw->scanning;
+		scan->result = result;
+		complete(&scan->done);
+	}
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	return owned;
+}
+#endif
 
 static int rwnx_close(struct net_device *dev);
 static bool rwnx_close_bus_ready(struct aicwf_bus *bus_if);
@@ -2913,6 +2927,7 @@ static int rwnx_cfg80211_scan(struct wiphy *wiphy,
     struct rwnx_vif* rwnx_vif = netdev_priv(request->dev);
 #endif
     int error;
+	bool submitted;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
@@ -2939,37 +2954,28 @@ static int rwnx_cfg80211_scan(struct wiphy *wiphy,
 	}
 #endif
 
-	if (rwnx_hw->scanning) {
-		AICWFDBG(LOGERROR, "%s is scanning, abort\n", __func__);
-    #if 0//AIDEN test
-		error =  rwnx_send_scanu_cancel_req(rwnx_hw, NULL);
-		if (error)
-			return error;
-		msleep(150);
-    #endif
-        return -EBUSY;
-	}
-
 	if((RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT) &&  rwnx_vif->sta.external_auth){
 		AICWFDBG(LOGINFO, "scan about: external auth\r\n");
 		return -EBUSY;
 	}
 
 	spin_lock_bh(&rwnx_hw->cb_lock);
-	if (rwnx_hw->scan_request) {
+	if (rwnx_hw->scan_request || rwnx_hw->scanning) {
 		spin_unlock_bh(&rwnx_hw->cb_lock);
 		return -EBUSY;
 	}
 	rwnx_hw->scan_request = request;
 	rwnx_hw->scanning = true;
+	rwnx_hw->scan_submitted = false;
 	spin_unlock_bh(&rwnx_hw->cb_lock);
 
-	error = rwnx_send_scanu_req(rwnx_hw, rwnx_vif, request);
+	error = rwnx_send_scanu_req(rwnx_hw, rwnx_vif, request, &submitted);
 	if (error) {
 		spin_lock_bh(&rwnx_hw->cb_lock);
 		if (rwnx_hw->scan_request == request) {
 			rwnx_hw->scan_request = NULL;
-			rwnx_hw->scanning = false;
+			rwnx_hw->scanning = submitted;
+			rwnx_hw->scan_submitted = submitted;
 		} else {
 			/* A completion already consumed the accepted request. */
 			error = 0;
@@ -9220,6 +9226,9 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     mutex_init(&rwnx_hw->mutex);
     mutex_init(&rwnx_hw->dbgdump_elem.mutex);
     spin_lock_init(&rwnx_hw->cb_lock);
+#ifdef CONFIG_USE_WIRELESS_EXT
+	INIT_LIST_HEAD(&rwnx_hw->wext_scanre_list);
+#endif
 
 	INIT_WORK(&rwnx_hw->apmStalossWork, apm_staloss_work_process);
 	rwnx_hw->apmStaloss_wq = create_singlethread_workqueue("apmStaloss_wq");
@@ -9235,7 +9244,8 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 #else
     rwnx_hw->fwlog_en = false;
 #endif
-    rwnx_hw->scanning = false;
+	rwnx_hw->scanning = false;
+	rwnx_hw->scan_submitted = false;
     rwnx_hw->p2p_working = false;
 	//init ic system
 	if((ret = rwnx_ic_system_init(rwnx_hw))){
