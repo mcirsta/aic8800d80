@@ -408,6 +408,10 @@ static inline int rwnx_radar_detect_ind(struct rwnx_hw *rwnx_hw,
     RWNX_DBG(RWNX_FN_ENTRY_STR);
     //printk("%s\n", __func__);
 
+	if (pulses->cnt > ARRAY_SIZE(pulses->pulse) ||
+		pulses->idx >= ARRAY_SIZE(rwnx_hw->radar.pulses))
+		return -EINVAL;
+
     if(pulses->cnt == 0) {
 		printk("cnt error\n");
 		return -1;
@@ -737,6 +741,10 @@ static inline int rwnx_rx_scanu_result_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 	
+	if (len < offsetof(struct ieee80211_mgmt, u.probe_resp.variable) ||
+		len > msg->param_len - offsetof(struct scanu_result_ind, payload))
+		return -EMSGSIZE;
+
     chan = ieee80211_get_channel(rwnx_hw->wiphy, ind->center_freq);
 
     if (chan != NULL) {
@@ -934,6 +942,10 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 	}
 	dev = rwnx_vif->ndev;
     wdev = dev->ieee80211_ptr;
+
+	if (ind->assoc_req_ie_len > sizeof(ind->assoc_ie_buf) ||
+		ind->assoc_rsp_ie_len > sizeof(ind->assoc_ie_buf) - ind->assoc_req_ie_len)
+		return -EMSGSIZE;
 
     /* Retrieve IE addresses and lengths */
     req_ie = (const u8 *)ind->assoc_ie_buf;
@@ -1645,103 +1657,158 @@ static inline int rwnx_fw_assert_ind(struct rwnx_hw *rwnx_hw,
                                                 struct ipc_e2a_msg *msg)
 {
     struct fw_assert_info_ind *ind = (struct fw_assert_info_ind *)msg->param;
-    uint8_t buffer[256];
+	if (ind->len > sizeof(ind->info) ||
+		ind->len > msg->param_len - offsetof(struct fw_assert_info_ind, info))
+		return -EMSGSIZE;
 
-    memcpy(buffer, ind->info, ind->len);
-    buffer[ind->len] = '\0';
-
-    printk("%s: %s\n", __func__, buffer);
+	pr_err("%s: %.*s\n", __func__, (int)ind->len, ind->info);
 
     return 0;
 }
 
+struct rwnx_msg_handler {
+	msg_cb_fct cb;
+	size_t min_len;
+};
+
 #ifdef CONFIG_RWNX_FULLMAC
 
-static msg_cb_fct mm_hdlrs[MSG_I(MM_MAX)] = {
-    [MSG_I(MM_CHANNEL_SWITCH_IND)]     = rwnx_rx_chan_switch_ind,
-    [MSG_I(MM_CHANNEL_PRE_SWITCH_IND)] = rwnx_rx_chan_pre_switch_ind,
-    [MSG_I(MM_REMAIN_ON_CHANNEL_EXP_IND)] = rwnx_rx_remain_on_channel_exp_ind,
-    [MSG_I(MM_PS_CHANGE_IND)]          = rwnx_rx_ps_change_ind,
-    [MSG_I(MM_TRAFFIC_REQ_IND)]        = rwnx_rx_traffic_req_ind,
-    [MSG_I(MM_P2P_VIF_PS_CHANGE_IND)]  = rwnx_rx_p2p_vif_ps_change_ind,
-    [MSG_I(MM_CSA_COUNTER_IND)]        = rwnx_rx_csa_counter_ind,
-    [MSG_I(MM_CSA_FINISH_IND)]         = rwnx_rx_csa_finish_ind,
-    [MSG_I(MM_CSA_TRAFFIC_IND)]        = rwnx_rx_csa_traffic_ind,
-    [MSG_I(MM_CHANNEL_SURVEY_IND)]     = rwnx_rx_channel_survey_ind,
-    [MSG_I(MM_P2P_NOA_UPD_IND)]        = rwnx_rx_p2p_noa_upd_ind,
-    [MSG_I(MM_RSSI_STATUS_IND)]        = rwnx_rx_rssi_status_ind,
-    [MSG_I(MM_PKTLOSS_IND)]            = rwnx_rx_pktloss_notify_ind,
-    [MSG_I(MM_APM_STALOSS_IND)]        = rwnx_apm_staloss_ind,
-    [MSG_I(MM_RADAR_DETECT_IND)] 	   = rwnx_radar_detect_ind,
-    [MSG_I(MM_FW_PANIC_IND)]           = rwnx_fw_panic_ind,
-    [MSG_I(MM_FW_ASSERT_IND)]          = rwnx_fw_assert_ind,
+static const struct rwnx_msg_handler mm_hdlrs[MSG_I(MM_MAX)] = {
+	[MSG_I(MM_CHANNEL_SWITCH_IND)]     = { rwnx_rx_chan_switch_ind,
+		sizeof(struct mm_channel_switch_ind) },
+	[MSG_I(MM_CHANNEL_PRE_SWITCH_IND)] = { rwnx_rx_chan_pre_switch_ind,
+		sizeof(struct mm_channel_pre_switch_ind) },
+	[MSG_I(MM_REMAIN_ON_CHANNEL_EXP_IND)] = { rwnx_rx_remain_on_channel_exp_ind,
+		0 },
+	[MSG_I(MM_PS_CHANGE_IND)]          = { rwnx_rx_ps_change_ind,
+		sizeof(struct mm_ps_change_ind) },
+	[MSG_I(MM_TRAFFIC_REQ_IND)]        = { rwnx_rx_traffic_req_ind,
+		sizeof(struct mm_traffic_req_ind) },
+	[MSG_I(MM_P2P_VIF_PS_CHANGE_IND)]  = { rwnx_rx_p2p_vif_ps_change_ind,
+		sizeof(struct mm_p2p_vif_ps_change_ind) },
+	[MSG_I(MM_CSA_COUNTER_IND)]        = { rwnx_rx_csa_counter_ind,
+		sizeof(struct mm_csa_counter_ind) },
+	[MSG_I(MM_CSA_FINISH_IND)]         = { rwnx_rx_csa_finish_ind,
+		sizeof(struct mm_csa_finish_ind) },
+	[MSG_I(MM_CSA_TRAFFIC_IND)]        = { rwnx_rx_csa_traffic_ind,
+		sizeof(struct mm_csa_traffic_ind) },
+	[MSG_I(MM_CHANNEL_SURVEY_IND)]     = { rwnx_rx_channel_survey_ind,
+		sizeof(struct mm_channel_survey_ind) },
+	[MSG_I(MM_P2P_NOA_UPD_IND)]        = { rwnx_rx_p2p_noa_upd_ind,
+		0 },
+	[MSG_I(MM_RSSI_STATUS_IND)]        = { rwnx_rx_rssi_status_ind,
+		sizeof(struct mm_rssi_status_ind) },
+	[MSG_I(MM_PKTLOSS_IND)]            = { rwnx_rx_pktloss_notify_ind,
+		sizeof(struct mm_pktloss_ind) },
+	[MSG_I(MM_APM_STALOSS_IND)]        = { rwnx_apm_staloss_ind,
+		sizeof(struct mm_apm_staloss_ind) },
+	[MSG_I(MM_RADAR_DETECT_IND)]    = { rwnx_radar_detect_ind,
+		sizeof(struct radar_pulse_array_desc) },
+	[MSG_I(MM_FW_PANIC_IND)]           = { rwnx_fw_panic_ind,
+		offsetof(struct fw_panic_info_ind, info) + 36 +
+		sizeof(struct fault_ctxt) + 64 * sizeof(u32) },
+	[MSG_I(MM_FW_ASSERT_IND)]          = { rwnx_fw_assert_ind,
+		offsetof(struct fw_assert_info_ind, info) },
 };
 
-static msg_cb_fct scan_hdlrs[MSG_I(SCANU_MAX)] = {
-    [MSG_I(SCANU_START_CFM)]           = rwnx_rx_scanu_start_cfm,
-    [MSG_I(SCANU_RESULT_IND)]          = rwnx_rx_scanu_result_ind,
+static const struct rwnx_msg_handler scan_hdlrs[MSG_I(SCANU_MAX)] = {
+	[MSG_I(SCANU_START_CFM)]           = { rwnx_rx_scanu_start_cfm,
+		0 },
+	[MSG_I(SCANU_RESULT_IND)]          = { rwnx_rx_scanu_result_ind,
+		offsetof(struct scanu_result_ind, payload) },
 };
 
-static msg_cb_fct me_hdlrs[MSG_I(ME_MAX)] = {
-    [MSG_I(ME_TKIP_MIC_FAILURE_IND)] = rwnx_rx_me_tkip_mic_failure_ind,
-    [MSG_I(ME_TX_CREDITS_UPDATE_IND)] = rwnx_rx_me_tx_credits_update_ind,
+static const struct rwnx_msg_handler me_hdlrs[MSG_I(ME_MAX)] = {
+	[MSG_I(ME_TKIP_MIC_FAILURE_IND)] = { rwnx_rx_me_tkip_mic_failure_ind,
+		sizeof(struct me_tkip_mic_failure_ind) },
+	[MSG_I(ME_TX_CREDITS_UPDATE_IND)] = { rwnx_rx_me_tx_credits_update_ind,
+		sizeof(struct me_tx_credits_update_ind) },
 };
 
-static msg_cb_fct sm_hdlrs[MSG_I(SM_MAX)] = {
-    [MSG_I(SM_CONNECT_IND)]    = rwnx_rx_sm_connect_ind,
-    [MSG_I(SM_DISCONNECT_IND)] = rwnx_rx_sm_disconnect_ind,
-    [MSG_I(SM_EXTERNAL_AUTH_REQUIRED_IND)] = rwnx_rx_sm_external_auth_required_ind,
+static const struct rwnx_msg_handler sm_hdlrs[MSG_I(SM_MAX)] = {
+	[MSG_I(SM_CONNECT_IND)]    = { rwnx_rx_sm_connect_ind,
+		sizeof(struct sm_connect_ind) },
+	[MSG_I(SM_DISCONNECT_IND)] = { rwnx_rx_sm_disconnect_ind,
+		sizeof(struct sm_disconnect_ind) },
+	[MSG_I(SM_EXTERNAL_AUTH_REQUIRED_IND)] = { rwnx_rx_sm_external_auth_required_ind,
+		sizeof(struct sm_external_auth_required_ind) },
 };
 
-static msg_cb_fct apm_hdlrs[MSG_I(APM_MAX)] = {
+static const struct rwnx_msg_handler apm_hdlrs[MSG_I(APM_MAX)] = {
 };
 
-static msg_cb_fct mesh_hdlrs[MSG_I(MESH_MAX)] = {
-    [MSG_I(MESH_PATH_CREATE_CFM)]  = rwnx_rx_mesh_path_create_cfm,
-    [MSG_I(MESH_PEER_UPDATE_IND)]  = rwnx_rx_mesh_peer_update_ind,
-    [MSG_I(MESH_PATH_UPDATE_IND)]  = rwnx_rx_mesh_path_update_ind,
-    [MSG_I(MESH_PROXY_UPDATE_IND)] = rwnx_rx_mesh_proxy_update_ind,
+static const struct rwnx_msg_handler mesh_hdlrs[MSG_I(MESH_MAX)] = {
+	[MSG_I(MESH_PATH_CREATE_CFM)]  = { rwnx_rx_mesh_path_create_cfm,
+		sizeof(struct mesh_path_create_cfm) },
+	[MSG_I(MESH_PEER_UPDATE_IND)]  = { rwnx_rx_mesh_peer_update_ind,
+		sizeof(struct mesh_peer_update_ind) },
+	[MSG_I(MESH_PATH_UPDATE_IND)]  = { rwnx_rx_mesh_path_update_ind,
+		sizeof(struct mesh_path_update_ind) },
+	[MSG_I(MESH_PROXY_UPDATE_IND)] = { rwnx_rx_mesh_proxy_update_ind,
+		sizeof(struct mesh_proxy_update_ind) },
 };
 
 #endif /* CONFIG_RWNX_FULLMAC */
 
-static msg_cb_fct dbg_hdlrs[MSG_I(DBG_MAX)] = {
-    [MSG_I(DBG_ERROR_IND)]                = rwnx_rx_dbg_error_ind,
+static const struct rwnx_msg_handler dbg_hdlrs[MSG_I(DBG_MAX)] = {
+	[MSG_I(DBG_ERROR_IND)]                = { rwnx_rx_dbg_error_ind,
+		0 },
 };
 
-static msg_cb_fct tdls_hdlrs[MSG_I(TDLS_MAX)] = {
-    [MSG_I(TDLS_CHAN_SWITCH_CFM)] = rwnx_rx_tdls_chan_switch_cfm,
-    [MSG_I(TDLS_CHAN_SWITCH_IND)] = rwnx_rx_tdls_chan_switch_ind,
-    [MSG_I(TDLS_CHAN_SWITCH_BASE_IND)] = rwnx_rx_tdls_chan_switch_base_ind,
-    [MSG_I(TDLS_PEER_PS_IND)] = rwnx_rx_tdls_peer_ps_ind,
+static const struct rwnx_msg_handler tdls_hdlrs[MSG_I(TDLS_MAX)] = {
+	[MSG_I(TDLS_CHAN_SWITCH_CFM)] = { rwnx_rx_tdls_chan_switch_cfm,
+		0 },
+	[MSG_I(TDLS_CHAN_SWITCH_IND)] = { rwnx_rx_tdls_chan_switch_ind,
+		0 },
+	[MSG_I(TDLS_CHAN_SWITCH_BASE_IND)] = { rwnx_rx_tdls_chan_switch_base_ind,
+		sizeof(struct tdls_chan_switch_base_ind) },
+	[MSG_I(TDLS_PEER_PS_IND)] = { rwnx_rx_tdls_peer_ps_ind,
+		sizeof(struct tdls_peer_ps_ind) },
 };
 
-static msg_cb_fct *msg_hdlrs[] = {
-    [TASK_MM]    = mm_hdlrs,
-    [TASK_DBG]   = dbg_hdlrs,
+struct rwnx_msg_task {
+	const struct rwnx_msg_handler *handlers;
+	size_t count;
+};
+
+#define RWNX_MSG_TASK(name) { name, ARRAY_SIZE(name) }
+static const struct rwnx_msg_task msg_hdlrs[] = {
+	[TASK_MM] = RWNX_MSG_TASK(mm_hdlrs),
+	[TASK_DBG] = RWNX_MSG_TASK(dbg_hdlrs),
 #ifdef CONFIG_RWNX_FULLMAC
-    [TASK_TDLS]  = tdls_hdlrs,
-    [TASK_SCANU] = scan_hdlrs,
-    [TASK_ME]    = me_hdlrs,
-    [TASK_SM]    = sm_hdlrs,
-    [TASK_APM]   = apm_hdlrs,
-    [TASK_MESH]  = mesh_hdlrs,
-#endif /* CONFIG_RWNX_FULLMAC */
+	[TASK_TDLS] = RWNX_MSG_TASK(tdls_hdlrs),
+	[TASK_SCANU] = RWNX_MSG_TASK(scan_hdlrs),
+	[TASK_ME] = RWNX_MSG_TASK(me_hdlrs),
+	[TASK_SM] = RWNX_MSG_TASK(sm_hdlrs),
+	[TASK_APM] = RWNX_MSG_TASK(apm_hdlrs),
+	[TASK_MESH] = RWNX_MSG_TASK(mesh_hdlrs),
+#endif
 };
+#undef RWNX_MSG_TASK
 
-/**
- *
- */
-void rwnx_rx_handle_msg(struct rwnx_hw *rwnx_hw, struct ipc_e2a_msg *msg)
+int rwnx_rx_handle_msg(struct rwnx_hw *rwnx_hw, struct ipc_e2a_msg *msg,
+					   size_t received_len)
 {
-	//printk("%s(%d) MSG_T(msg->id):%d MSG_I(msg->id):%d cmd:%s\r\n", __func__, 
-	//	msg->id,
-	//	MSG_T(msg->id), 
-	//	MSG_I(msg->id),
-	//	rwnx_id2str[MSG_T(msg->id)][MSG_I(msg->id)]);
-	
-    rwnx_hw->cmd_mgr->msgind(rwnx_hw->cmd_mgr, msg,
-                            msg_hdlrs[MSG_T(msg->id)][MSG_I(msg->id)]);
+	const struct rwnx_msg_task *task;
+	const struct rwnx_msg_handler *handler;
+	unsigned int task_id, index;
+
+	if (!rwnx_hw || !rwnx_hw->cmd_mgr || !msg ||
+		received_len < offsetof(struct ipc_e2a_msg, param))
+		return -EMSGSIZE;
+
+	task_id = MSG_T(msg->id);
+	index = MSG_I(msg->id);
+	if (task_id >= ARRAY_SIZE(msg_hdlrs))
+		return -EINVAL;
+	task = &msg_hdlrs[task_id];
+	if (!task->handlers || index >= task->count)
+		return -EINVAL;
+	handler = &task->handlers[index];
+
+	/* A null callback is valid for command confirmations in known tasks. */
+	return rwnx_hw->cmd_mgr->msgind(rwnx_hw->cmd_mgr, msg, received_len,
+								   handler->cb, handler->min_len);
 }
 
 void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)
@@ -1749,6 +1816,8 @@ void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)
     u8 *data_end = NULL;
     (void)data_end;
 
+	if (!msg || !len)
+		return;
     msg[len-1] = '\0';
 
     if (!rwnx_hw || !rwnx_hw->fwlog_en) {
@@ -1761,8 +1830,14 @@ void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)
 #ifdef CONFIG_RWNX_DEBUGFS
     data_end = rwnx_hw->debugfs.fw_log.buf.dataend;
 
-    if (!rwnx_hw->debugfs.fw_log.buf.data)
-        return ;
+	if (!rwnx_hw->debugfs.fw_log.buf.data)
+		return;
+
+	/* One firmware record must not wrap farther than the whole ring. */
+	if (len > FW_LOG_SIZE) {
+		msg += len - FW_LOG_SIZE;
+		len = FW_LOG_SIZE;
+	}
 
     //printk("end=%lx, len=%d\n", (unsigned long)rwnx_hw->debugfs.fw_log.buf.end, len);
 

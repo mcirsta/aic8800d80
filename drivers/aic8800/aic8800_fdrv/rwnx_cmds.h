@@ -76,11 +76,13 @@ struct rwnx_cmd {
     lmac_msg_id_t reqid;
     struct rwnx_cmd_a2emsg *a2e_msg;
     char *e2a_msg;
+	size_t e2a_msg_len;
+	size_t e2a_msg_min_len;
     u32 tkn;
     u16 flags;
 
     struct completion complete;
-    u32 result;
+	int result;
 	u8 used;
 	int array_id;
     #ifdef CONFIG_RWNX_FHOST
@@ -99,7 +101,8 @@ struct rwnx_cmd_mgr {
 
     int  (*queue)(struct rwnx_cmd_mgr *, struct rwnx_cmd *);
     int  (*llind)(struct rwnx_cmd_mgr *, struct rwnx_cmd *);
-    int  (*msgind)(struct rwnx_cmd_mgr *, struct rwnx_cmd_e2amsg *, msg_cb_fct);
+	int (*msgind)(struct rwnx_cmd_mgr *mgr, struct rwnx_cmd_e2amsg *msg,
+		      size_t received_len, msg_cb_fct cb, size_t min_len);
     void (*print)(struct rwnx_cmd_mgr *);
     void (*drain)(struct rwnx_cmd_mgr *);
 
