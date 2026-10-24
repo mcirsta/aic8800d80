@@ -36,7 +36,9 @@ int aicwf_bus_init(uint bus_hdrlen, struct device *dev)
         return -1;
     }
     bus_if = dev_get_drvdata(dev);
-    #if defined CONFIG_USB_SUPPORT && defined CONFIG_USB_NO_TRANS_DMA_MAP
+	init_completion(&bus_if->bustx_trgg);
+	init_completion(&bus_if->busrx_trgg);
+#if defined(AICWF_USB_SUPPORT) && defined(CONFIG_USB_NO_TRANS_DMA_MAP)
     #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
     bus_if->cmd_buf = usb_alloc_coherent(bus_if->bus_priv.usb->udev, CMD_BUF_MAX, (in_interrupt() ? GFP_ATOMIC : GFP_KERNEL), &bus_if->bus_priv.usb->cmd_dma_trans_addr);
     #else
@@ -52,33 +54,40 @@ int aicwf_bus_init(uint bus_hdrlen, struct device *dev)
     }
     memset(bus_if->cmd_buf, '\0', CMD_BUF_MAX);
 
-    init_completion(&bus_if->bustx_trgg);
-    init_completion(&bus_if->busrx_trgg);
 #ifdef AICWF_SDIO_SUPPORT
     bus_if->bustx_thread = kthread_run(sdio_bustx_thread, (void *)bus_if, "aicwf_bustx_thread");
-    bus_if->busrx_thread = kthread_run(sdio_busrx_thread, (void *)bus_if->bus_priv.sdio->rx_priv, "aicwf_busrx_thread");
 #endif
 #ifdef AICWF_USB_SUPPORT
     bus_if->bustx_thread = kthread_run(usb_bustx_thread, (void *)bus_if, "aicwf_bustx_thread");
-    bus_if->busrx_thread = kthread_run(usb_busrx_thread, (void *)bus_if->bus_priv.usb->rx_priv, "aicwf_busrx_thread");
 #endif
 
-    if (IS_ERR(bus_if->bustx_thread)) {
-        bus_if->bustx_thread  = NULL;
-        txrx_err("aicwf_bustx_thread run fail\n");
-        goto fail;
-    }
+	if (IS_ERR(bus_if->bustx_thread)) {
+		ret = PTR_ERR(bus_if->bustx_thread);
+		bus_if->bustx_thread = NULL;
+		txrx_err("aicwf_bustx_thread run fail\n");
+		goto fail;
+	}
 
-    if (IS_ERR(bus_if->busrx_thread)) {
-        bus_if->busrx_thread  = NULL;
-        txrx_err("aicwf_bustx_thread run fail\n");
-        goto fail;
-    }
+#ifdef AICWF_SDIO_SUPPORT
+	bus_if->busrx_thread = kthread_run(sdio_busrx_thread,
+					 bus_if->bus_priv.sdio->rx_priv,
+					 "aicwf_busrx_thread");
+#endif
+#ifdef AICWF_USB_SUPPORT
+	bus_if->busrx_thread = kthread_run(usb_busrx_thread,
+					 bus_if->bus_priv.usb->rx_priv,
+					 "aicwf_busrx_thread");
+#endif
+	if (IS_ERR(bus_if->busrx_thread)) {
+		ret = PTR_ERR(bus_if->busrx_thread);
+		bus_if->busrx_thread = NULL;
+		txrx_err("aicwf_busrx_thread run fail\n");
+		goto fail;
+	}
 
     return ret;
 fail:
-    aicwf_bus_deinit(dev);
-
+	/* The probe owns cleanup, including partially initialized bus state. */
     return ret;
 }
 
@@ -93,16 +102,26 @@ void aicwf_bus_deinit(struct device *dev)
     }
     printk("%s", __func__);
 
-	mdelay(500);
     bus_if = dev_get_drvdata(dev);
-    aicwf_bus_stop(bus_if);
-
     usbdev = bus_if->bus_priv.usb;
     usbdev->app_cmp = false;
-    aic_bt_platform_deinit(usbdev);
+	aicwf_bus_stop(bus_if);
+
+	/* Join consumers before releasing command or receive storage. */
+	if (bus_if->bustx_thread) {
+		complete_all(&bus_if->bustx_trgg);
+		kthread_stop(bus_if->bustx_thread);
+		bus_if->bustx_thread = NULL;
+	}
+
+	if (bus_if->busrx_thread) {
+		complete_all(&bus_if->busrx_trgg);
+		kthread_stop(bus_if->busrx_thread);
+		bus_if->busrx_thread = NULL;
+	}
 
     if (bus_if->cmd_buf) {
-        #if defined CONFIG_USB_SUPPORT && defined CONFIG_USB_NO_TRANS_DMA_MAP
+#if defined(AICWF_USB_SUPPORT) && defined(CONFIG_USB_NO_TRANS_DMA_MAP)
         #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35))
         usb_free_coherent(bus_if->bus_priv.usb->udev, CMD_BUF_MAX, bus_if->cmd_buf, bus_if->bus_priv.usb->cmd_dma_trans_addr);
         #else
@@ -114,11 +133,6 @@ void aicwf_bus_deinit(struct device *dev)
         bus_if->cmd_buf = NULL;
     }
 
-    if (bus_if->bustx_thread) {
-        complete_all(&bus_if->bustx_trgg);
-        kthread_stop(bus_if->bustx_thread);
-        bus_if->bustx_thread = NULL;
-    }
     printk("exit %s\n", __func__);
 }
 
@@ -316,13 +330,6 @@ void aicwf_rx_deinit(struct aicwf_rx_priv* rx_priv)
     aicwf_recvframe_queue_deinit(&rx_priv->rxframes_freequeue);
     if (rx_priv->recv_frames)
         vfree(rx_priv->recv_frames);
-
-    if (rx_priv->usbdev->bus_if->busrx_thread) {
-        complete_all(&rx_priv->usbdev->bus_if->busrx_trgg);
-        send_sig(SIGTERM, rx_priv->usbdev->bus_if->busrx_thread, 1);
-        kthread_stop(rx_priv->usbdev->bus_if->busrx_thread);
-        rx_priv->usbdev->bus_if->busrx_thread = NULL;
-    }
 
     kfree(rx_priv);
     rx_priv = NULL;

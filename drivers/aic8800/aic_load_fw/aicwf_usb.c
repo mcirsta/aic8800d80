@@ -661,7 +661,10 @@ static void aicwf_usb_bus_stop(struct device *dev)
         return;
 
     aicwf_usb_state_change(usb_dev, USB_DOWN_ST);
+	/* Stop refills before killing URBs, then drain work queued by completion. */
+	cancel_work_sync(&usb_dev->rx_urb_work);
     aicwf_usb_cancel_all_urbs(usb_dev);
+	cancel_work_sync(&usb_dev->rx_urb_work);
 }
 
 static void aicwf_usb_deinit(struct aic_usb_dev *usbdev)
@@ -699,6 +702,7 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
     INIT_LIST_HEAD(&usb_dev->rx_free_list);
     INIT_LIST_HEAD(&usb_dev->tx_free_list);
     INIT_LIST_HEAD(&usb_dev->tx_post_list);
+	INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
 
     usb_dev->tx_free_count = 0;
     usb_dev->tx_post_count = 0;
@@ -716,11 +720,9 @@ static int aicwf_usb_init(struct aic_usb_dev *usb_dev)
     usb_dev->msg_out_urb = usb_alloc_urb(0, GFP_ATOMIC);
     if (!usb_dev->msg_out_urb) {
         usb_err("usb_alloc_urb (msg out) failed\n");
-        ret = ENOMEM;
+		ret = -ENOMEM;
         goto error;
     }
-
-    INIT_WORK(&usb_dev->rx_urb_work, aicwf_usb_rx_urb_work);
 
     return ret;
     error:
@@ -1672,6 +1674,7 @@ int aicfw_download_fw(struct aic_usb_dev *usb_dev)
 static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
     int ret = 0;
+	bool rebooting = false;
     struct usb_device *usb = interface_to_usbdev(intf);
     struct aicwf_bus *bus_if ;
     struct device *dev = NULL;
@@ -1692,7 +1695,7 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	    id->idProduct == USB_DEVICE_ID_AIC_8800D41 ||
 	    id->idProduct == USB_DEVICE_ID_AIC_8800D81X2 ||
 	    id->idProduct == USB_DEVICE_ID_AIC_8800D89X2)){
-		return -1;
+		return -ENODEV;
 	}
 
     usb_dev = kzalloc(sizeof(struct aic_usb_dev), GFP_ATOMIC);
@@ -1722,10 +1725,15 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
         goto out_free;
     }
 
+	/* Initialize command callbacks before the bus can receive messages. */
+	ret = aic_bt_platform_init(usb_dev);
+	if (ret)
+		goto out_free_usb;
+
     bus_if = kzalloc(sizeof(struct aicwf_bus), GFP_ATOMIC);
     if (!bus_if) {
         ret = -ENOMEM;
-        goto out_free_usb;
+		goto out_deinit_platform;
     }
 
     dev = usb_dev->dev;
@@ -1739,7 +1747,7 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
     rx_priv = aicwf_rx_init(usb_dev);
     if(!rx_priv) {
         txrx_err("rx init failed\n");
-        ret = -1;
+		ret = -ENOMEM;
         goto out_free_bus;
     }
     usb_dev->rx_priv = rx_priv;
@@ -1756,12 +1764,10 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
         goto out_free_bus;
     }
 
-    aic_bt_platform_init(usb_dev);
-
     if ((usb->speed != USB_SPEED_HIGH) && (usb->speed != USB_SPEED_SUPER)) {
         printk("Aic USB device detected speed = %d\n", usb->speed);
-        system_reboot(usb_dev);
-        goto out_free_bus;
+		ret = system_reboot(usb_dev);
+		goto out_reboot;
     }
 
 	if(fw_loaded == 0 && 
@@ -1769,52 +1775,66 @@ static int aicwf_usb_probe(struct usb_interface *intf, const struct usb_device_i
         usb_dev->chipid == PRODUCT_ID_AIC8800D81||
         usb_dev->chipid == PRODUCT_ID_AIC8800D81X2 ||
         usb_dev->chipid == PRODUCT_ID_AIC8800D89X2)){
-		rwnx_send_reboot(usb_dev);
-		goto out_free_bus;
+		ret = rwnx_send_reboot(usb_dev);
+		goto out_reboot;
 	}
 
-    if (system_config(usb_dev)) {
-        goto out_free_bus;
-    }
+	ret = system_config(usb_dev);
+	if (ret)
+		goto out_free_bus;
 
-    if (aicfw_download_fw(usb_dev)){
-        goto out_free_bus;
-    }
+	ret = aicfw_download_fw(usb_dev);
+	if (ret)
+		goto out_free_bus;
     
     usb_dev->app_cmp = true;
 	fw_loaded = 1;
 
     return 0;
 
+out_reboot:
+	if (!ret) {
+		/* A reboot request must not bind an interface with discarded state. */
+		AICWFDBG(LOGINFO, "loader requested USB re-enumeration\n");
+		rebooting = true;
+		ret = -ENODEV;
+	}
 out_free_bus:
 	aicwf_bus_deinit(dev);
-	aicwf_rx_deinit(usb_dev->rx_priv);
+	if (usb_dev->rx_priv)
+		aicwf_rx_deinit(usb_dev->rx_priv);
+	dev_set_drvdata(dev, NULL);
     kfree(bus_if);
+out_deinit_platform:
+	aic_bt_platform_deinit(usb_dev);
 out_free_usb:
     aicwf_usb_deinit(usb_dev);
 out_free:
-    usb_err("failed with errno %d\n", ret);
-    kfree(usb_dev);
     usb_set_intfdata(intf, NULL);
+	if (!rebooting)
+		usb_err("failed with errno %d\n", ret);
+	kfree(usb_dev);
     return ret;
 }
 
 static void aicwf_usb_disconnect(struct usb_interface *intf)
 {
-    struct aic_usb_dev *usb_dev =
-            (struct aic_usb_dev *) usb_get_intfdata(intf);
+	struct aic_usb_dev *usb_dev = usb_get_intfdata(intf);
 
 	printk("%s enter \r\n", __func__);
 
-    if (!usb_dev)
-        return;
+	if (!usb_dev)
+		return;
 
-    aicwf_bus_deinit(usb_dev->dev);
-    aicwf_usb_deinit(usb_dev);
-    if (usb_dev->rx_priv)
-        aicwf_rx_deinit(usb_dev->rx_priv);
-    kfree(usb_dev->bus_if);
-    kfree(usb_dev);
+	usb_set_intfdata(intf, NULL);
+	aicwf_bus_deinit(usb_dev->dev);
+	if (usb_dev->rx_priv)
+		aicwf_rx_deinit(usb_dev->rx_priv);
+	dev_set_drvdata(usb_dev->dev, NULL);
+	kfree(usb_dev->bus_if);
+	aic_bt_platform_deinit(usb_dev);
+	aicwf_usb_deinit(usb_dev);
+	kfree(usb_dev);
 }
 #if 0
 static int aicwf_usb_suspend(struct usb_interface *intf, pm_message_t state)
@@ -1873,11 +1893,13 @@ static struct usb_driver aicwf_usbdrvr = {
     .disable_hub_initiated_lpm = 1,
 };
 
-void aicwf_usb_register(void)
+int aicwf_usb_register(void)
 {
-    if (usb_register(&aicwf_usbdrvr) < 0) {
-        usb_err("usb_register failed\n");
-    }
+	int ret = usb_register(&aicwf_usbdrvr);
+
+	if (ret)
+		usb_err("usb_register failed: %d\n", ret);
+	return ret;
 }
 
 void aicwf_usb_exit(void)

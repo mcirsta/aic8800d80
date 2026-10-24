@@ -35,21 +35,30 @@ module_param(ble_scan_wakeup_reboot_time, int, 0660);
 module_param_string(paringid, paringid, 100, 0660);
 
 
-static void aicsmac_driver_register(void)
-{
-    aicwf_usb_register();
-}
-
 static int __init aic_bluetooth_mod_init(void)
 {
+	int ret;
+
     printk("%s \n", __func__);
     printk("RELEASE DATE:%s \r\n", RELEASE_DATE);
 #ifdef CONFIG_PREALLOC_RX_SKB
-    aicwf_prealloc_init();
+	ret = aicwf_prealloc_init();
+	if (ret)
+		goto out_free_prealloc;
 #endif
 
-    aicsmac_driver_register();
-    return 0;
+	ret = aicwf_usb_register();
+	if (!ret)
+		return 0;
+
+#ifdef CONFIG_PREALLOC_RX_SKB
+out_free_prealloc:
+	aicwf_prealloc_exit();
+#endif
+#ifdef CONFIG_PREALLOC_TXQ
+	aicwf_prealloc_txq_free();
+#endif
+	return ret;
 }
 
 static void __exit aic_bluetooth_mod_exit(void)
