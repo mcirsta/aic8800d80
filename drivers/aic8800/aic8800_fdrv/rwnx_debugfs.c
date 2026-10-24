@@ -796,49 +796,61 @@ static ssize_t rwnx_dbgfs_noa_write(struct file *file,
 DEBUGFS_WRITE_FILE_OPS(noa);
 #endif /* CONFIG_RWNX_P2P_DEBUGFS */
 
-static char fw_log_buffer[FW_LOG_SIZE];
+struct rwnx_fw_log_reader {
+	struct rwnx_hw *hw;
+	struct mutex lock;
+	size_t size;
+	loff_t offset;
+	u8 data[FW_LOG_SIZE];
+};
 
-static ssize_t rwnx_dbgfs_fw_log_read(struct file *file,
-											  char __user *user_buf,
-											  size_t count, loff_t *ppos)
+static int rwnx_dbgfs_fw_log_open(struct inode *inode, struct file *file)
 {
-	struct rwnx_hw *priv = file->private_data;
-	size_t not_cpy;
-	size_t nb_cpy;
-	char *log = fw_log_buffer;
+	struct rwnx_fw_log_reader *reader;
 
-	printk("%s, %d, %p, %p\n", __func__, priv->debugfs.fw_log.buf.size, priv->debugfs.fw_log.buf.start, priv->debugfs.fw_log.buf.dataend);
-	//spin_lock_bh(&priv->debugfs.fw_log.lock);
+	reader = kzalloc(sizeof(*reader), GFP_KERNEL);
+	if (!reader)
+		return -ENOMEM;
+	mutex_init(&reader->lock);
+	reader->hw = inode->i_private;
+	file->private_data = reader;
+	return nonseekable_open(inode, file);
+}
 
-	if ((priv->debugfs.fw_log.buf.start + priv->debugfs.fw_log.buf.size) >= priv->debugfs.fw_log.buf.dataend) {
-		memcpy(log, priv->debugfs.fw_log.buf.start, priv->debugfs.fw_log.buf.dataend - priv->debugfs.fw_log.buf.start);
-		not_cpy = copy_to_user(user_buf, log, priv->debugfs.fw_log.buf.dataend - priv->debugfs.fw_log.buf.start);
-		nb_cpy = priv->debugfs.fw_log.buf.dataend - priv->debugfs.fw_log.buf.start - not_cpy;
-		priv->debugfs.fw_log.buf.start = priv->debugfs.fw_log.buf.data;
-	} else {
-		memcpy(log, priv->debugfs.fw_log.buf.start, priv->debugfs.fw_log.buf.size);
-		not_cpy = copy_to_user(user_buf, log, priv->debugfs.fw_log.buf.size);
-		nb_cpy = priv->debugfs.fw_log.buf.size - not_cpy;
-		priv->debugfs.fw_log.buf.start = priv->debugfs.fw_log.buf.start + priv->debugfs.fw_log.buf.size - not_cpy;
+static ssize_t rwnx_dbgfs_fw_log_read(struct file *file, char __user *user_buf,
+				    size_t count, loff_t *ppos)
+{
+	struct rwnx_fw_log_reader *reader = file->private_data;
+	ssize_t ret;
+
+	if (!count)
+		return 0;
+	mutex_lock(&reader->lock);
+	if (reader->offset == reader->size) {
+		reader->size = rwnx_fw_log_read(&reader->hw->debugfs.fw_log,
+					     reader->data, sizeof(reader->data));
+		reader->offset = 0;
 	}
-
-	priv->debugfs.fw_log.buf.size -= nb_cpy;
-	//spin_unlock_bh(&priv->debugfs.fw_log.lock);
-
-	printk("nb_cpy=%lu, not_cpy=%lu, start=%p, end=%p\n", (long unsigned int)nb_cpy, (long unsigned int)not_cpy, priv->debugfs.fw_log.buf.start, priv->debugfs.fw_log.buf.end);
-	return nb_cpy;
+	/* Retain uncopied bytes for this file, including across usercopy faults. */
+	ret = simple_read_from_buffer(user_buf, count, &reader->offset,
+				      reader->data, reader->size);
+	mutex_unlock(&reader->lock);
+	return ret;
 }
 
-static ssize_t rwnx_dbgfs_fw_log_write(struct file *file,
-											   const char __user *user_buf,
-											   size_t count, loff_t *ppos)
+static int rwnx_dbgfs_fw_log_release(struct inode *inode, struct file *file)
 {
-	//struct rwnx_hw *priv = file->private_data;
-
-	printk("%s\n", __func__);
-	return count;
+	/* Release can run after debugfs removal and must not dereference hw. */
+	kfree(file->private_data);
+	return 0;
 }
-DEBUGFS_READ_WRITE_FILE_OPS(fw_log);
+
+static const struct file_operations rwnx_dbgfs_fw_log_ops = {
+	.owner = THIS_MODULE,
+	.open = rwnx_dbgfs_fw_log_open,
+	.read = rwnx_dbgfs_fw_log_read,
+	.release = rwnx_dbgfs_fw_log_release,
+};
 
 #ifdef CONFIG_RWNX_RADAR
 static ssize_t rwnx_dbgfs_pulses_read(struct file *file,
@@ -1985,9 +1997,7 @@ int rwnx_dbgfs_register(struct rwnx_hw *rwnx_hw, const char *name)
 #endif /* CONFIG_RWNX_P2P_DEBUGFS */
 
 	if (rwnx_hw->fwlog_en) {
-		if (rwnx_fw_log_init(&rwnx_debugfs->fw_log))
-			goto err;
-		DEBUGFS_ADD_FILE(fw_log, dir_drv, 0600);
+		DEBUGFS_ADD_FILE(fw_log, dir_drv, 0400);
 	}
 #ifdef CONFIG_RWNX_RADAR
     {
@@ -2043,11 +2053,6 @@ void rwnx_dbgfs_unregister(struct rwnx_hw *rwnx_hw)
     }
 #endif /* CONFIG_RWNX_FULLMAC */
 
-	if (rwnx_debugfs->fw_log.buf.data) {
-		rwnx_fw_log_deinit(&rwnx_debugfs->fw_log);
-		rwnx_debugfs->fw_log.buf.data = NULL;
-		rwnx_debugfs->fw_log.buf.dataend = NULL;
-	}
 }
 
 #endif //

@@ -1695,9 +1695,6 @@ int rwnx_rx_handle_msg(struct rwnx_hw *rwnx_hw, struct ipc_e2a_msg *msg,
 
 void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)
 {
-    u8 *data_end = NULL;
-    (void)data_end;
-
 	if (!msg || !len)
 		return;
     msg[len-1] = '\0';
@@ -1710,36 +1707,7 @@ void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)
 	AICWFDBG(LOGFW, "%s", msg);
 
 #ifdef CONFIG_RWNX_DEBUGFS
-    data_end = rwnx_hw->debugfs.fw_log.buf.dataend;
-
-	if (!rwnx_hw->debugfs.fw_log.buf.data)
-		return;
-
-	/* One firmware record must not wrap farther than the whole ring. */
-	if (len > FW_LOG_SIZE) {
-		msg += len - FW_LOG_SIZE;
-		len = FW_LOG_SIZE;
-	}
-
-    //printk("end=%lx, len=%d\n", (unsigned long)rwnx_hw->debugfs.fw_log.buf.end, len);
-
-    spin_lock_bh(&rwnx_hw->debugfs.fw_log.lock);
-
-    if (rwnx_hw->debugfs.fw_log.buf.end + len > data_end) {
-        int rem = data_end - rwnx_hw->debugfs.fw_log.buf.end;
-        memcpy(rwnx_hw->debugfs.fw_log.buf.end, msg, rem);
-        memcpy(rwnx_hw->debugfs.fw_log.buf.data, &msg[rem], len - rem);
-        rwnx_hw->debugfs.fw_log.buf.end = rwnx_hw->debugfs.fw_log.buf.data + (len - rem);
-    } else {
-        memcpy(rwnx_hw->debugfs.fw_log.buf.end, msg, len);
-        rwnx_hw->debugfs.fw_log.buf.end += len;
-    }
-
-    rwnx_hw->debugfs.fw_log.buf.size += len;
-    if (rwnx_hw->debugfs.fw_log.buf.size > FW_LOG_SIZE)
-        rwnx_hw->debugfs.fw_log.buf.size = FW_LOG_SIZE;
-
-    spin_unlock_bh(&rwnx_hw->debugfs.fw_log.lock);
+	rwnx_fw_log_append(&rwnx_hw->debugfs.fw_log, msg, len);
 #endif
 }
 

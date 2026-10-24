@@ -9103,6 +9103,7 @@ struct rwnx_init_state {
 	bool radar_initialized;
 	bool wiphy_registered;
 	bool debugfs_initialized;
+	bool fwlog_initialized;
 };
 
 /* RX can already be running when firmware setup or registration fails. */
@@ -9143,6 +9144,10 @@ static void rwnx_cfg80211_init_cleanup(struct rwnx_hw *rwnx_hw,
 #ifdef CONFIG_DEBUG_FS
 	if (state->debugfs_initialized)
 		rwnx_dbgfs_unregister(rwnx_hw);
+#endif
+#ifdef CONFIG_RWNX_DEBUGFS
+	if (state->fwlog_initialized)
+		rwnx_fw_log_deinit(&rwnx_hw->debugfs.fw_log);
 #endif
 	if (state->wiphy_registered)
 		wiphy_unregister(rwnx_hw->wiphy);
@@ -9345,6 +9350,13 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     rwnx_hw->fwlog_en = true;
 #else
     rwnx_hw->fwlog_en = false;
+#endif
+#ifdef CONFIG_RWNX_DEBUGFS
+	/* Set up all ring fields before the transport can publish firmware logs. */
+	state.fwlog_initialized = true;
+	ret = rwnx_fw_log_init(&rwnx_hw->debugfs.fw_log, rwnx_hw->fwlog_en);
+	if (ret)
+		goto err_cleanup;
 #endif
 	rwnx_hw->scanning = false;
 	rwnx_hw->scan_submitted = false;
@@ -9760,6 +9772,9 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 
 #ifdef CONFIG_DEBUG_FS
     rwnx_dbgfs_unregister(rwnx_hw);
+#endif
+#ifdef CONFIG_RWNX_DEBUGFS
+	rwnx_fw_log_deinit(&rwnx_hw->debugfs.fw_log);
 #endif
 	flush_workqueue(rwnx_hw->apmStaloss_wq);
 	destroy_workqueue(rwnx_hw->apmStaloss_wq);
