@@ -45,7 +45,6 @@ typedef struct
 
 u32 aic_crc32(u8 *p, u32 len, u32 crc);
 void get_fw_path(char* fw_path);
-void set_testmode(int val);
 int get_testmode(void);
 int get_hardware_info(void);
 int get_adap_test(void);

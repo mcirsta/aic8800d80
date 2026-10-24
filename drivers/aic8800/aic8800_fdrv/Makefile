@@ -74,7 +74,10 @@ CONFIG_ARP_OFFLOAD =y
 CONFIG_USE_5G = y
 CONFIG_RADAR_OR_IR_DETECT =n
 CONFIG_DOWNLOAD_FW =n
-CONFIG_RFTEST=y
+CONFIG_RFTEST = n
+ifneq ($(CONFIG_RFTEST),n)
+$(error RF test commands are not supported by the production driver)
+endif
 CONFIG_USB_BT=y
 CONFIG_MAC_RANDOM_IF_NO_MAC_IN_EFUSE = y
 CONFIG_WPA3_FOR_OLD_KERNEL = n
@@ -207,7 +210,6 @@ $(MODULE_NAME)-y := \
 	regdb.o                \
 	md5.o                  \
 	aic_vendor.o           \
-        aic_priv_cmd.o         \
 	aicwf_compat_8800dc.o  \
 	aicwf_compat_8800d80.o \
 	aicwf_compat_8800d80x2.o \
@@ -220,7 +222,6 @@ $(MODULE_NAME)-$(CONFIG_BR_SUPPORT)       += aic_br_ext.o
 $(MODULE_NAME)-$(CONFIG_RWNX_RADAR)       += rwnx_radar.o
 $(MODULE_NAME)-$(CONFIG_DEBUG_FS)         += rwnx_debugfs.o
 $(MODULE_NAME)-$(CONFIG_DEBUG_FS)         += rwnx_fw_trace.o
-$(MODULE_NAME)-$(CONFIG_NL80211_TESTMODE) += rwnx_testmode.o
 $(MODULE_NAME)-$(CONFIG_RWNX_BFMER)       += rwnx_bfmer.o
 $(MODULE_NAME)-$(CONFIG_RWNX_MUMIMO_TX)   += rwnx_mu_group.o
 $(MODULE_NAME)-$(CONFIG_SDIO_SUPPORT)     += sdio_host.o

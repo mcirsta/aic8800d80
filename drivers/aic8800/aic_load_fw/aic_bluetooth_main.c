@@ -28,10 +28,11 @@ uint32_t gpio_dft_lvl = 0;//0:defalut pull down,  1:default pull up
 
 module_param(aicwf_dbg_level, int, 0660);
 module_param(ble_scan_wakeup_reboot_time, int, 0660);
-module_param(testmode, int, 0660);
-module_param(adap_test, int, 0660);
+/*
+ * Production initialization keeps normal firmware and calibration defaults.
+ * Factory RF/flash modes must not be selected through module parameters.
+ */
 module_param_string(paringid, paringid, 100, 0660);
-module_param(flash_erase_len, int, 0660);
 
 
 static void aicsmac_driver_register(void)

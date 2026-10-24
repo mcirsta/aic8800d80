@@ -873,10 +873,6 @@ void get_fw_path(char* fw_path){
 	}
 } 
 
-void set_testmode(int val){
-	testmode = val;
-}
-
 int get_testmode(void){
 	return testmode;
 }
@@ -903,8 +899,6 @@ u32 get_flash_bin_crc(void)
 EXPORT_SYMBOL(get_fw_path);
 
 EXPORT_SYMBOL(get_testmode);
-
-EXPORT_SYMBOL(set_testmode);
 
 EXPORT_SYMBOL(get_hardware_info);
 

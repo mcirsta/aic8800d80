@@ -52,7 +52,10 @@ enum AICWF_IC{
 #define AICWF_USB_TX_HIGH_WATER         (AICWF_USB_TX_LOW_WATER*3)
 #define AICWF_USB_MAX_PKT_SIZE          (2048)
 
-#ifdef CONFIG_RFTEST
+/*
+ * Firmware names are shared by normal Wi-Fi/Bluetooth initialization and the
+ * retained vendor mode branches; they do not enable RF test command support.
+ */
 #define FW_RF_PATCH_BASE_NAME           "fw_patch.bin"
 #define FW_RF_ADID_BASE_NAME            "fw_adid.bin"
 #define FW_RF_BASE_NAME                 "fmacfw_rf.bin"
@@ -71,12 +74,6 @@ enum AICWF_IC{
 #define FW_PATCH_TEST_BASE_NAME      	"fw_patch_test.bin"
 #define FW_PATCH_BASE_NAME_U03          "fw_patch_u03.bin"
 #define FW_ADID_BASE_NAME_U03           "fw_adid_u03.bin"
-
-#else
-#define FW_PATCH_BASE_NAME              "fw_patch.bin"
-#define FW_ADID_BASE_NAME               "fw_adid.bin"
-#define FW_BASE_NAME                    "fmacfw.bin"
-#endif
 
 #define FW_PATCH_TABLE_NAME             "fw_patch_table.bin"
 #define FW_PATCH_TABLE_NAME_U03         "fw_patch_table_u03.bin"

@@ -46,7 +46,6 @@
 #include "aicwf_compat_8800d80x2.h"
 #include "aicwf_compat_8800d80n.h"
 #include "aicwf_compat_8800dln.h"
-#include "aic_priv_cmd.h"
 #include "rwnx_wakelock.h"
 #include "rwnx_msg_tx.h"
 #include "aic_vendor.h"
@@ -1717,37 +1716,6 @@ static int rwnx_close(struct net_device *dev)
 }
 
 
-#define IOCTL_HOSTAPD   (SIOCIWFIRSTPRIV+28)
-#define IOCTL_WPAS      (SIOCIWFIRSTPRIV+30)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
-static int rwnx_do_ioctl(struct net_device *net, struct ifreq *req, void __user *data, int cmd)
-#else
-static int rwnx_do_ioctl(struct net_device *net, struct ifreq *req, int cmd)
-#endif
-{
-    int ret = 0;
-    ///TODO: add ioctl command handler later
-    switch(cmd)
-    {
-        case IOCTL_HOSTAPD:
-            AICWFDBG(LOGINFO, "IOCTL_HOSTAPD\n");
-            break;
-        case IOCTL_WPAS:
-            AICWFDBG(LOGINFO, "IOCTL_WPAS\n");
-            break;
-        case SIOCDEVPRIVATE:
-            AICWFDBG(LOGINFO, "IOCTL SIOCDEVPRIVATE\n");
-            break;
-        case (SIOCDEVPRIVATE+1):
-            AICWFDBG(LOGINFO, "IOCTL PRIVATE\n");
-            ret = android_priv_cmd(net, req, cmd);
-	    break;
-        default:
-            ret = -EOPNOTSUPP;
-    }
-    return ret;
-}
-
 /**
  * struct net_device_stats* (*ndo_get_stats)(struct net_device *dev);
  *	Called when a user wants to get the network device usage
@@ -1799,14 +1767,10 @@ static int rwnx_set_mac_address(struct net_device *dev, void *addr)
     return ret;
 }
 
+/* Station and monitor configuration use cfg80211, not private RF ioctls. */
 static const struct net_device_ops rwnx_netdev_ops = {
     .ndo_open               = rwnx_open,
     .ndo_stop               = rwnx_close,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
-    .ndo_siocdevprivate     = rwnx_do_ioctl,
-#else
-    .ndo_do_ioctl           = rwnx_do_ioctl,
-#endif
     .ndo_start_xmit         = rwnx_start_xmit,
     .ndo_get_stats          = rwnx_get_stats,
 #ifndef CONFIG_ONE_TXQ
@@ -1822,11 +1786,6 @@ static const struct net_device_ops rwnx_netdev_ops = {
 static const struct net_device_ops rwnx_netdev_monitor_ops = {
     .ndo_open               = rwnx_open,
     .ndo_stop               = rwnx_close,
-    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
-    .ndo_siocdevprivate     = rwnx_do_ioctl,
-    #else
-    .ndo_do_ioctl           = rwnx_do_ioctl,
-    #endif
     #ifdef CONFIG_RWNX_MON_XMIT
     .ndo_start_xmit         = rwnx_start_monitor_if_xmit,
     .ndo_select_queue       = rwnx_select_queue,

@@ -1,5 +1,8 @@
 CONFIG_USB_SUPPORT =y
-CONFIG_RFTEST =y
+CONFIG_RFTEST = n
+ifneq ($(CONFIG_RFTEST),n)
+$(error RF test commands are not supported by the production driver)
+endif
 CONFIG_USB_BT =y
 CONFIG_USB_MSG_EP = y
 CONFIG_USB_NO_TRANS_DMA_MAP = n
