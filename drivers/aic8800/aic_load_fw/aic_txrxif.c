@@ -106,6 +106,7 @@ void aicwf_bus_deinit(struct device *dev)
     usbdev = bus_if->bus_priv.usb;
     usbdev->app_cmp = false;
 	aicwf_bus_stop(bus_if);
+	rwnx_cmd_mgr_stop(&usbdev->cmd_mgr);
 
 	/* Join consumers before releasing command or receive storage. */
 	if (bus_if->bustx_thread) {

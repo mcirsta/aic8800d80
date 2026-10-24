@@ -212,6 +212,7 @@ struct aic_usb_dev {
     struct aicwf_usb_buf usb_rx_buf[AICWF_USB_RX_URBS];
 
     int msg_finished;
+	int msg_status;
     wait_queue_head_t msg_wait;
     ulong msg_busy;
     struct urb *msg_out_urb;

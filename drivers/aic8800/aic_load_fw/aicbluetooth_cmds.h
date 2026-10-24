@@ -14,6 +14,7 @@
 #include <linux/spinlock.h>
 #include <linux/completion.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 
 #define RWNX_80211_CMD_TIMEOUT_MS    2000//500//300
 
@@ -111,7 +112,7 @@ struct rwnx_cmd {
     u32 tkn;
     u16 flags;
     struct completion complete;
-    u32 result;
+	int result;
 };
 
 struct aic_sdio_dev;
@@ -122,6 +123,8 @@ typedef int (*msg_cb_fct)(struct rwnx_cmd *cmd, struct rwnx_cmd_e2amsg *msg);
 struct rwnx_cmd_mgr {
     enum rwnx_cmd_mgr_state state;
     spinlock_t lock;
+	/* Serializes synchronous requests and their shared USB command buffer. */
+	struct mutex tx_lock;
     u32 next_tkn;
     u32 queue_sz;
     u32 max_queue_sz;
@@ -152,8 +155,9 @@ struct rwnx_cmd_mgr {
 #endif
 void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr);
 void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr);
+void rwnx_cmd_mgr_stop(struct rwnx_cmd_mgr *cmd_mgr);
 int cmd_mgr_queue_force_defer(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd);
-void aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len);
+int aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len);
 
 enum
 {

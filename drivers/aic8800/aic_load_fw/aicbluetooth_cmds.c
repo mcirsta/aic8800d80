@@ -25,99 +25,78 @@ static void cmd_dump(const struct rwnx_cmd *cmd)
            cmd->tkn, cmd->flags, cmd->result, cmd->id, cmd->reqid);
 }
 
-static void cmd_complete(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
+/* The sender owns cmd and its message; the queue only borrows cmd. */
+static void cmd_complete(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd,
+			 int result)
 {
-    //printk("cmdcmp\n");
-    lockdep_assert_held(&cmd_mgr->lock);
+	lockdep_assert_held(&cmd_mgr->lock);
 
-    list_del(&cmd->list);
-    cmd_mgr->queue_sz--;
-
-    cmd->flags |= RWNX_CMD_FLAG_DONE;
-    if (cmd->flags & RWNX_CMD_FLAG_NONBLOCK) {
-        kfree(cmd);
-    } else {
-        if (RWNX_CMD_WAIT_COMPLETE(cmd->flags)) {
-            cmd->result = 0;
-            complete(&cmd->complete);
-        }
-    }
+	list_del_init(&cmd->list);
+	cmd_mgr->queue_sz--;
+	cmd->result = result;
+	cmd->flags |= RWNX_CMD_FLAG_DONE;
+	complete(&cmd->complete);
 }
 
 static int cmd_mgr_queue(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
 {
-    bool defer_push = false;
+	long waited;
+	int ret;
 
-    spin_lock_bh(&cmd_mgr->lock);
+	lockdep_assert_held(&cmd_mgr->tx_lock);
+	/* All current loader requests are synchronous; there is no push worker. */
+	if (cmd->flags & RWNX_CMD_FLAG_NONBLOCK)
+		return -EOPNOTSUPP;
 
-    if (cmd_mgr->state == RWNX_CMD_MGR_STATE_CRASHED) {
-        printk(KERN_CRIT"cmd queue crashed\n");
-        cmd->result = -EPIPE;
-        spin_unlock_bh(&cmd_mgr->lock);
-        return -EPIPE;
-    }
+	spin_lock_bh(&cmd_mgr->lock);
+	if (cmd_mgr->state != RWNX_CMD_MGR_STATE_INITED) {
+		ret = cmd_mgr->state == RWNX_CMD_MGR_STATE_CRASHED ?
+			-EPIPE : -ESHUTDOWN;
+		goto out_unlock;
+	}
+	if (cmd_mgr->queue_sz >= cmd_mgr->max_queue_sz) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
 
-    if (!list_empty(&cmd_mgr->cmds)) {
-        struct rwnx_cmd *last;
+	if (cmd->flags & RWNX_CMD_FLAG_REQ_CFM)
+		cmd->flags |= RWNX_CMD_FLAG_WAIT_CFM;
+	cmd->tkn = cmd_mgr->next_tkn++;
+	cmd->result = -EINPROGRESS;
+	init_completion(&cmd->complete);
+	list_add_tail(&cmd->list, &cmd_mgr->cmds);
+	cmd_mgr->queue_sz++;
+	spin_unlock_bh(&cmd_mgr->lock);
 
-        if (cmd_mgr->queue_sz == cmd_mgr->max_queue_sz) {
-            printk(KERN_CRIT"Too many cmds (%d) already queued\n",
-                   cmd_mgr->max_queue_sz);
-            cmd->result = -ENOMEM;
-            spin_unlock_bh(&cmd_mgr->lock);
-            return -ENOMEM;
-        }
-        last = list_entry(cmd_mgr->cmds.prev, struct rwnx_cmd, list);
-        if (last->flags & (RWNX_CMD_FLAG_WAIT_ACK | RWNX_CMD_FLAG_WAIT_PUSH)) {
-            cmd->flags |= RWNX_CMD_FLAG_WAIT_PUSH;
-            defer_push = true;
-        }
-    }
+	ret = aicwf_set_cmd_tx(cmd_mgr->usbdev, cmd->a2e_msg,
+			      RWNX_CMD_A2EMSG_LEN(cmd->a2e_msg));
+	if (ret) {
+		spin_lock_bh(&cmd_mgr->lock);
+		/* A late confirmation cannot be correlated after a failed transfer. */
+		if (cmd_mgr->state == RWNX_CMD_MGR_STATE_INITED)
+			cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+		if (!(cmd->flags & RWNX_CMD_FLAG_DONE))
+			cmd_complete(cmd_mgr, cmd, ret);
+		else
+			cmd->result = ret;
+		goto out_unlock;
+	}
 
-    if (cmd->flags & RWNX_CMD_FLAG_REQ_CFM)
-        cmd->flags |= RWNX_CMD_FLAG_WAIT_CFM;
-
-    cmd->tkn    = cmd_mgr->next_tkn++;
-    cmd->result = -EINTR;
-
-    if (!(cmd->flags & RWNX_CMD_FLAG_NONBLOCK))
-        init_completion(&cmd->complete);
-
-    list_add_tail(&cmd->list, &cmd_mgr->cmds);
-    cmd_mgr->queue_sz++;
-    spin_unlock_bh(&cmd_mgr->lock);
-
-    if (!defer_push) {
-        //printk("queue:id=%x, param_len=%u\n",cmd->a2e_msg->id, cmd->a2e_msg->param_len);
-        aicwf_set_cmd_tx((void *)(cmd_mgr->usbdev), cmd->a2e_msg, sizeof(struct lmac_msg) + cmd->a2e_msg->param_len);
-        kfree(cmd->a2e_msg);
-    } else {
-        printk("ERR: never defer push!!!!");
-        return 0;
-    }
-
-    if (!(cmd->flags & RWNX_CMD_FLAG_NONBLOCK)) {
-        unsigned long tout = msecs_to_jiffies(RWNX_80211_CMD_TIMEOUT_MS * cmd_mgr->queue_sz);
-        if (!wait_for_completion_killable_timeout(&cmd->complete, tout)) {
-            printk(KERN_CRIT"cmd timed-out\n");
-
-            cmd_dump(cmd);
-            spin_lock_bh(&cmd_mgr->lock);
-            cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
-            if (!(cmd->flags & RWNX_CMD_FLAG_DONE)) {
-                cmd->result = -ETIMEDOUT;
-                cmd_complete(cmd_mgr, cmd);
-            }
-            spin_unlock_bh(&cmd_mgr->lock);
-        }
-        else{
-            kfree(cmd);
-        }
-    } else {
-        cmd->result = 0;
-    }
-
-    return 0;
+	waited = wait_for_completion_killable_timeout(&cmd->complete,
+				msecs_to_jiffies(RWNX_80211_CMD_TIMEOUT_MS));
+	spin_lock_bh(&cmd_mgr->lock);
+	if (!(cmd->flags & RWNX_CMD_FLAG_DONE)) {
+		ret = waited < 0 ? waited : -ETIMEDOUT;
+		/* The ABI matches replies by ID, so do not reuse it after abandonment. */
+		if (cmd_mgr->state == RWNX_CMD_MGR_STATE_INITED)
+			cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+		cmd_complete(cmd_mgr, cmd, ret);
+	}
+	/* A confirmation that won the lock at the deadline keeps its result. */
+	ret = cmd->result;
+out_unlock:
+	spin_unlock_bh(&cmd_mgr->lock);
+	return ret;
 }
 
 static int cmd_mgr_run_callback(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd,
@@ -135,44 +114,48 @@ static int cmd_mgr_run_callback(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *c
     return res;
 }
 
-static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd_e2amsg *msg,
-                          msg_cb_fct cb)
+static int cmd_mgr_msgind(struct rwnx_cmd_mgr *cmd_mgr,
+			 struct rwnx_cmd_e2amsg *msg, msg_cb_fct cb)
 {
-    struct rwnx_cmd *cmd;
-    bool found = false;
+	struct rwnx_cmd *cmd;
+	bool found = false;
 
-    //printk("cmd->id=%x\n", msg->id);
-    spin_lock(&cmd_mgr->lock);
-    list_for_each_entry(cmd, &cmd_mgr->cmds, list) {
-        if (cmd->reqid == msg->id &&
-            (cmd->flags & RWNX_CMD_FLAG_WAIT_CFM)) {
+	//printk("cmd->id=%x\n", msg->id);
+	spin_lock(&cmd_mgr->lock);
+	if (cmd_mgr->state != RWNX_CMD_MGR_STATE_INITED) {
+		spin_unlock(&cmd_mgr->lock);
+		return 0;
+	}
+	list_for_each_entry(cmd, &cmd_mgr->cmds, list) {
+		if (cmd->reqid == msg->id &&
+			(cmd->flags & RWNX_CMD_FLAG_WAIT_CFM)) {
 
-            if (!cmd_mgr_run_callback(cmd_mgr, cmd, msg, cb)) {
-                found = true;
-                cmd->flags &= ~RWNX_CMD_FLAG_WAIT_CFM;
+			if (!cmd_mgr_run_callback(cmd_mgr, cmd, msg, cb)) {
+				found = true;
+				cmd->flags &= ~RWNX_CMD_FLAG_WAIT_CFM;
 
-                if (WARN((msg->param_len > RWNX_CMD_E2AMSG_LEN_MAX),
+				if (WARN((msg->param_len > RWNX_CMD_E2AMSG_LEN_MAX),
                          "Unexpect E2A msg len %d > %d\n", msg->param_len,
                          RWNX_CMD_E2AMSG_LEN_MAX)) {
-                    msg->param_len = RWNX_CMD_E2AMSG_LEN_MAX;
-                }
+					msg->param_len = RWNX_CMD_E2AMSG_LEN_MAX;
+				}
 
-                if (cmd->e2a_msg && msg->param_len)
-                    memcpy(cmd->e2a_msg, &msg->param, msg->param_len);
+				if (cmd->e2a_msg && msg->param_len)
+					memcpy(cmd->e2a_msg, &msg->param, msg->param_len);
 
-                if (RWNX_CMD_WAIT_COMPLETE(cmd->flags))
-                    cmd_complete(cmd_mgr, cmd);
+				if (RWNX_CMD_WAIT_COMPLETE(cmd->flags))
+					cmd_complete(cmd_mgr, cmd, 0);
 
-                break;
-            }
-        }
-    }
-    spin_unlock(&cmd_mgr->lock);
+				break;
+			}
+		}
+	}
+	spin_unlock(&cmd_mgr->lock);
 
-    if (!found)
-        cmd_mgr_run_callback(cmd_mgr, NULL, msg, cb);
+	if (!found)
+		cmd_mgr_run_callback(cmd_mgr, NULL, msg, cb);
 
-    return 0;
+	return 0;
 }
 
 static void cmd_mgr_print(struct rwnx_cmd_mgr *cmd_mgr)
@@ -191,20 +174,20 @@ static void cmd_mgr_print(struct rwnx_cmd_mgr *cmd_mgr)
 
 static void cmd_mgr_drain(struct rwnx_cmd_mgr *cmd_mgr)
 {
-    struct rwnx_cmd *cur, *nxt;
+	struct rwnx_cmd *cmd, *next;
 
-    spin_lock_bh(&cmd_mgr->lock);
-    list_for_each_entry_safe(cur, nxt, &cmd_mgr->cmds, list) {
-        list_del(&cur->list);
-        cmd_mgr->queue_sz--;
-        if (!(cur->flags & RWNX_CMD_FLAG_NONBLOCK))
-            complete(&cur->complete);
-    }
-    spin_unlock_bh(&cmd_mgr->lock);
+	spin_lock_bh(&cmd_mgr->lock);
+	cmd_mgr->state = RWNX_CMD_MGR_STATE_DEINIT;
+	list_for_each_entry_safe(cmd, next, &cmd_mgr->cmds, list)
+		cmd_complete(cmd_mgr, cmd, -ESHUTDOWN);
+	spin_unlock_bh(&cmd_mgr->lock);
 }
 
 void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr)
 {
+	mutex_init(&cmd_mgr->tx_lock);
+	cmd_mgr->queue_sz = 0;
+	cmd_mgr->next_tkn = 0;
     cmd_mgr->max_queue_sz = RWNX_CMD_MAX_QUEUED;
     INIT_LIST_HEAD(&cmd_mgr->cmds);
     cmd_mgr->state = RWNX_CMD_MGR_STATE_INITED;
@@ -226,42 +209,53 @@ void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr)
     #endif
 }
 
-void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr)
+void rwnx_cmd_mgr_stop(struct rwnx_cmd_mgr *cmd_mgr)
 {
-    cmd_mgr->print(cmd_mgr);
-    cmd_mgr->drain(cmd_mgr);
-    cmd_mgr->print(cmd_mgr);
-    memset(cmd_mgr, 0, sizeof(*cmd_mgr));
+	/* Wake a pending sender before waiting for its transmit-buffer ownership. */
+	cmd_mgr_drain(cmd_mgr);
+	mutex_lock(&cmd_mgr->tx_lock);
+	mutex_unlock(&cmd_mgr->tx_lock);
 }
 
-void aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len)
+void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr)
 {
-	struct aic_usb_dev *usbdev = (struct aic_usb_dev *)dev;
-    struct aicwf_bus *bus = usbdev->bus_if;
-    u8 *buffer = bus->cmd_buf;
-    u16 index = 0;
+	/* stop is idempotent; bus teardown already stops it before freeing buffers. */
+	rwnx_cmd_mgr_stop(cmd_mgr);
+}
 
-    memset(buffer, 0, CMD_BUF_MAX);
-    buffer[0] = (len+4) & 0x00ff;
-    buffer[1] = ((len+4) >> 8) &0x0f;
-    buffer[2] = 0x11;
-    buffer[3] = 0x0;
-    index += 4;
-    //there is a dummy word
-    index += 4;
+int aicwf_set_cmd_tx(void *dev, struct lmac_msg *msg, uint len)
+{
+	struct aic_usb_dev *usbdev = dev;
+	struct aicwf_bus *bus = usbdev->bus_if;
+	u8 *buffer = bus->cmd_buf;
+	u16 index = 8;
 
-	//make sure little endian
-    put_u16(&buffer[index], msg->id);
-    index += 2;
-    put_u16(&buffer[index], msg->dest_id);
-    index += 2;
-    put_u16(&buffer[index], msg->src_id);
-    index += 2;
-    put_u16(&buffer[index], msg->param_len);
-    index += 2;
-    memcpy(&buffer[index], (u8 *)msg->param, msg->param_len);
+	lockdep_assert_held(&usbdev->cmd_mgr.tx_lock);
+	if (READ_ONCE(bus->state) == BUS_DOWN_ST)
+		return -ENETDOWN;
+	if (!buffer)
+		return -ESHUTDOWN;
+	if (len != RWNX_CMD_A2EMSG_LEN(msg))
+		return -EINVAL;
+	if (len > CMD_BUF_MAX - 8)
+		return -EMSGSIZE;
 
-    aicwf_bus_txmsg(bus, buffer, len + 8);
+	memset(buffer, 0, CMD_BUF_MAX);
+	buffer[0] = (len + 4) & 0xff;
+	buffer[1] = ((len + 4) >> 8) & 0x0f;
+	buffer[2] = 0x11;
+	/* Bytes 4..7 are the firmware's dummy word. */
+	put_u16(&buffer[index], msg->id);
+	index += 2;
+	put_u16(&buffer[index], msg->dest_id);
+	index += 2;
+	put_u16(&buffer[index], msg->src_id);
+	index += 2;
+	put_u16(&buffer[index], msg->param_len);
+	index += 2;
+	memcpy(&buffer[index], msg->param, msg->param_len);
+
+	return aicwf_bus_txmsg(bus, buffer, len + 8);
 }
 
 static inline void *rwnx_msg_zalloc(lmac_msg_id_t const id,
@@ -298,46 +292,58 @@ static void rwnx_msg_free(struct lmac_msg *msg, const void *msg_params)
 
 
 static int rwnx_send_msg(struct aic_usb_dev *usbdev, const void *msg_params,
-                         int reqcfm, lmac_msg_id_t reqid, void *cfm)
+			 int reqcfm, lmac_msg_id_t reqid, void *cfm)
 {
-    struct lmac_msg *msg;
-    struct rwnx_cmd *cmd;
-    bool nonblock;
-    int ret = 0;
+	struct rwnx_cmd_mgr *cmd_mgr = &usbdev->cmd_mgr;
+	struct lmac_msg *msg;
+	struct rwnx_cmd *cmd;
+	int ret;
 
-    msg = container_of((void *)msg_params, struct lmac_msg, param);
-    if(usbdev->bus_if->state == BUS_DOWN_ST) {
-        rwnx_msg_free(msg, msg_params);
-        printk("bus is down\n");
-        return 0;
-    }
+	msg = container_of((void *)msg_params, struct lmac_msg, param);
+	ret = mutex_lock_interruptible(&cmd_mgr->tx_lock);
+	if (ret)
+		goto out_free_msg;
 
-    nonblock = 0;
-    cmd = kzalloc(sizeof(struct rwnx_cmd), nonblock ? GFP_ATOMIC : GFP_KERNEL);
-    cmd->result  = -EINTR;
-    cmd->id      = msg->id;
-    cmd->reqid   = reqid;
-    cmd->a2e_msg = msg;
-    cmd->e2a_msg = cfm;
-    if (nonblock)
-        cmd->flags = RWNX_CMD_FLAG_NONBLOCK;
-    if (reqcfm)
-        cmd->flags |= RWNX_CMD_FLAG_REQ_CFM;
+	if (READ_ONCE(usbdev->bus_if->state) == BUS_DOWN_ST) {
+		ret = -ENETDOWN;
+		goto out_unlock;
+	}
+	spin_lock_bh(&cmd_mgr->lock);
+	if (cmd_mgr->state != RWNX_CMD_MGR_STATE_INITED)
+		ret = cmd_mgr->state == RWNX_CMD_MGR_STATE_CRASHED ?
+			-EPIPE : -ESHUTDOWN;
+	spin_unlock_bh(&cmd_mgr->lock);
+	if (ret)
+		goto out_unlock;
 
-    if(reqcfm) {
-        cmd->flags &= ~RWNX_CMD_FLAG_WAIT_ACK; // we don't need ack any more
-        ret = usbdev->cmd_mgr.queue(&usbdev->cmd_mgr,cmd);
-    } else {
-        aicwf_set_cmd_tx((void *)(usbdev), cmd->a2e_msg, sizeof(struct lmac_msg) + cmd->a2e_msg->param_len);
-    }
-
-    if(!reqcfm)
-	{
-        kfree(cmd);
-		rwnx_msg_free(msg, msg_params);
+	if (!reqcfm) {
+		ret = aicwf_set_cmd_tx(usbdev, msg, RWNX_CMD_A2EMSG_LEN(msg));
+		if (ret) {
+			spin_lock_bh(&cmd_mgr->lock);
+			if (cmd_mgr->state == RWNX_CMD_MGR_STATE_INITED)
+				cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+			spin_unlock_bh(&cmd_mgr->lock);
+		}
+		goto out_unlock;
 	}
 
-    return ret;
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (!cmd) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	cmd->id = msg->id;
+	cmd->reqid = reqid;
+	cmd->a2e_msg = msg;
+	cmd->e2a_msg = cfm;
+	cmd->flags = RWNX_CMD_FLAG_REQ_CFM;
+	ret = cmd_mgr->queue(cmd_mgr, cmd);
+	kfree(cmd);
+out_unlock:
+	mutex_unlock(&cmd_mgr->tx_lock);
+out_free_msg:
+	rwnx_msg_free(msg, msg_params);
+	return ret;
 }
 
 int rwnx_send_dbg_mem_mask_write_req(struct aic_usb_dev *usbdev, u32 mem_addr,

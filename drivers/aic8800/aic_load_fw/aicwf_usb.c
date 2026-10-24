@@ -385,80 +385,78 @@ int usb_busrx_thread(void *data)
 
 static void aicwf_usb_send_msg_complete(struct urb *urb)
 {
-    struct aic_usb_dev *usb_dev = (struct aic_usb_dev *) urb->context;
+	struct aic_usb_dev *usb_dev = urb->context;
 
-    usb_dev->msg_finished = true;
-    if (waitqueue_active(&usb_dev->msg_wait))
-        wake_up(&usb_dev->msg_wait);
+	usb_dev->msg_status = urb->status;
+	if (!usb_dev->msg_status &&
+	    urb->actual_length != urb->transfer_buffer_length)
+		usb_dev->msg_status = -EREMOTEIO;
+	WRITE_ONCE(usb_dev->msg_finished, true);
+	wake_up(&usb_dev->msg_wait);
 }
 
 static int aicwf_usb_bus_txmsg(struct device *dev, u8 *buf, u32 len)
 {
-    int ret = 0;
-    struct aicwf_bus *bus_if = dev_get_drvdata(dev);
-    struct aic_usb_dev *usb_dev = bus_if->bus_priv.usb;
+	struct aicwf_bus *bus_if = dev_get_drvdata(dev);
+	struct aic_usb_dev *usb_dev = bus_if->bus_priv.usb;
+	unsigned long timeleft;
+	int ret;
 
-    if (usb_dev->state != USB_UP_ST)
-        return -EIO;
+	if (READ_ONCE(bus_if->state) == BUS_DOWN_ST ||
+	    READ_ONCE(usb_dev->state) != USB_UP_ST)
+		return -ENETDOWN;
 
-    if (buf == NULL || len == 0 || usb_dev->msg_out_urb == NULL)
-        return -EINVAL;
+	if (!buf || !len || !usb_dev->msg_out_urb)
+		return -EINVAL;
 
-    if (test_and_set_bit(0, &usb_dev->msg_busy)) {
-        usb_err("In a control frame option, can't tx!\n");
-        return -EIO;
-    }
+	if (test_and_set_bit(0, &usb_dev->msg_busy)) {
+		usb_err("In a control frame option, can't tx!\n");
+		return -EBUSY;
+	}
 
-    usb_dev->msg_finished = false;
+	WRITE_ONCE(usb_dev->msg_finished, false);
+	usb_dev->msg_status = -EINPROGRESS;
 
 #ifdef CONFIG_USB_MSG_EP
-		if (usb_dev->msg_out_pipe && usb_dev->use_msg_ep == 1) {
-			usb_fill_bulk_urb(usb_dev->msg_out_urb,
-				usb_dev->udev,
-				usb_dev->msg_out_pipe,
-				buf, len, (usb_complete_t) aicwf_usb_send_msg_complete, usb_dev);
-		} else {
-			usb_fill_bulk_urb(usb_dev->msg_out_urb,
-				usb_dev->udev,
-				usb_dev->bulk_out_pipe,
-				buf, len, (usb_complete_t) aicwf_usb_send_msg_complete, usb_dev);
-		}
+	if (usb_dev->msg_out_pipe && usb_dev->use_msg_ep == 1)
+		usb_fill_bulk_urb(usb_dev->msg_out_urb, usb_dev->udev,
+				  usb_dev->msg_out_pipe, buf, len,
+				  aicwf_usb_send_msg_complete, usb_dev);
+	else
+		usb_fill_bulk_urb(usb_dev->msg_out_urb, usb_dev->udev,
+				  usb_dev->bulk_out_pipe, buf, len,
+				  aicwf_usb_send_msg_complete, usb_dev);
 #else
-    usb_fill_bulk_urb(usb_dev->msg_out_urb,
-        usb_dev->udev,
-        usb_dev->bulk_out_pipe,
-        buf, len, (usb_complete_t) aicwf_usb_send_msg_complete, usb_dev);
+	usb_fill_bulk_urb(usb_dev->msg_out_urb, usb_dev->udev,
+			  usb_dev->bulk_out_pipe, buf, len,
+			  aicwf_usb_send_msg_complete, usb_dev);
 #endif
-    #if defined CONFIG_USB_NO_TRANS_DMA_MAP
-    usb_dev->msg_out_urb->transfer_dma = usb_dev->cmd_dma_trans_addr;
-    usb_dev->msg_out_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
-    #endif
-    usb_dev->msg_out_urb->transfer_flags |= URB_ZERO_PACKET;
+#ifdef CONFIG_USB_NO_TRANS_DMA_MAP
+	usb_dev->msg_out_urb->transfer_dma = usb_dev->cmd_dma_trans_addr;
+	usb_dev->msg_out_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+#endif
+	usb_dev->msg_out_urb->transfer_flags |= URB_ZERO_PACKET;
 
-    ret = usb_submit_urb(usb_dev->msg_out_urb, GFP_ATOMIC);
-    if (ret) {
-        usb_err("usb_submit_urb failed %d\n", ret);
-        goto exit;
-    }
+	ret = usb_submit_urb(usb_dev->msg_out_urb, GFP_ATOMIC);
+	if (ret) {
+		usb_err("usb_submit_urb failed %d\n", ret);
+		goto exit;
+	}
 
-    ret = wait_event_timeout(usb_dev->msg_wait,
-        usb_dev->msg_finished, msecs_to_jiffies(CMD_TX_TIMEOUT));
-    if (!ret) {
-        if (usb_dev->msg_out_urb)
-            usb_kill_urb(usb_dev->msg_out_urb);
-        usb_err("Txmsg wait timed out\n");
-        ret = -EIO;
-        goto exit;
-    }
-
-    if (usb_dev->msg_finished == false) {
-        usb_err("Txmsg timed out\n");
-        ret = -ETIMEDOUT;
-        goto exit;
-    }
+	timeleft = wait_event_timeout(usb_dev->msg_wait,
+			READ_ONCE(usb_dev->msg_finished),
+			msecs_to_jiffies(CMD_TX_TIMEOUT));
+	/* Join the callback before another sender reuses its URB and buffer. */
+	usb_kill_urb(usb_dev->msg_out_urb);
+	if (!timeleft) {
+		usb_err("Txmsg wait timed out\n");
+		ret = -ETIMEDOUT;
+	} else {
+		ret = usb_dev->msg_status;
+	}
 exit:
-    clear_bit(0, &usb_dev->msg_busy);
-    return ret;
+	clear_bit_unlock(0, &usb_dev->msg_busy);
+	return ret;
 }
 
 
