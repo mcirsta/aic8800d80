@@ -379,7 +379,6 @@ int reord_rxframe_enqueue(struct reord_ctrl *preorder_ctrl, struct recv_msdu *pr
 void reord_timeout_worker(struct work_struct *work);
 int reord_single_frame_ind(struct aicwf_rx_priv *rx_priv, struct recv_msdu *prframe);
 void reord_rxframes_ind(struct aicwf_rx_priv *rx_priv, struct reord_ctrl *preorder_ctrl);
-void remove_sec_hdr_mgmt_frame(struct hw_rxhdr *hw_rxhdr,struct sk_buff *skb);
 int reord_process_unit(struct recv_msdu *pframe, struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 seq_num, u8 tid, u8 forward, u8 is_amsdu);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
@@ -387,6 +386,8 @@ void reord_timeout_handler (ulong data);
 #else
 void reord_timeout_handler (struct timer_list *t);
 #endif
+#endif /* AICWF_RX_REORDER */
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
 void defrag_timeout_cb(ulong data);
 #else
@@ -394,7 +395,6 @@ void defrag_timeout_cb(struct timer_list *t);
 #endif
 void rwnx_rx_defrag_deinit(struct rwnx_hw *rwnx_hw);
 
-#endif
 void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb, u8 vif_idx,
                                         struct sk_buff_head *list);
 

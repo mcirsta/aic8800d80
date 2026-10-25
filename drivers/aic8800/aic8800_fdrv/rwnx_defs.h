@@ -734,6 +734,10 @@ struct rwnx_phy_info {
 struct defrag_ctrl_info {
     struct list_head list;
     u8 sta_idx;
+	u8 vif_idx;
+	u8 decr_status;
+	u8 ra[ETH_ALEN];
+	u8 ta[ETH_ALEN];
     u8 tid;
     u16 sn;
     u8 next_fn;
