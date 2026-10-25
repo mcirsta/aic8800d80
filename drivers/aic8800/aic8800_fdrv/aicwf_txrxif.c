@@ -676,8 +676,7 @@ struct aicwf_rx_priv *aicwf_rx_init(void *arg)
         kfree(rx_priv);
         return NULL;
     }
-    spin_lock_init(&rx_priv->stas_reord_lock);
-    INIT_LIST_HEAD(&rx_priv->stas_reord_list);
+	reord_init(rx_priv);
 #endif
 
     return rx_priv;
@@ -695,16 +694,11 @@ static void aicwf_recvframe_queue_deinit(struct list_head *q)
 #endif
 void aicwf_rx_deinit(struct aicwf_rx_priv* rx_priv)
 {
+	if (!rx_priv)
+		return;
 #ifdef AICWF_RX_REORDER
-    struct reord_ctrl_info *reord_info, *tmp;
-
-	AICWFDBG(LOGINFO, "%s Enter\n", __func__);
-	
-    list_for_each_entry_safe(reord_info, tmp,
-        &rx_priv->stas_reord_list, list) {
-        reord_deinit_sta(rx_priv, reord_info);
-    }
-
+	/* Stop publication before joining RX producers or retired objects. */
+	reord_stop(rx_priv);
 #endif
 	AICWFDBG(LOGINFO, "stio rx thread\n");
 #ifdef AICWF_SDIO_SUPPORT
@@ -760,6 +754,8 @@ void aicwf_rx_deinit(struct aicwf_rx_priv* rx_priv)
 #endif
 
 #ifdef AICWF_RX_REORDER
+	/* All producer threads/tasklets are gone; join every asynchronous retire. */
+	reord_shutdown(rx_priv);
     aicwf_recvframe_queue_deinit(&rx_priv->rxframes_freequeue);
     if (rx_priv->recv_frames)
         vfree(rx_priv->recv_frames);

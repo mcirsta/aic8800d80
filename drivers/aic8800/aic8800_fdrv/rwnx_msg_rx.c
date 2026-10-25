@@ -846,7 +846,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
         u8 txq_status;
         struct cfg80211_chan_def chandef;
 
-        sta->valid = true;
+	WRITE_ONCE(sta->valid, true);
         sta->sta_idx = ind->ap_idx;
         sta->ch_idx = ind->ch_idx;
         sta->vif_idx = ind->vif_idx;
@@ -1084,8 +1084,6 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
     struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
     struct net_device *dev;
 #ifdef AICWF_RX_REORDER
-    struct reord_ctrl_info *reord_info, *tmp;
-    u8 *macaddr;
     struct aicwf_rx_priv *rx_priv;
 #endif
 
@@ -1139,23 +1137,18 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
 
 #ifdef AICWF_RX_REORDER
 #ifdef AICWF_SDIO_SUPPORT
-    rx_priv = rwnx_hw->sdiodev->rx_priv;
+    rx_priv = rwnx_hw->sdiodev ? rwnx_hw->sdiodev->rx_priv : NULL;
 #else
-    rx_priv = rwnx_hw->usbdev->rx_priv;
+    rx_priv = rwnx_hw->usbdev ? rwnx_hw->usbdev->rx_priv : NULL;
 #endif
     if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT)) {
-        macaddr = (u8*)rwnx_vif->ndev->dev_addr;
-		AICWFDBG(LOGINFO, "deinit:macaddr:%x,%x,%x,%x,%x,%x\r\n", macaddr[0],macaddr[1],macaddr[2], \
-                               macaddr[3],macaddr[4],macaddr[5]);
-        list_for_each_entry_safe(reord_info, tmp, &rx_priv->stas_reord_list, list) {
-            macaddr = (u8*)rwnx_vif->ndev->dev_addr;
-			AICWFDBG(LOGINFO, "reord_mac:%x,%x,%x,%x,%x,%x\r\n", reord_info->mac_addr[0],reord_info->mac_addr[1],reord_info->mac_addr[2], \
-                                   reord_info->mac_addr[3],reord_info->mac_addr[4],reord_info->mac_addr[5]);
-            if (!memcmp(reord_info->mac_addr, macaddr, 6)) {
-                reord_deinit_sta(rx_priv, reord_info);
-                break;
-            }
-        }
+		/* Close station admission before retiring its reorder objects. */
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		if (rwnx_vif->sta.ap)
+			WRITE_ONCE(rwnx_vif->sta.ap->valid, false);
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		if (rx_priv)
+			reord_deinit_sta(rx_priv, rwnx_vif, NULL);
     }
     else if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO))
         BUG();//should be not here: del_sta function
@@ -1166,7 +1159,7 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
     #if 0
     rwnx_dbgfs_unregister_rc_stat(rwnx_hw, rwnx_vif->sta.ap);
     #endif
-    rwnx_vif->sta.ap->valid = false;
+    WRITE_ONCE(rwnx_vif->sta.ap->valid, false);
     rwnx_vif->sta.ap = NULL;
     rwnx_external_auth_disable(rwnx_vif);
     rwnx_chanctx_unlink(rwnx_vif);
@@ -1273,7 +1266,7 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
             if (!rwnx_sta->valid) {
                 u8 txq_status;
 
-                rwnx_sta->valid = true;
+		WRITE_ONCE(rwnx_sta->valid, true);
                 rwnx_sta->sta_idx = ind->sta_idx;
                 rwnx_sta->ch_idx = rwnx_vif->ch_index;
                 rwnx_sta->vif_idx = ind->vif_idx;
@@ -1315,7 +1308,7 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
         } else {
             if (rwnx_sta->valid) {
                 rwnx_sta->ps.active = false;
-                rwnx_sta->valid = false;
+		WRITE_ONCE(rwnx_sta->valid, false);
 
                 /* Remove the station from the list of VIF's station */
                 list_del_init(&rwnx_sta->list);
@@ -1333,7 +1326,7 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
             /* There is no way to inform upper layer for lost of peer, still
                clean everything in the driver */
             rwnx_sta->ps.active = false;
-            rwnx_sta->valid = false;
+	    WRITE_ONCE(rwnx_sta->valid, false);
 
             /* Remove the station from the list of VIF's station */
             list_del_init(&rwnx_sta->list);

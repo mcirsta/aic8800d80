@@ -1496,7 +1496,7 @@ static int rwnx_open(struct net_device *dev)
 				/* Save the index retrieved from LMAC */
 				spin_lock_bh(&rwnx_hw->cb_lock);
 				rwnx_hw->p2p_dev_vif->vif_index = add_if_cfm.inst_nbr;
-				rwnx_hw->p2p_dev_vif->up = true;
+				WRITE_ONCE(rwnx_hw->p2p_dev_vif->up, true);
 				rwnx_hw->vif_started++;
 				rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_hw->p2p_dev_vif;
 				spin_unlock_bh(&rwnx_hw->cb_lock);
@@ -1522,7 +1522,7 @@ static int rwnx_open(struct net_device *dev)
 		/* Save the index retrieved from LMAC */
 		spin_lock_bh(&rwnx_hw->cb_lock);
 		rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-		rwnx_vif->up = true;
+		WRITE_ONCE(rwnx_vif->up, true);
 		rwnx_hw->vif_started++;
 		rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
 		AICWFDBG(LOGDEBUG, "%s ap create vif in rwnx_hw->vif_table[%d] \r\n",
@@ -1547,7 +1547,7 @@ static int rwnx_open(struct net_device *dev)
 		/* Save the index retrieved from LMAC */
 		spin_lock_bh(&rwnx_hw->cb_lock);
 		rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-		rwnx_vif->up = true;
+		WRITE_ONCE(rwnx_vif->up, true);
 		rwnx_hw->vif_started++;
 		rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
 		AICWFDBG(LOGDEBUG, "%s sta create vif in rwnx_hw->vif_table[%d] \r\n",
@@ -1763,7 +1763,7 @@ static int rwnx_close(struct net_device *dev)
 	/* Retire the RX lookup before releasing channel and queue state. */
 	spin_lock_bh(&rwnx_hw->cb_lock);
 	carrier = netif_carrier_ok(dev);
-	rwnx_vif->up = false;
+	WRITE_ONCE(rwnx_vif->up, false);
 	owns_slot = rwnx_vif->vif_index < ARRAY_SIZE(rwnx_hw->vif_table) &&
 		    rwnx_hw->vif_table[rwnx_vif->vif_index] == rwnx_vif;
 	if (owns_slot)
@@ -1777,6 +1777,16 @@ static int rwnx_close(struct net_device *dev)
 			rwnx_hw->vif_started--;
 	}
 	spin_unlock_bh(&rwnx_hw->cb_lock);
+
+#ifdef AICWF_RX_REORDER
+#if defined(AICWF_USB_SUPPORT)
+	if (rwnx_hw->usbdev && rwnx_hw->usbdev->rx_priv)
+		reord_vif_stop(rwnx_hw->usbdev->rx_priv, rwnx_vif);
+#elif defined(AICWF_SDIO_SUPPORT)
+	if (rwnx_hw->sdiodev && rwnx_hw->sdiodev->rx_priv)
+		reord_vif_stop(rwnx_hw->sdiodev->rx_priv, rwnx_vif);
+#endif
+#endif
 
 	if (carrier) {
 		switch (RWNX_VIF_TYPE(rwnx_vif)) {
@@ -1996,7 +2006,7 @@ static struct rwnx_vif *rwnx_interface_add(struct rwnx_hw *rwnx_hw,
     SET_NETDEV_DEV(ndev, wiphy_dev(vif->wdev.wiphy));
     vif->wdev.netdev = ndev;
     vif->wdev.iftype = type;
-    vif->up = false;
+    WRITE_ONCE(vif->up, false);
     vif->ch_index = RWNX_CH_NOT_SET;
     memset(&vif->net_stats, 0, sizeof(vif->net_stats));
     vif->is_p2p_vif = 0;
@@ -2189,7 +2199,7 @@ void aicwf_p2p_alive_timeout(struct timer_list *t)
      /* Ensure that we won't process disconnect ind */
      spin_lock_bh(&rwnx_hw->cb_lock);
 
-     rwnx_vif->up = false;
+     WRITE_ONCE(rwnx_vif->up, false);
      rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
      AICWFDBG(LOGDEBUG, "%s rwnx_vif[%d] down \r\n", __func__, rwnx_vif->vif_index);
      rwnx_hw->vif_started--;
@@ -2519,7 +2529,7 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
     vif->vif_index = vif_idx;
     vif->wdev.wiphy = rwnx_hw->wiphy;
     vif->drv_vif_index = vif_idx;
-    vif->up = false;
+    WRITE_ONCE(vif->up, false);
     vif->ch_index = RWNX_CH_NOT_SET;
     memset(&vif->net_stats, 0, sizeof(vif->net_stats));
     vif->use_4addr = false;
@@ -2889,7 +2899,7 @@ static void rwnx_cfgp2p_stop_p2p_device(struct wiphy *wiphy, struct wireless_dev
 			rwnx_send_remove_if(rwnx_hw, rwnx_vif->vif_index, true);
 			/* Ensure that we won't process disconnect ind */
 			spin_lock_bh(&rwnx_hw->cb_lock);
-			rwnx_vif->up = false;
+			WRITE_ONCE(rwnx_vif->up, false);
 			rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
             AICWFDBG(LOGDEBUG, "%s rwnx_vif[%d] down \r\n", __func__, rwnx_vif->vif_index);
 			rwnx_hw->vif_started--;
@@ -3630,7 +3640,7 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
             spin_lock_bh(&rwnx_hw->cb_lock);
             rwnx_txq_sta_init(rwnx_hw, sta, rwnx_txq_vif_get_status(rwnx_vif));
             list_add_tail(&sta->list, &rwnx_vif->ap.sta_list);
-            sta->valid = true;
+	    WRITE_ONCE(sta->valid, true);
             rwnx_ps_bh_enable(rwnx_hw, sta, sta->ps.active || me_sta_add_cfm.pm_state);
             spin_unlock_bh(&rwnx_hw->cb_lock);
 
@@ -3735,8 +3745,6 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
     const u8 *mac = NULL;
 #endif
 #ifdef AICWF_RX_REORDER
-    struct reord_ctrl_info *reord_info, *reord_tmp;
-    u8 *macaddr;
     struct aicwf_rx_priv *rx_priv;
 #endif
 
@@ -3762,7 +3770,7 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
 
 		if(found) {
             		cur->ps.active = false;
-            		cur->valid = false;
+			WRITE_ONCE(cur->valid, false);
             		list_del(&cur->list);
         	}
 		spin_unlock_bh(&rwnx_hw->cb_lock);
@@ -3799,26 +3807,16 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
 
 #ifdef AICWF_RX_REORDER
 #ifdef AICWF_SDIO_SUPPORT
-			rx_priv = rwnx_hw->sdiodev->rx_priv;
+			rx_priv = rwnx_hw->sdiodev ? rwnx_hw->sdiodev->rx_priv : NULL;
 #else
-			rx_priv = rwnx_hw->usbdev->rx_priv;
+			rx_priv = rwnx_hw->usbdev ? rwnx_hw->usbdev->rx_priv : NULL;
 #endif
 			if ((rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT)) {
 				BUG();//should be other function
 			}
 			else if ((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO)){
-				macaddr = cur->mac_addr;
-				AICWFDBG(LOGINFO, "deinit:macaddr:%x,%x,%x,%x,%x,%x\r\n", macaddr[0],macaddr[1],macaddr[2], \
-									   macaddr[3],macaddr[4],macaddr[5]);
-				list_for_each_entry_safe(reord_info, reord_tmp,
-					&rx_priv->stas_reord_list, list) {
-                    			AICWFDBG(LOGINFO, "reord_mac:%x,%x,%x,%x,%x,%x\r\n", reord_info->mac_addr[0],reord_info->mac_addr[1],reord_info->mac_addr[2], \
-										   reord_info->mac_addr[3],reord_info->mac_addr[4],reord_info->mac_addr[5]);
-					if (!memcmp(reord_info->mac_addr, macaddr, 6)) {
-						reord_deinit_sta(rx_priv, reord_info);
-						break;
-					}
-				}
+				if (rx_priv)
+					reord_deinit_sta(rx_priv, rwnx_vif, cur);
 			}
 #endif
 
@@ -3870,8 +3868,6 @@ void apm_staloss_work_process(struct work_struct *work)
 	int error = 0;
 
 #ifdef AICWF_RX_REORDER
-	struct reord_ctrl_info *reord_info, *reord_tmp;
-	u8 *macaddr;
 	struct aicwf_rx_priv *rx_priv;
 #endif
 	struct rwnx_vif *rwnx_vif;
@@ -3904,7 +3900,7 @@ void apm_staloss_work_process(struct work_struct *work)
 	}
         if(found) {
 		cur->ps.active = false;
-        	cur->valid = false;
+		WRITE_ONCE(cur->valid, false);
 	        list_del(&cur->list);
 	}
 	spin_unlock_bh(&rwnx_hw->cb_lock);
@@ -3929,27 +3925,15 @@ void apm_staloss_work_process(struct work_struct *work)
 
 #ifdef AICWF_RX_REORDER
 #ifdef AICWF_SDIO_SUPPORT
-		rx_priv = rwnx_hw->sdiodev->rx_priv;
+		rx_priv = rwnx_hw->sdiodev ? rwnx_hw->sdiodev->rx_priv : NULL;
 #else
-		rx_priv = rwnx_hw->usbdev->rx_priv;
+		rx_priv = rwnx_hw->usbdev ? rwnx_hw->usbdev->rx_priv : NULL;
 #endif
 		if ((rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT)) {
 			BUG();//should be other function
 		} else if ((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO)) {
-			macaddr = cur->mac_addr;
-			AICWFDBG(LOGINFO, "deinit:macaddr:%x,%x,%x,%x,%x,%x\r\n", macaddr[0], macaddr[1], macaddr[2], \
-								   macaddr[3], macaddr[4], macaddr[5]);
-			//spin_lock_bh(&rx_priv->stas_reord_lock);
-			list_for_each_entry_safe(reord_info, reord_tmp,
-				&rx_priv->stas_reord_list, list) {
-				AICWFDBG(LOGINFO, "reord_mac:%x,%x,%x,%x,%x,%x\r\n", reord_info->mac_addr[0], reord_info->mac_addr[1], reord_info->mac_addr[2], \
-									   reord_info->mac_addr[3], reord_info->mac_addr[4], reord_info->mac_addr[5]);
-				if (!memcmp(reord_info->mac_addr, macaddr, 6)) {
-					reord_deinit_sta(rx_priv, reord_info);
-					break;
-				}
-			}
-			//spin_unlock_bh(&rx_priv->stas_reord_lock);
+			if (rx_priv)
+				reord_deinit_sta(rx_priv, rwnx_vif, cur);
 		}
 #endif
 
@@ -4123,7 +4107,7 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
                         !rwnx_vif->tdls_chsw_prohibited)
                         sta->tdls.chsw_allowed = true;
                     rwnx_vif->sta.tdls_sta = sta;
-                    sta->valid = true;
+		    WRITE_ONCE(sta->valid, true);
                     spin_unlock_bh(&rwnx_hw->cb_lock);
 #ifdef CONFIG_RWNX_BFMER
                     if (rwnx_hw->mod_params->bfmer)
@@ -4260,7 +4244,7 @@ static int rwnx_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
 #endif
             rwnx_vif->ap.ap_freq = ((settings->chandef).chan)->center_freq;
             sta = &rwnx_hw->sta_table[apm_start_cfm.bcmc_idx];
-            sta->valid = true;
+	    WRITE_ONCE(sta->valid, true);
             sta->aid = 0;
             sta->sta_idx = apm_start_cfm.bcmc_idx;
             sta->ch_idx = apm_start_cfm.ch_idx;
@@ -4877,7 +4861,7 @@ rwnx_cfg80211_remain_on_channel_(struct wiphy *wiphy,
             /* Save the index retrieved from LMAC */
             spin_lock_bh(&rwnx_hw->cb_lock);
             rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-            rwnx_vif->up = true;
+	    WRITE_ONCE(rwnx_vif->up, true);
             rwnx_hw->vif_started++;
             rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
             spin_unlock_bh(&rwnx_hw->cb_lock);
@@ -5691,7 +5675,7 @@ rwnx_cfg80211_tdls_oper(struct wiphy *wiphy,
         /* Ensure that we won't process PS change ind */
         spin_lock_bh(&rwnx_hw->cb_lock);
         rwnx_vif->sta.tdls_sta->ps.active = false;
-        rwnx_vif->sta.tdls_sta->valid = false;
+	WRITE_ONCE(rwnx_vif->sta.tdls_sta->valid, false);
         spin_unlock_bh(&rwnx_hw->cb_lock);
         rwnx_txq_sta_deinit(rwnx_hw, rwnx_vif->sta.tdls_sta);
         error = rwnx_send_me_sta_del(rwnx_hw, rwnx_vif->sta.tdls_sta->sta_idx, true);
@@ -6602,7 +6586,7 @@ static int rwnx_cfg80211_join_mesh(struct wiphy *wiphy, struct net_device *dev,
             rwnx_vif->user_mpm = setup->user_mpm;
 
             sta = &rwnx_hw->sta_table[mesh_start_cfm.bcmc_idx];
-            sta->valid = true;
+	    WRITE_ONCE(sta->valid, true);
             sta->aid = 0;
             sta->sta_idx = mesh_start_cfm.bcmc_idx;
             sta->ch_idx = mesh_start_cfm.ch_idx;
@@ -9126,6 +9110,10 @@ static void rwnx_cfg80211_init_cleanup(struct rwnx_hw *rwnx_hw,
 	/* Keep RX private state alive for work queued by the last callback. */
 	aicwf_usb_tx_stop(rwnx_hw->usbdev);
 	aicwf_usb_rx_quiesce(rwnx_hw->usbdev);
+#ifdef AICWF_RX_REORDER
+	if (rwnx_hw->usbdev->rx_priv)
+		reord_shutdown(rwnx_hw->usbdev->rx_priv);
+#endif
 #endif
 #ifdef CONFIG_FILTER_TCP_ACK
 	if (state->ack_initialized)
@@ -9746,6 +9734,10 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 #ifdef AICWF_USB_SUPPORT
 	aicwf_usb_tx_stop(rwnx_hw->usbdev);
 	aicwf_usb_rx_quiesce(rwnx_hw->usbdev);
+#ifdef AICWF_RX_REORDER
+	if (rwnx_hw->usbdev->rx_priv)
+		reord_shutdown(rwnx_hw->usbdev->rx_priv);
+#endif
 #endif
     rwnx_hw->fwlog_en = 0;
     rwnx_hw->scanning = 0;

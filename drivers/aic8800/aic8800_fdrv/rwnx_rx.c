@@ -1672,174 +1672,256 @@ struct recv_msdu *reord_rxframe_alloc(spinlock_t *lock, struct list_head *q)
     return rxframe;
 }
 
-struct reord_ctrl_info *reord_init_sta(struct aicwf_rx_priv* rx_priv, const u8 *mac_addr)
+/* Listed/retired objects own a reference until callback cleanup is complete. */
+static void reord_sta_put(struct reord_ctrl_info *info)
 {
-    u8 i = 0;
-    struct reord_ctrl *preorder_ctrl = NULL;
-    struct reord_ctrl_info *reord_info;
-#ifdef AICWF_SDIO_SUPPORT
-    struct aicwf_bus *bus_if = rx_priv->sdiodev->bus_if;
-#else
-    struct aicwf_bus *bus_if = rx_priv->usbdev->bus_if;
-#endif
-
-    if (bus_if->state == BUS_DOWN_ST || rx_priv == NULL) {
-        printk("bad stat!\n");
-        return NULL;
-    }
-
-    AICWFDBG(LOGINFO, "reord_init_sta:%pM\n", mac_addr);
-    reord_info = kmalloc(sizeof(struct reord_ctrl_info), GFP_ATOMIC);
-    if (!reord_info)
-        return NULL;
-
-    memcpy(reord_info->mac_addr, mac_addr, ETH_ALEN);
-    for (i=0; i < 8; i++) {
-        preorder_ctrl = &reord_info->preorder_ctrl[i];
-        preorder_ctrl->enable = true;
-        preorder_ctrl->ind_sn = 0xffff;
-        preorder_ctrl->wsize_b = AICWF_REORDER_WINSIZE;
-        preorder_ctrl->rx_priv= rx_priv;
-        INIT_LIST_HEAD(&preorder_ctrl->reord_list);
-        spin_lock_init(&preorder_ctrl->reord_list_lock);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
-        init_timer(&preorder_ctrl->reord_timer);
-        preorder_ctrl->reord_timer.data = (ulong) preorder_ctrl;
-        preorder_ctrl->reord_timer.function = reord_timeout_handler;
-#else
-        timer_setup(&preorder_ctrl->reord_timer, reord_timeout_handler, 0);
-#endif
-        INIT_WORK(&preorder_ctrl->reord_timer_work, reord_timeout_worker);
-    }
-
-    return reord_info;
+	if (refcount_dec_and_test(&info->refs)) {
+		dev_put(info->ndev);
+		kfree(info);
+	}
 }
 
-int reord_flush_tid(struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u8 tid)
+static void reord_cleanup_work(struct work_struct *work)
 {
-    struct reord_ctrl_info *reord_info;
-    struct reord_ctrl *preorder_ctrl;
-    struct rwnx_vif *rwnx_vif = (struct rwnx_vif *)rx_priv->rwnx_vif;
-    struct ethhdr *eh = (struct ethhdr *)(skb->data);
-    u8 *mac;
-    unsigned long flags;
-    u8 found = 0;
-    struct list_head *phead, *plist;
-    struct recv_msdu *prframe;
-    int ret;
+	struct aicwf_rx_priv *rx_priv = container_of(work, struct aicwf_rx_priv,
+						   reord_cleanup_work);
+	struct reord_ctrl_info *info;
+	unsigned int i;
+
+	for (;;) {
+		spin_lock_bh(&rx_priv->stas_reord_lock);
+		if (list_empty(&rx_priv->reord_retired)) {
+			spin_unlock_bh(&rx_priv->stas_reord_lock);
+			break;
+		}
+		info = list_first_entry(&rx_priv->reord_retired,
+					struct reord_ctrl_info, list);
+		list_del_init(&info->list);
+		spin_unlock_bh(&rx_priv->stas_reord_lock);
+
+		for (i = 0; i < ARRAY_SIZE(info->preorder_ctrl); i++) {
+			struct reord_ctrl *ctrl = &info->preorder_ctrl[i];
+			struct recv_msdu *frame, *next;
+
+			/* Admission and rearming were closed before retirement. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+			timer_delete_sync(&ctrl->reord_timer);
+#else
+			del_timer_sync(&ctrl->reord_timer);
+#endif
+			cancel_work_sync(&ctrl->reord_timer_work);
+			spin_lock_bh(&ctrl->reord_list_lock);
+			list_for_each_entry_safe(frame, next, &ctrl->reord_list,
+						 reord_pending_list) {
+				list_del_init(&frame->reord_pending_list);
+				reord_rxframe_release(rx_priv, frame);
+			}
+			spin_unlock_bh(&ctrl->reord_list_lock);
+		}
+		reord_sta_put(info);
+	}
+}
+
+void reord_init(struct aicwf_rx_priv *rx_priv)
+{
+	spin_lock_init(&rx_priv->stas_reord_lock);
+	INIT_LIST_HEAD(&rx_priv->stas_reord_list);
+	INIT_LIST_HEAD(&rx_priv->reord_retired);
+	rx_priv->reord_stopping = false;
+	INIT_WORK(&rx_priv->reord_cleanup_work, reord_cleanup_work);
+}
+
+static struct reord_ctrl_info *reord_init_sta(struct aicwf_rx_priv *rx_priv,
+					     struct rwnx_vif *vif,
+					     struct rwnx_sta *peer,
+					     const u8 *mac_addr)
+{
+	struct reord_ctrl_info *info;
+	unsigned int i;
+
+	info = kzalloc(sizeof(*info), GFP_ATOMIC);
+	if (!info)
+		return NULL;
+	refcount_set(&info->refs, 1);
+	info->ndev = vif->ndev;
+	info->vif = vif;
+	info->peer = peer;
+	dev_hold(info->ndev);
+	ether_addr_copy(info->mac_addr, mac_addr);
+	INIT_LIST_HEAD(&info->list);
+	for (i = 0; i < ARRAY_SIZE(info->preorder_ctrl); i++) {
+		struct reord_ctrl *ctrl = &info->preorder_ctrl[i];
+
+		ctrl->owner = info;
+		ctrl->rx_priv = rx_priv;
+		ctrl->enable = true;
+		ctrl->ind_sn = 0xffff;
+		ctrl->wsize_b = AICWF_REORDER_WINSIZE;
+		spin_lock_init(&ctrl->reord_list_lock);
+		INIT_LIST_HEAD(&ctrl->reord_list);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+		init_timer(&ctrl->reord_timer);
+		ctrl->reord_timer.data = (unsigned long)ctrl;
+		ctrl->reord_timer.function = reord_timeout_handler;
+#else
+		timer_setup(&ctrl->reord_timer, reord_timeout_handler, 0);
+#endif
+		INIT_WORK(&ctrl->reord_timer_work, reord_timeout_worker);
+	}
+	return info;
+}
+
+/* Returned pointers stay owned until put, including after registry deletion. */
+static struct reord_ctrl_info *reord_sta_get(struct aicwf_rx_priv *rx_priv,
+					    struct rwnx_vif *vif,
+					    const u8 *mac,
+					    struct rwnx_sta *peer, bool create)
+{
+	struct reord_ctrl_info *info, *found = NULL;
+
+	spin_lock_bh(&rx_priv->stas_reord_lock);
+	if (rx_priv->reord_stopping || !READ_ONCE(vif->up) || !vif->ndev ||
+	    (create && (!peer || !READ_ONCE(peer->valid))))
+		goto out;
+	list_for_each_entry(info, &rx_priv->stas_reord_list, list) {
+		if (info->vif == vif && ether_addr_equal(info->mac_addr, mac) &&
+		    (!create || info->peer == peer)) {
+			found = info;
+			break;
+		}
+	}
+	if (!found && create) {
+		found = reord_init_sta(rx_priv, vif, peer, mac);
+		if (found)
+			list_add_tail(&found->list, &rx_priv->stas_reord_list);
+	}
+	if (found)
+		refcount_inc(&found->refs);
+out:
+	spin_unlock_bh(&rx_priv->stas_reord_lock);
+	return found;
+}
+
+/* Registry -> TID is the only nested order; callback joins hold neither lock. */
+static void reord_retire_locked(struct aicwf_rx_priv *rx_priv,
+				struct reord_ctrl_info *info)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&rx_priv->stas_reord_lock);
+	WRITE_ONCE(info->dying, true);
+	for (i = 0; i < ARRAY_SIZE(info->preorder_ctrl); i++) {
+		struct reord_ctrl *ctrl = &info->preorder_ctrl[i];
+
+		spin_lock_bh(&ctrl->reord_list_lock);
+		ctrl->enable = false;
+		ctrl->generation++;
+		spin_unlock_bh(&ctrl->reord_list_lock);
+	}
+	list_move_tail(&info->list, &rx_priv->reord_retired);
+	/* Publish reclamation before dropping the lock that shutdown acquires. */
+	schedule_work(&rx_priv->reord_cleanup_work);
+}
+
+/* Atomic-safe: callers retain no raw registry pointers and never join work. */
+void reord_deinit_sta(struct aicwf_rx_priv *rx_priv, struct rwnx_vif *vif,
+			struct rwnx_sta *peer)
+{
+	struct reord_ctrl_info *info, *next;
+
+	if (!rx_priv)
+		return;
+	spin_lock_bh(&rx_priv->stas_reord_lock);
+	list_for_each_entry_safe(info, next, &rx_priv->stas_reord_list, list) {
+		if (info->vif == vif && (!peer || info->peer == peer))
+			reord_retire_locked(rx_priv, info);
+	}
+	spin_unlock_bh(&rx_priv->stas_reord_lock);
+}
+
+void reord_stop(struct aicwf_rx_priv *rx_priv)
+{
+	struct reord_ctrl_info *info, *next;
+
+	if (!rx_priv)
+		return;
+	spin_lock_bh(&rx_priv->stas_reord_lock);
+	rx_priv->reord_stopping = true;
+	list_for_each_entry_safe(info, next, &rx_priv->stas_reord_list, list)
+		reord_retire_locked(rx_priv, info);
+	spin_unlock_bh(&rx_priv->stas_reord_lock);
+}
+
+/* Process context; RX producers must stop before their storage is released. */
+void reord_shutdown(struct aicwf_rx_priv *rx_priv)
+{
+	if (!rx_priv)
+		return;
+	reord_stop(rx_priv);
+	flush_work(&rx_priv->reord_cleanup_work);
+}
+
+/* After vif->up is cleared, before netdev unregister waits for references. */
+void reord_vif_stop(struct aicwf_rx_priv *rx_priv, struct rwnx_vif *vif)
+{
+	if (!rx_priv)
+		return;
+	reord_deinit_sta(rx_priv, vif, NULL);
+	flush_work(&rx_priv->reord_cleanup_work);
+}
+
+int reord_flush_tid(struct aicwf_rx_priv *rx_priv, struct rwnx_vif *vif,
+		    struct sk_buff *skb, u8 tid)
+{
+	struct reord_ctrl_info *info;
+	struct reord_ctrl *ctrl;
+	struct ethhdr *eth;
+	struct recv_msdu *frame;
+	const u8 *mac;
 
 	if (tid >= ARRAY_SIZE(((struct reord_ctrl_info *)0)->preorder_ctrl) ||
 	    !pskb_may_pull(skb, ETH_HLEN))
 		return -EINVAL;
-	eh = (struct ethhdr *)skb->data;
-
-    if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT))
-        mac = eh->h_dest;
-    else if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO))
-        mac = eh->h_source;
-    else {
-        printk("error mode:%d!\n", rwnx_vif->wdev.iftype);
-	return -EINVAL;
-    }
-
-    spin_lock_bh(&rx_priv->stas_reord_lock);
-    list_for_each_entry(reord_info, &rx_priv->stas_reord_list, list) {
-        if (!memcmp(mac, reord_info->mac_addr, ETH_ALEN)) {
-            found = 1;
-            preorder_ctrl = &reord_info->preorder_ctrl[tid];
-            break;
-        }
-    }
-    if (!found) {
-        spin_unlock_bh(&rx_priv->stas_reord_lock);
-        return 0;
-    }
-    spin_unlock_bh(&rx_priv->stas_reord_lock);
-
-    if(preorder_ctrl->enable == false)
-        return 0;
-    spin_lock_irqsave(&preorder_ctrl->reord_list_lock, flags);
-    phead = &preorder_ctrl->reord_list;
-    while (1) {
-        if (list_empty(phead)) {
-            break;
-        }
-        plist = phead->next;
-        prframe = list_entry(plist, struct recv_msdu, reord_pending_list);
-	list_del_init(&prframe->reord_pending_list);
-        reord_single_frame_ind(rx_priv, prframe);
-    }
-
-	AICWFDBG(LOGINFO, "flush:tid=%d", tid);
-    preorder_ctrl->enable = false;
-    spin_unlock_irqrestore(&preorder_ctrl->reord_list_lock, flags);
-    if (timer_pending(&preorder_ctrl->reord_timer)) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-	    ret = timer_delete_sync(&preorder_ctrl->reord_timer);
+	eth = (void *)skb->data;
+	if (RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_STATION ||
+	    RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_P2P_CLIENT)
+		mac = eth->h_dest;
+	else if (RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP ||
+		 RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_P2P_GO)
+		mac = eth->h_source;
+	else
+		return -EINVAL;
+	info = reord_sta_get(rx_priv, vif, mac, NULL, false);
+	if (!info)
+		return 0;
+	ctrl = &info->preorder_ctrl[tid];
+	spin_lock_bh(&ctrl->reord_list_lock);
+	if (READ_ONCE(info->dying))
+		goto unlock;
+	ctrl->enable = false;
+	ctrl->generation++;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	timer_delete(&ctrl->reord_timer);
 #else
-        ret = del_timer_sync(&preorder_ctrl->reord_timer);
+	del_timer(&ctrl->reord_timer);
 #endif
-    }
-    cancel_work_sync(&preorder_ctrl->reord_timer_work);
-
-    return 0;
-}
-
-void reord_deinit_sta(struct aicwf_rx_priv* rx_priv, struct reord_ctrl_info *reord_info)
-{
-    u8 i = 0;
-    //unsigned long flags;
-    struct reord_ctrl *preorder_ctrl = NULL;
-    int ret;
-
-    if (rx_priv == NULL) {
-        txrx_err("bad rx_priv!\n");
-        return;
-    }
-
-	AICWFDBG(LOGINFO, "%s\n", __func__);
-
-    for (i=0; i < 8; i++) {
-        struct recv_msdu *req, *next;
-        preorder_ctrl = &reord_info->preorder_ctrl[i];
-		if(preorder_ctrl->enable){
-			preorder_ctrl->enable = false;
-	        if (timer_pending(&preorder_ctrl->reord_timer)) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-	           ret = timer_delete_sync(&preorder_ctrl->reord_timer);
-#else
-	            ret = del_timer_sync(&preorder_ctrl->reord_timer);
-#endif
-	        }
-	        cancel_work_sync(&preorder_ctrl->reord_timer_work);
-		}
-
-        spin_lock_bh(&preorder_ctrl->reord_list_lock);
-        list_for_each_entry_safe(req, next, &preorder_ctrl->reord_list, reord_pending_list) {
-            list_del_init(&req->reord_pending_list);
-		reord_rxframe_release(rx_priv, req);
-        }
-
-#if (LINUX_VERSION_CODE <= KERNEL_VERSION(6, 18, 0))
-		AICWFDBG(LOGINFO, "reord dinit in_irq():%d in_atomic:%d in_softirq:%d\r\n", (int)in_irq()
-#else
-		AICWFDBG(LOGINFO, "reord dinit in_irq():%d in_atomic:%d in_softirq:%d\r\n", (int)in_hardirq()
-#endif
-			,(int)in_atomic(), (int)in_softirq());
-        spin_unlock_bh(&preorder_ctrl->reord_list_lock);
-    }
-
-    spin_lock_bh(&rx_priv->stas_reord_lock);
-    list_del(&reord_info->list);
-    spin_unlock_bh(&rx_priv->stas_reord_lock);
-    kfree(reord_info);
+	while (!list_empty(&ctrl->reord_list)) {
+		frame = list_first_entry(&ctrl->reord_list, struct recv_msdu,
+					reord_pending_list);
+		list_del_init(&frame->reord_pending_list);
+		reord_single_frame_ind(rx_priv, frame);
+	}
+unlock:
+	spin_unlock_bh(&ctrl->reord_list_lock);
+	reord_sta_put(info);
+	return 0;
 }
 
 int reord_single_frame_ind(struct aicwf_rx_priv *rx_priv, struct recv_msdu *prframe)
 {
     struct list_head *rxframes_freequeue = NULL;
     struct sk_buff *skb = NULL;
-    struct rwnx_vif *rwnx_vif = (struct rwnx_vif *)rx_priv->rwnx_vif;
+    struct rwnx_vif *rwnx_vif = prframe->vif;
     struct sk_buff_head list;
     struct sk_buff *rx_skb;
 
@@ -2057,198 +2139,159 @@ int reorder_timeout = REORDER_UPDATE_TIME;
 module_param(reorder_timeout, int, 0660);
 
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
-void reord_timeout_handler (ulong data)
+/* All timeout state and timer arms are serialized by the TID lock. */
+static bool reord_ctrl_active(struct reord_ctrl *ctrl)
+{
+	return ctrl->enable && !READ_ONCE(ctrl->owner->dying) &&
+		READ_ONCE(ctrl->owner->vif->up) && READ_ONCE(ctrl->owner->peer->valid);
+}
+
+static void reord_timer_arm(struct reord_ctrl *ctrl)
+{
+	lockdep_assert_held(&ctrl->reord_list_lock);
+	ctrl->deadline = jiffies + msecs_to_jiffies(max(reorder_timeout, 1));
+	mod_timer(&ctrl->reord_timer, ctrl->deadline);
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+void reord_timeout_handler(ulong data)
 #else
-void reord_timeout_handler (struct timer_list *t)
+void reord_timeout_handler(struct timer_list *t)
 #endif
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,14,0)
-	struct reord_ctrl *preorder_ctrl = (struct reord_ctrl *)data;
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(6,16,0)
-	struct reord_ctrl *preorder_ctrl = from_timer(preorder_ctrl, t, reord_timer);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+	struct reord_ctrl *ctrl = (struct reord_ctrl *)data;
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+	struct reord_ctrl *ctrl = from_timer(ctrl, t, reord_timer);
 #else
-	struct reord_ctrl *preorder_ctrl = timer_container_of(preorder_ctrl, t, reord_timer);
+	struct reord_ctrl *ctrl = timer_container_of(ctrl, t, reord_timer);
 #endif
 
-	AICWFDBG(LOGTRACE, "%s Enter \r\n", __func__);
-
-
-	if (g_rwnx_plat->usbdev->state == USB_DOWN_ST) {
-        usb_err("bus is down\n");
-        return;
+	spin_lock_bh(&ctrl->reord_list_lock);
+	if (!reord_ctrl_active(ctrl))
+		goto out;
+	/* A prior callback may have waited while flush installed a new deadline. */
+	if (time_before(jiffies, ctrl->deadline)) {
+		mod_timer(&ctrl->reord_timer, ctrl->deadline);
+		goto out;
 	}
-#if 0//AIDEN
-    struct aicwf_rx_priv *rx_priv = preorder_ctrl->rx_priv;
-
-    if (reord_rxframes_process(rx_priv, preorder_ctrl, true)==true) {
-        mod_timer(&preorder_ctrl->reord_timer, jiffies + msecs_to_jiffies(reorder_timeout/*REORDER_UPDATE_TIME*/));
-    }
-#endif
-
-    if(!work_pending(&preorder_ctrl->reord_timer_work))
-        schedule_work(&preorder_ctrl->reord_timer_work);
-
+	if (ctrl->work_armed) {
+		reord_timer_arm(ctrl);
+		goto out;
+	}
+	ctrl->work_armed = true;
+	ctrl->work_generation = ctrl->generation;
+	schedule_work(&ctrl->reord_timer_work);
+out:
+	spin_unlock_bh(&ctrl->reord_list_lock);
 }
 
 void reord_timeout_worker(struct work_struct *work)
 {
-    struct reord_ctrl *preorder_ctrl = container_of(work, struct reord_ctrl, reord_timer_work);
-    struct aicwf_rx_priv *rx_priv = preorder_ctrl->rx_priv;
+	struct reord_ctrl *ctrl = container_of(work, struct reord_ctrl,
+					      reord_timer_work);
+	struct aicwf_rx_priv *rx_priv = ctrl->rx_priv;
 
-	spin_lock_bh(&preorder_ctrl->reord_list_lock);
-#if 1//AIDEN
-	if (reord_rxframes_process(rx_priv, preorder_ctrl, true)==true) {
-		mod_timer(&preorder_ctrl->reord_timer, jiffies + msecs_to_jiffies(reorder_timeout/*REORDER_UPDATE_TIME*/));
+	spin_lock_bh(&ctrl->reord_list_lock);
+	if (reord_ctrl_active(ctrl) && ctrl->work_generation == ctrl->generation) {
+		reord_rxframes_process(rx_priv, ctrl, true);
+		reord_rxframes_ind(rx_priv, ctrl);
 	}
-#endif
-
-    reord_rxframes_ind(rx_priv, preorder_ctrl);
-	spin_unlock_bh(&preorder_ctrl->reord_list_lock);
-
-    return ;
+	/* A stale worker never forces delivery from a new reorder generation. */
+	ctrl->work_armed = false;
+	if (reord_ctrl_active(ctrl) && !list_empty(&ctrl->reord_list))
+		reord_timer_arm(ctrl);
+	spin_unlock_bh(&ctrl->reord_list_lock);
+	/* No ctrl access: the same work may now be queued for another generation. */
 }
 
-int reord_process_unit(struct recv_msdu *pframe, struct aicwf_rx_priv *rx_priv, struct sk_buff *skb, u16 seq_num, u8 tid, u8 forward, u8 is_amsdu)
+int reord_process_unit(struct recv_msdu *frame, struct aicwf_rx_priv *rx_priv,
+		       struct rwnx_vif *vif, struct rwnx_sta *peer,
+		       struct sk_buff *skb, u16 seq_num, u8 tid,
+		       u8 forward, u8 is_amsdu)
 {
-    int ret=0;
-    u8 *mac;
-    struct reord_ctrl *preorder_ctrl;
-    struct reord_ctrl_info *reord_info;
-    struct rwnx_vif *rwnx_vif = (struct rwnx_vif *)rx_priv->rwnx_vif;
-	struct ethhdr *eh;
+	struct reord_ctrl_info *info;
+	struct reord_ctrl *ctrl;
+	struct ethhdr *eth;
+	const u8 *mac;
 	u8 payload_byte;
+	int ret = 0;
 
-    #if 0
-    struct recv_msdu *pframe;
-    pframe = reord_rxframe_alloc(&rx_priv->freeq_lock, &rx_priv->rxframes_freequeue);
-    if (!pframe) {
-        dev_kfree_skb(skb);
-        return -1;
-    }
-    #endif
-
-    INIT_LIST_HEAD(&pframe->reord_pending_list);
-    pframe->seq_num = seq_num;
-    pframe->tid = tid;
-    pframe->rx_data = skb->data;
-    //pframe->len = skb->len;
-    pframe->pkt = skb;
-    pframe->forward = forward;
-    pframe->is_amsdu = is_amsdu;
-
+	INIT_LIST_HEAD(&frame->reord_pending_list);
+	frame->vif = vif;
+	frame->seq_num = seq_num;
+	frame->tid = tid;
+	frame->rx_data = skb->data;
+	frame->pkt = skb;
+	frame->forward = forward;
+	frame->is_amsdu = is_amsdu;
 	if (tid >= ARRAY_SIZE(((struct reord_ctrl_info *)0)->preorder_ctrl) ||
 	    !pskb_may_pull(skb, ETH_HLEN)) {
 		ret = -EINVAL;
 		goto fail;
 	}
-	eh = (struct ethhdr *)skb->data;
-
-    if (ntohs(eh->h_proto) == ETH_P_PAE)
-        return reord_single_frame_ind(rx_priv, pframe);
-
-    if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT))
-        mac = eh->h_dest;
-    else if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO))
-        mac = eh->h_source;
-    else {
-	ret = -EINVAL;
-	goto fail;
-    }
-
-    spin_lock_bh(&rx_priv->stas_reord_lock);
-    list_for_each_entry(reord_info, &rx_priv->stas_reord_list, list) {
-        if (!memcmp(mac, reord_info->mac_addr, ETH_ALEN)) {
-            preorder_ctrl = &reord_info->preorder_ctrl[pframe->tid];
-            break;
-        }
-    }
-
-
-    if (&reord_info->list == &rx_priv->stas_reord_list) {//first time???
-        reord_info = reord_init_sta(rx_priv, mac);
-        //reord_info has 8 preorder_ctrl,
-        //There is a one-to-one matched preorder_ctrl and tid
-        if (!reord_info) {
-            spin_unlock_bh(&rx_priv->stas_reord_lock);
-            reord_single_frame_ind(rx_priv, pframe);
-            return -1;
-        }
-        list_add_tail(&reord_info->list, &rx_priv->stas_reord_list);
-        preorder_ctrl = &reord_info->preorder_ctrl[pframe->tid];
-    } else {
-        if(preorder_ctrl->enable == false) {
-            preorder_ctrl->enable = true;
-            preorder_ctrl->ind_sn = 0xffff;
-            preorder_ctrl->wsize_b = AICWF_REORDER_WINSIZE;
-            preorder_ctrl->rx_priv= rx_priv;
-        }
-    }
-    spin_unlock_bh(&rx_priv->stas_reord_lock);
-
-    if (preorder_ctrl->enable == false) {
-        preorder_ctrl->ind_sn = pframe->seq_num;
-        spin_lock_bh(&preorder_ctrl->reord_list_lock);//AIDEN
-        reord_single_frame_ind(rx_priv, pframe);
-        spin_unlock_bh(&preorder_ctrl->reord_list_lock);//AIDEN
-        preorder_ctrl->ind_sn = (preorder_ctrl->ind_sn + 1)%4096;
-        return 0;
-    }
-
-    spin_lock_bh(&preorder_ctrl->reord_list_lock);
-	if (reord_need_check(preorder_ctrl, pframe->seq_num)) {
-#if 1
-		if (!skb_copy_bits(skb, 42, &payload_byte, 1) &&
-		    payload_byte == 0x80) {
-			if(pframe->seq_num == preorder_ctrl->ind_sn){
-				//printk("%s pframe->seq_num1:%d \r\n", __func__, pframe->seq_num);
-	        	reord_single_frame_ind(rx_priv, pframe);//not need to reorder
-			}else{
-				//printk("%s free pframe->seq_num:%d \r\n", __func__, pframe->seq_num);
-				reord_rxframe_release(rx_priv, pframe);
-			}
-		}else{
-			//printk("%s pframe->seq_num2:%d \r\n", __func__, pframe->seq_num);
-			reord_single_frame_ind(rx_priv, pframe);//not need to reorder
-		}
+	eth = (void *)skb->data;
+	if (ntohs(eth->h_proto) == ETH_P_PAE)
+		return reord_single_frame_ind(rx_priv, frame);
+	if (RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_STATION ||
+	    RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_P2P_CLIENT)
+		mac = eth->h_dest;
+	else if (RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP ||
+		 RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_P2P_GO)
+		mac = eth->h_source;
+	else {
+		ret = -EINVAL;
+		goto fail;
+	}
+	info = reord_sta_get(rx_priv, vif, mac, peer, true);
+	if (!info) {
+		ret = -ENOENT;
+		goto fail;
+	}
+	ctrl = &info->preorder_ctrl[tid];
+	spin_lock_bh(&ctrl->reord_list_lock);
+	if (READ_ONCE(info->dying) || !READ_ONCE(peer->valid) || !READ_ONCE(vif->up)) {
+		ret = -ESHUTDOWN;
+		goto unlock_fail;
+	}
+	if (!ctrl->enable) {
+		ctrl->enable = true;
+		ctrl->generation++;
+		ctrl->ind_sn = 0xffff;
+	}
+	if (reord_need_check(ctrl, frame->seq_num)) {
+		if (!skb_copy_bits(skb, 42, &payload_byte, 1) && payload_byte == 0x80 &&
+		    frame->seq_num != ctrl->ind_sn)
+			reord_rxframe_release(rx_priv, frame);
+		else
+			reord_single_frame_ind(rx_priv, frame);
+		goto unlock;
+	}
+	if (reord_rxframe_enqueue(ctrl, frame)) {
+		ret = -EALREADY;
+		goto unlock_fail;
+	}
+	if (reord_rxframes_process(rx_priv, ctrl, false)) {
+		if (!timer_pending(&ctrl->reord_timer))
+			reord_timer_arm(ctrl);
+	} else {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+		timer_delete(&ctrl->reord_timer);
 #else
-        reord_single_frame_ind(rx_priv, pframe);//not need to reor
+		del_timer(&ctrl->reord_timer);
 #endif
-
-        spin_unlock_bh(&preorder_ctrl->reord_list_lock);
-		return 0;
-    }
-
-    if (reord_rxframe_enqueue(preorder_ctrl, pframe)) {
-        spin_unlock_bh(&preorder_ctrl->reord_list_lock);
-        goto fail;
-    }
-
-    if (reord_rxframes_process(rx_priv, preorder_ctrl, false) == true) {
-        if (!timer_pending(&preorder_ctrl->reord_timer)) {//if this timer not countdown, mod_timer timer to start count down
-            ret = mod_timer(&preorder_ctrl->reord_timer, jiffies + msecs_to_jiffies(reorder_timeout/*REORDER_UPDATE_TIME*/));
-        }
-    } else {
-		if(timer_pending(&preorder_ctrl->reord_timer)) {
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-            ret = timer_delete(&preorder_ctrl->reord_timer);
-#else
-            ret = del_timer(&preorder_ctrl->reord_timer);
-#endif
-		}
-    }
-
-	reord_rxframes_ind(rx_priv, preorder_ctrl);
-
-    spin_unlock_bh(&preorder_ctrl->reord_list_lock);
-
-
-
-    return 0;
-
+	}
+	reord_rxframes_ind(rx_priv, ctrl);
+unlock:
+	spin_unlock_bh(&ctrl->reord_list_lock);
+	reord_sta_put(info);
+	return ret;
+unlock_fail:
+	spin_unlock_bh(&ctrl->reord_list_lock);
+	reord_sta_put(info);
 fail:
-	reord_rxframe_release(rx_priv, pframe);
-    return ret;
+	reord_rxframe_release(rx_priv, frame);
+	return ret;
 }
 
 int reord_need_check(struct reord_ctrl *preorder_ctrl, u16 seq_num)
@@ -2561,6 +2604,9 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
     int msdu_offset = sizeof(struct hw_rxhdr) + 2;
     u16_l status = 0;
     struct aicwf_rx_priv *rx_priv_tmp;
+#ifdef AICWF_RX_REORDER
+	struct rwnx_sta *reord_peer = NULL;
+#endif
     u8 hdr_len = 24;
     u8 ra[MAC_ADDR_LEN] = {0};
     u8 ta[MAC_ADDR_LEN] = {0};
@@ -2911,8 +2957,10 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
             skb->priority = 256 + tid;//hw_rxhdr->flags_user_prio;
 
 #ifdef AICWF_RX_REORDER
+		if (hw_rxhdr->flags_sta_idx != RWNX_INVALID_STA)
+			reord_peer = &rwnx_hw->sta_table[hw_rxhdr->flags_sta_idx];
             rx_priv_tmp = rx_priv;
-            rx_priv_tmp->rwnx_vif = (void *)rwnx_vif;
+
 
     	    if( (rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT) ){
                 if(is_qos && hw_rxhdr->flags_need_reord){
@@ -2926,9 +2974,11 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
     				pframe->is_ap_reord = 0;
     				pframe->ap_fwd_cnt = 0;
     				pframe->ap_resend_cnt = 0;
-    				reord_process_unit(pframe, (struct aicwf_rx_priv *)rx_priv, skb, seq_num, tid, 1, hw_rxhdr->flags_is_amsdu);
+				reord_process_unit(pframe, rx_priv, rwnx_vif, reord_peer,
+						   skb, seq_num, tid, 1,
+						   hw_rxhdr->flags_is_amsdu);
                 } else if (is_qos  && !hw_rxhdr->flags_need_reord) {
-                    reord_flush_tid((struct aicwf_rx_priv *)rx_priv, skb, tid);
+		    reord_flush_tid(rx_priv, rwnx_vif, skb, tid);
 			rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb, hw_rxhdr);
                 } else {
 			rwnx_rx_data_skb(rwnx_hw, rwnx_vif, skb, hw_rxhdr);
@@ -3042,7 +3092,7 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 							}
 						}
 					} else if (is_qos  && !flags_need_reord) {
-                        reord_flush_tid((struct aicwf_rx_priv *)rx_priv, rx_skb, tid);
+			reord_flush_tid(rx_priv, rwnx_vif, rx_skb, tid);
                         rwnx_rx_data_skb_forward(rwnx_hw, rwnx_vif, rx_skb);
                     } else
                         rwnx_rx_data_skb_forward(rwnx_hw, rwnx_vif, rx_skb);
@@ -3076,7 +3126,7 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 						}
 					else if (is_qos  && !flags_need_reord) {
 						/* Flush borrows rx_skb, including on errors. */
-						reord_flush_tid(rx_priv, rx_skb, tid);
+						reord_flush_tid(rx_priv, rwnx_vif, rx_skb, tid);
 						dev_kfree_skb(rx_skb);
 						} else {
 							dev_kfree_skb(rx_skb);
@@ -3090,7 +3140,8 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 			/* The last dequeued subframe may already be consumed. */
 			rx_skb = pframe->first_fwd_skb ? pframe->first_fwd_skb :
 				pframe->first_resend_skb;
-					reord_process_unit(pframe, (struct aicwf_rx_priv *)rx_priv, rx_skb, seq_num, tid, 0, 0);
+					reord_process_unit(pframe, rx_priv, rwnx_vif, reord_peer,
+							   rx_skb, seq_num, tid, 0, 0);
 				}
 			}
 #else

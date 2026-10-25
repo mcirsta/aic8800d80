@@ -11,6 +11,7 @@
 
 #include <linux/skbuff.h>
 #include <linux/sched.h>
+#include <linux/refcount.h>
 #include "ipc_shared.h"
 #include "aicwf_rx_prealloc.h"
 #ifdef AICWF_SDIO_SUPPORT
@@ -162,6 +163,7 @@ struct aicwf_tx_priv {
 #define SN_EQUAL(a, b)          (a == b)
 
 struct reord_ctrl {
+	struct reord_ctrl_info *owner;
     struct aicwf_rx_priv *rx_priv;
     u8 enable;
     u16 ind_sn;
@@ -170,15 +172,25 @@ struct reord_ctrl {
     struct list_head reord_list;
     struct timer_list reord_timer;
     struct work_struct reord_timer_work;
+	u32 generation;
+	u32 work_generation;
+	bool work_armed;
+	unsigned long deadline;
 };
 
 struct reord_ctrl_info {
+	refcount_t refs;
+	bool dying;
+	struct net_device *ndev;
+	struct rwnx_vif *vif;
+	struct rwnx_sta *peer;
     u8 mac_addr[6];
     struct reord_ctrl preorder_ctrl[8];
     struct list_head list;
 };
 
 struct recv_msdu {
+	struct rwnx_vif *vif;
     struct sk_buff  *pkt;
     u8 tid;
     u8 forward;
@@ -209,7 +221,6 @@ struct aicwf_rx_priv {
     struct aic_usb_dev *usbdev;
 #endif
 
-    void *rwnx_vif;
     atomic_t rx_cnt;
     u32 data_len;
     spinlock_t rxqlock;
@@ -244,6 +255,9 @@ struct aicwf_rx_priv {
     struct list_head rxframes_freequeue;
     struct list_head stas_reord_list;
     spinlock_t stas_reord_lock;
+	struct list_head reord_retired;
+	struct work_struct reord_cleanup_work;
+	bool reord_stopping;
     struct recv_msdu *recv_frames;
 #endif
 
