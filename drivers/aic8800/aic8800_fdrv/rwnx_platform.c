@@ -642,7 +642,9 @@ static int rwnx_load_firmware(u32 **fw_buf, const char *name,
 {
 	const struct firmware *fw;
 	const char *directory;
-	char prefix[FW_PATH_MAX_LEN], fw_name[FW_PATH_MAX_LEN];
+	/* Older loader modules copy the prefix without its trailing NUL. */
+	char prefix[FW_PATH_MAX_LEN] = {0};
+	char fw_name[FW_PATH_MAX_LEN];
 	void *buffer;
 	MD5_CTX md5;
 	unsigned char decrypt[16];
