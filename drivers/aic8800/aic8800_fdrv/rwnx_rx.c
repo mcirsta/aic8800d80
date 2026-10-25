@@ -1147,8 +1147,9 @@ static void rwnx_rx_add_rtap_hdr(struct rwnx_hw* rwnx_hw,
 
     // IEEE80211_RADIOTAP_FLAGS
     rtap->it_present |= cpu_to_le32(1 << IEEE80211_RADIOTAP_FLAGS);
-    if (hwvect && (!hwvect->frm_successful_rx))
-        *pos |= IEEE80211_RADIOTAP_F_BADFCS;
+	/* General RX failure is not evidence of a failed frame checksum. */
+	if (hwvect && hwvect->fcs_err)
+		*pos |= IEEE80211_RADIOTAP_F_BADFCS;
     if (!rxvect->pre_type
             && (rxvect->format_mod <= FORMATMOD_NON_HT_DUP_OFDM))
         *pos |= IEEE80211_RADIOTAP_F_SHORTPRE;
