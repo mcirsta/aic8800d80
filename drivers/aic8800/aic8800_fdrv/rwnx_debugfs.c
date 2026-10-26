@@ -426,6 +426,7 @@ static ssize_t rwnx_dbgfs_txq_read(struct file *file ,
                                    size_t count, loff_t *ppos)
 {
     struct rwnx_hw *rwnx_hw = file->private_data;
+	int srcu_idx;
     struct rwnx_vif *vif;
     char *buf;
     int idx, res;
@@ -452,8 +453,11 @@ static ssize_t rwnx_dbgfs_txq_read(struct file *file ,
     idx += res;
     bufsz -= res;
 
-    //spin_lock_bh(&rwnx_hw->tx_lock);
-    list_for_each_entry(vif, &rwnx_hw->vifs, list) {
+	srcu_idx = srcu_read_lock(&rwnx_hw->vif_readers);
+    list_for_each_entry_rcu(vif, &rwnx_hw->vifs, list,
+				   srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+		if (!smp_load_acquire(&vif->up))
+			continue;
         res = scnprintf(&buf[idx], bufsz, "\n"VIF_SEP);
         idx += res;
         bufsz -= res;
@@ -464,7 +468,7 @@ static ssize_t rwnx_dbgfs_txq_read(struct file *file ,
         idx += res;
         bufsz -= res;
     }
-    //spin_unlock_bh(&rwnx_hw->tx_lock);
+	srcu_read_unlock(&rwnx_hw->vif_readers, srcu_idx);
 
     read = simple_read_from_buffer(user_buf, count, ppos, buf, idx);
     kfree(buf);
@@ -726,6 +730,7 @@ static ssize_t rwnx_dbgfs_oppps_write(struct file *file,
                                       size_t count, loff_t *ppos)
 {
     struct rwnx_hw *rw_hw = file->private_data;
+	int srcu_idx;
     struct rwnx_vif *rw_vif;
     char buf[32];
     size_t len = min_t(size_t, count, sizeof(buf) - 1);
@@ -738,7 +743,11 @@ static ssize_t rwnx_dbgfs_oppps_write(struct file *file,
     /* Read the written CT Window (provided in ms) value */
     if (sscanf(buf, "ctw=%d", &ctw) > 0) {
         /* Check if at least one VIF is configured as P2P GO */
-        list_for_each_entry(rw_vif, &rw_hw->vifs, list) {
+		srcu_idx = srcu_read_lock(&rw_hw->vif_readers);
+	list_for_each_entry_rcu(rw_vif, &rw_hw->vifs, list,
+				       srcu_read_lock_held(&rw_hw->vif_readers)) {
+			if (!smp_load_acquire(&rw_vif->up))
+				continue;
 #ifdef CONFIG_RWNX_FULLMAC
             if (RWNX_VIF_TYPE(rw_vif) == NL80211_IFTYPE_P2P_GO) {
 #endif /* CONFIG_RWNX_FULLMAC */
@@ -750,6 +759,7 @@ static ssize_t rwnx_dbgfs_oppps_write(struct file *file,
                 break;
             }
         }
+		srcu_read_unlock(&rw_hw->vif_readers, srcu_idx);
     }
 
     return count;
@@ -762,6 +772,7 @@ static ssize_t rwnx_dbgfs_noa_write(struct file *file,
                                     size_t count, loff_t *ppos)
 {
     struct rwnx_hw *rw_hw = file->private_data;
+	int srcu_idx;
     struct rwnx_vif *rw_vif;
     char buf[64];
     size_t len = min_t(size_t, count, sizeof(buf) - 1);
@@ -775,7 +786,11 @@ static ssize_t rwnx_dbgfs_noa_write(struct file *file,
     if (sscanf(buf, "count=%d interval=%d duration=%d dyn=%d",
                &noa_count, &interval, &duration, &dyn_noa) > 0) {
         /* Check if at least one VIF is configured as P2P GO */
-        list_for_each_entry(rw_vif, &rw_hw->vifs, list) {
+		srcu_idx = srcu_read_lock(&rw_hw->vif_readers);
+	list_for_each_entry_rcu(rw_vif, &rw_hw->vifs, list,
+				       srcu_read_lock_held(&rw_hw->vif_readers)) {
+			if (!smp_load_acquire(&rw_vif->up))
+				continue;
 #ifdef CONFIG_RWNX_FULLMAC
             if (RWNX_VIF_TYPE(rw_vif) == NL80211_IFTYPE_P2P_GO) {
 #endif /* CONFIG_RWNX_FULLMAC */
@@ -788,6 +803,7 @@ static ssize_t rwnx_dbgfs_noa_write(struct file *file,
                 break;
             }
         }
+		srcu_read_unlock(&rw_hw->vif_readers, srcu_idx);
     }
 
     return count;

@@ -40,6 +40,7 @@
 #include "rwnx_compat.h"
 #include "rwnx_version.h"
 #include "rwnx_main.h"
+#include "rwnx_state.h"
 #include "aicwf_txrxif.h"
 #include "aicwf_compat_8800dc.h"
 #include "aicwf_compat_8800d80.h"
@@ -774,7 +775,7 @@ struct rwnx_sta *rwnx_get_sta(struct rwnx_hw *rwnx_hw, const u8 *mac_addr)
 
     for (i = 0; i < NX_REMOTE_STA_MAX; i++) {
         struct rwnx_sta *sta = &rwnx_hw->sta_table[i];
-        if (sta->valid && (memcmp(mac_addr, &sta->mac_addr, 6) == 0))
+	if (rwnx_sta_is_valid(sta) && (memcmp(mac_addr, &sta->mac_addr, 6) == 0))
             return sta;
     }
 
@@ -1185,7 +1186,7 @@ void rwnx_update_mesh_power_mode(struct rwnx_vif *vif)
     } else {
         mesh_pm = NL80211_MESH_POWER_DEEP_SLEEP;
         list_for_each_entry(sta, &vif->ap.sta_list, list) {
-            if (sta->valid && (sta->mesh_pm < mesh_pm)) {
+	    if (rwnx_sta_is_valid(sta) && (sta->mesh_pm < mesh_pm)) {
                 mesh_pm = sta->mesh_pm;
             }
         }
@@ -1225,7 +1226,7 @@ void aicwf_steering_work(struct work_struct *work)
 		goto finish;
 	}
 	list_for_each_entry(sta, &rwnx_vif->ap.sta_list, list) {
-		if (sta->valid) {
+		if (rwnx_sta_is_valid(sta)) {
 			sta->link_time +=2;
 			aicwf_nl_send_sta_rpt_msg(rwnx_vif, sta);
 		}
@@ -1495,11 +1496,13 @@ static int rwnx_open(struct net_device *dev)
 
 				/* Save the index retrieved from LMAC */
 				spin_lock_bh(&rwnx_hw->cb_lock);
-				rwnx_hw->p2p_dev_vif->vif_index = add_if_cfm.inst_nbr;
-				WRITE_ONCE(rwnx_hw->p2p_dev_vif->up, true);
-				rwnx_hw->vif_started++;
-				rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_hw->p2p_dev_vif;
+				error = rwnx_vif_publish_locked(rwnx_hw,
+						rwnx_hw->p2p_dev_vif, add_if_cfm.inst_nbr);
+				if (!error)
+					rwnx_hw->vif_started++;
 				spin_unlock_bh(&rwnx_hw->cb_lock);
+				if (error)
+					goto out_close;
 			}
 			rwnx_hw->is_p2p_alive = 1;
 #ifndef CONFIG_USE_P2P0
@@ -1521,13 +1524,15 @@ static int rwnx_open(struct net_device *dev)
 
 		/* Save the index retrieved from LMAC */
 		spin_lock_bh(&rwnx_hw->cb_lock);
-		rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-		WRITE_ONCE(rwnx_vif->up, true);
-		rwnx_hw->vif_started++;
-		rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
+		error = rwnx_vif_publish_locked(rwnx_hw, rwnx_vif,
+						add_if_cfm.inst_nbr);
+		if (!error)
+			rwnx_hw->vif_started++;
 		AICWFDBG(LOGDEBUG, "%s ap create vif in rwnx_hw->vif_table[%d] \r\n",
 			__func__, rwnx_vif->vif_index);
 		spin_unlock_bh(&rwnx_hw->cb_lock);
+		if (error)
+			goto out_close;
 	} else {
 		/* The interface type suffices to identify P2P in FullMAC mode. */
 		error = rwnx_send_add_if(rwnx_hw, rwnx_vif->wdev.address,
@@ -1546,13 +1551,15 @@ static int rwnx_open(struct net_device *dev)
 
 		/* Save the index retrieved from LMAC */
 		spin_lock_bh(&rwnx_hw->cb_lock);
-		rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-		WRITE_ONCE(rwnx_vif->up, true);
-		rwnx_hw->vif_started++;
-		rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
+		error = rwnx_vif_publish_locked(rwnx_hw, rwnx_vif,
+						add_if_cfm.inst_nbr);
+		if (!error)
+			rwnx_hw->vif_started++;
 		AICWFDBG(LOGDEBUG, "%s sta create vif in rwnx_hw->vif_table[%d] \r\n",
 			__func__, rwnx_vif->vif_index);
 		spin_unlock_bh(&rwnx_hw->cb_lock);
+		if (error)
+			goto out_close;
 #ifdef CONFIG_USE_P2P0
 		if (rwnx_vif->is_p2p_vif) {
 			rwnx_hw->p2p_dev_vif = rwnx_vif;
@@ -1681,6 +1688,7 @@ static int rwnx_close(struct net_device *dev)
 	struct aicwf_bus *bus_if = dev_get_drvdata(rwnx_hw->dev);
 	bool monitor = RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_MONITOR;
 	bool was_up = rwnx_vif->up;
+	struct rwnx_roc_elem *retired_roc = NULL;
 	bool owns_slot;
 	bool carrier;
 	int waiting_counter = 20;
@@ -1756,21 +1764,25 @@ static int rwnx_close(struct net_device *dev)
 #endif
 	}
 
-	if (rwnx_hw->roc_elem &&
-	    rwnx_hw->roc_elem->wdev == &rwnx_vif->wdev)
-		rwnx_hw->roc_elem = NULL;
-
-	/* Retire the RX lookup before releasing channel and queue state. */
+	/* Keep FW event lookup live through remove_if; retire before host teardown. */
 	spin_lock_bh(&rwnx_hw->cb_lock);
 	carrier = netif_carrier_ok(dev);
-	WRITE_ONCE(rwnx_vif->up, false);
 	owns_slot = rwnx_vif->vif_index < ARRAY_SIZE(rwnx_hw->vif_table) &&
 		    rwnx_hw->vif_table[rwnx_vif->vif_index] == rwnx_vif;
-	if (owns_slot)
-		rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
+	rwnx_vif_unpublish_locked(rwnx_hw, rwnx_vif);
+	if (rwnx_hw->roc_elem &&
+	    rwnx_hw->roc_elem->wdev == &rwnx_vif->wdev) {
+		retired_roc = rwnx_hw->roc_elem;
+		rwnx_hw->roc_elem = NULL;
+	}
 	if (monitor && owns_slot &&
 	    rwnx_hw->monitor_vif == rwnx_vif->vif_index)
 		rwnx_hw->monitor_vif = RWNX_INVALID_VIF;
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	rwnx_roc_free(rwnx_hw, retired_roc);
+	synchronize_srcu(&rwnx_hw->vif_readers);
+
+	spin_lock_bh(&rwnx_hw->cb_lock);
 	if (was_up) {
 		rwnx_chanctx_unlink(rwnx_vif);
 		if (rwnx_hw->vif_started)
@@ -2001,6 +2013,8 @@ static struct rwnx_vif *rwnx_interface_add(struct rwnx_hw *rwnx_hw,
     ndev->ieee80211_ptr = &vif->wdev;
     vif->wdev.wiphy = rwnx_hw->wiphy;
     vif->rwnx_hw = rwnx_hw;
+    spin_lock_init(&vif->conn_state_lock);
+    atomic_set(&vif->drv_conn_state, RWNX_DRV_STATUS_DISCONNECTED);
     vif->ndev = ndev;
     vif->drv_vif_index = vif_idx;
     SET_NETDEV_DEV(ndev, wiphy_dev(vif->wdev.wiphy));
@@ -2123,11 +2137,9 @@ static struct rwnx_vif *rwnx_interface_add(struct rwnx_hw *rwnx_hw,
 
 
     spin_lock_bh(&rwnx_hw->cb_lock);
-    list_add_tail(&vif->list, &rwnx_hw->vifs);
+    list_add_tail_rcu(&vif->list, &rwnx_hw->vifs);
     spin_unlock_bh(&rwnx_hw->cb_lock);
     rwnx_hw->avail_idx_map &= ~BIT(vif_idx);
-
-	spin_lock_init(&vif->conn_state_lock);
 
     return vif;
 
@@ -2137,27 +2149,14 @@ err:
 }
 
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
-void aicwf_p2p_alive_timeout(ulong data)
-#else
-void aicwf_p2p_alive_timeout(struct timer_list *t)
-#endif
+static void rwnx_p2p_alive_check(struct rwnx_hw *rwnx_hw,
+				 struct rwnx_vif *rwnx_vif)
 {
-    struct rwnx_hw *rwnx_hw;
-    struct rwnx_vif *rwnx_vif;
-    struct rwnx_vif *rwnx_vif1, *tmp;
-    u8_l p2p = 0;
-    #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
-    rwnx_vif = (struct rwnx_vif *)data;
-    rwnx_hw = rwnx_vif->rwnx_hw;
-    #elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
-    rwnx_hw = from_timer(rwnx_hw, t, p2p_alive_timer);
-    rwnx_vif = rwnx_hw->p2p_dev_vif;
-    #else
-    rwnx_hw = timer_container_of(rwnx_hw, t, p2p_alive_timer);
-    rwnx_vif = rwnx_hw->p2p_dev_vif;
-    #endif
+	struct rwnx_vif *rwnx_vif1;
+	u8_l p2p = 0;
 
+	if (!rwnx_vif || !READ_ONCE(rwnx_vif->up))
+		return;
 	//printk("%s enter %d \r\n", __func__, atomic_read(&rwnx_hw->p2p_alive_timer_count));
 
 #if 1 //AIDEN workaround
@@ -2166,7 +2165,8 @@ void aicwf_p2p_alive_timeout(struct timer_list *t)
 	}
 #endif
 
-    list_for_each_entry_safe(rwnx_vif1, tmp, &rwnx_hw->vifs, list) {
+    list_for_each_entry_rcu(rwnx_vif1, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
         if ((rwnx_hw->avail_idx_map & BIT(rwnx_vif1->drv_vif_index)) == 0) {
             switch(RWNX_VIF_TYPE(rwnx_vif1)) {
             case NL80211_IFTYPE_P2P_CLIENT:
@@ -2199,11 +2199,34 @@ void aicwf_p2p_alive_timeout(struct timer_list *t)
      /* Ensure that we won't process disconnect ind */
      spin_lock_bh(&rwnx_hw->cb_lock);
 
-     WRITE_ONCE(rwnx_vif->up, false);
-     rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
+     rwnx_vif_unpublish_locked(rwnx_hw, rwnx_vif);
      AICWFDBG(LOGDEBUG, "%s rwnx_vif[%d] down \r\n", __func__, rwnx_vif->vif_index);
-     rwnx_hw->vif_started--;
+     if (rwnx_hw->vif_started)
+	 rwnx_hw->vif_started--;
      spin_unlock_bh(&rwnx_hw->cb_lock);
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+void aicwf_p2p_alive_timeout(ulong data)
+#else
+void aicwf_p2p_alive_timeout(struct timer_list *t)
+#endif
+{
+	struct rwnx_hw *rwnx_hw;
+	struct rwnx_vif *rwnx_vif;
+	int idx;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+	rwnx_hw = ((struct rwnx_vif *)data)->rwnx_hw;
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+	rwnx_hw = from_timer(rwnx_hw, t, p2p_alive_timer);
+#else
+	rwnx_hw = timer_container_of(rwnx_hw, t, p2p_alive_timer);
+#endif
+	idx = srcu_read_lock(&rwnx_hw->vif_readers);
+	rwnx_vif = READ_ONCE(rwnx_hw->p2p_dev_vif);
+	rwnx_p2p_alive_check(rwnx_hw, rwnx_vif);
+	srcu_read_unlock(&rwnx_hw->vif_readers, idx);
 }
 
 #ifdef CONFIG_DYNAMIC_PERPWR
@@ -2489,6 +2512,7 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
     int min_idx, max_idx;
     int vif_idx = -1;
     int i;
+    bool set_p2p_dev = false;
 
     AICWFDBG(LOGINFO, "rwnx_virtual_interface_add: %d, %s\n", type, name);
 
@@ -2523,9 +2547,10 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
 
     AICWFDBG(LOGINFO, "rwnx_virtual_interface_add, ifname=%s, wdev=%p, vif_idx=%d\n", name, wdev, vif_idx);
 
-    #ifndef CONFIG_USE_P2P0
     vif->is_p2p_vif = 1;
     vif->rwnx_hw = rwnx_hw;
+    spin_lock_init(&vif->conn_state_lock);
+    atomic_set(&vif->drv_conn_state, RWNX_DRV_STATUS_DISCONNECTED);
     vif->vif_index = vif_idx;
     vif->wdev.wiphy = rwnx_hw->wiphy;
     vif->drv_vif_index = vif_idx;
@@ -2534,10 +2559,7 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
     memset(&vif->net_stats, 0, sizeof(vif->net_stats));
     vif->use_4addr = false;
 
-    spin_lock_bh(&rwnx_hw->cb_lock);
-    list_add_tail(&vif->list, &rwnx_hw->vifs);
-    spin_unlock_bh(&rwnx_hw->cb_lock);
-
+    #ifndef CONFIG_USE_P2P0
     if (rwnx_hw->is_p2p_alive == 0) {
         #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
         init_timer(&rwnx_hw->p2p_alive_timer);
@@ -2548,7 +2570,7 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
         #endif
         rwnx_hw->is_p2p_alive = 0;
         rwnx_hw->is_p2p_connected = 0;
-        rwnx_hw->p2p_dev_vif = vif;
+	set_p2p_dev = true;
         atomic_set(&rwnx_hw->p2p_alive_timer_count, 0);
     }
     #endif
@@ -2560,6 +2582,11 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
     AICWFDBG(LOGERROR, "p2p dev addr=%x %x %x %x %x %x\n", vif->wdev.address[0], vif->wdev.address[1], \
         vif->wdev.address[2], vif->wdev.address[3], vif->wdev.address[4], vif->wdev.address[5]);
 
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    if (set_p2p_dev)
+	rwnx_hw->p2p_dev_vif = vif;
+    list_add_tail_rcu(&vif->list, &rwnx_hw->vifs);
+    spin_unlock_bh(&rwnx_hw->cb_lock);
     return wdev;
 }
 
@@ -2586,7 +2613,7 @@ struct rwnx_sta *rwnx_retrieve_sta(struct rwnx_hw *rwnx_hw,
                 /* Returned STA pointer */
                 struct rwnx_sta *rwnx_sta = &rwnx_hw->sta_table[rwnx_vif->ap.bcmc_index];
 
-                if (rwnx_sta->valid)
+		if (rwnx_sta_is_valid(rwnx_sta))
                     return rwnx_sta;
             } else {
                 /* Returned STA pointer */
@@ -2599,7 +2626,7 @@ struct rwnx_sta *rwnx_retrieve_sta(struct rwnx_hw *rwnx_hw,
 						rwnx_sta->mac_addr[0],rwnx_sta->mac_addr[1],rwnx_sta->mac_addr[2],
 						rwnx_sta->mac_addr[3],rwnx_sta->mac_addr[4],rwnx_sta->mac_addr[5],
 						addr[0],addr[1],addr[2],addr[3],addr[4],addr[5]);
-                    if (rwnx_sta->valid &&
+		    if (rwnx_sta_is_valid(rwnx_sta) &&
                         ether_addr_equal(rwnx_sta->mac_addr, addr)) {
                         /* Return the found STA */
 						spin_unlock_bh(&rwnx_vif->rwnx_hw->cb_lock);
@@ -2652,8 +2679,12 @@ static struct wireless_dev *rwnx_cfg80211_add_iface(struct wiphy *wiphy,
 /**
  * @del_virtual_intf: remove the virtual interface
  */
+static void rwnx_cfgp2p_stop_p2p_device(struct wiphy *wiphy,
+				     struct wireless_dev *wdev);
+
 static int rwnx_cfg80211_del_iface(struct wiphy *wiphy, struct wireless_dev *wdev)
 {
+	struct rwnx_roc_elem *retired_roc = NULL;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0))
     struct net_device *dev = wdev->netdev;
     struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
@@ -2669,48 +2700,43 @@ static int rwnx_cfg80211_del_iface(struct wiphy *wiphy, struct wireless_dev *wde
 	aicwf_wext_cache_purge(rwnx_hw, &rwnx_vif->wdev, false);
 #endif
 
-    if (!dev || !rwnx_vif->ndev) {
-#if 0
-	if (rwnx_vif == rwnx_hw->p2p_dev_vif) {
-		if (timer_pending(&rwnx_hw->p2p_alive_timer)) {
-			del_timer_sync(&rwnx_hw->p2p_alive_timer);
-		}
+	if (!dev || !rwnx_vif->ndev) {
+		rwnx_cfgp2p_stop_p2p_device(wiphy, wdev);
+	} else if (netif_running(dev)) {
+		/* Retire through ndo_stop while the FW disconnect lookup is live. */
+		dev_close(dev);
 	}
-#endif
-        cfg80211_unregister_wdev(wdev);
-        spin_lock_bh(&rwnx_hw->cb_lock);
-        list_del(&rwnx_vif->list);
-        spin_unlock_bh(&rwnx_hw->cb_lock);
-        rwnx_hw->avail_idx_map |= BIT(rwnx_vif->drv_vif_index);
-        rwnx_vif->ndev = NULL;
-        kfree(rwnx_vif);
-        return 0;
-    }
-#if 0
-    netdev_info(dev, "Remove Interface");
-#endif
 
-	AICWFDBG(LOGINFO, "%s Remove Interface \r\n", dev->name);
-    if (dev->reg_state == NETREG_REGISTERED) {
-        /* Will call rwnx_close if interface is UP */
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	rwnx_vif_unpublish_locked(rwnx_hw, rwnx_vif);
+	if (rwnx_hw->roc_elem &&
+	    rwnx_hw->roc_elem->wdev == &rwnx_vif->wdev) {
+		retired_roc = rwnx_hw->roc_elem;
+		rwnx_hw->roc_elem = NULL;
+	}
+	if (rwnx_hw->p2p_dev_vif == rwnx_vif)
+		WRITE_ONCE(rwnx_hw->p2p_dev_vif, NULL);
+	list_del_rcu(&rwnx_vif->list);
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	rwnx_roc_free(rwnx_hw, retired_roc);
+	synchronize_srcu(&rwnx_hw->vif_readers);
+	rwnx_hw->avail_idx_map |= BIT(rwnx_vif->drv_vif_index);
+
+	if (!dev || !rwnx_vif->ndev) {
+		cfg80211_unregister_wdev(wdev);
+		kfree(rwnx_vif);
+		return 0;
+	}
+
+	if (dev->reg_state == NETREG_REGISTERED) {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
-        cfg80211_unregister_netdevice(dev);
+		cfg80211_unregister_netdevice(dev);
 #else
-        unregister_netdevice(dev);
+		unregister_netdevice(dev);
 #endif
-
-    }
-
-    spin_lock_bh(&rwnx_hw->cb_lock);
-    list_del(&rwnx_vif->list);
-    spin_unlock_bh(&rwnx_hw->cb_lock);
-    rwnx_hw->avail_idx_map |= BIT(rwnx_vif->drv_vif_index);
-    rwnx_vif->ndev = NULL;
-
-    /* Clear the priv in adapter */
-    dev->ieee80211_ptr = NULL;
-
-    return 0;
+	}
+	/* ndev remains a valid self-pointer until netdev private storage is freed. */
+	return 0;
 }
 
 /**
@@ -2726,16 +2752,12 @@ static int rwnx_cfg80211_change_iface(struct wiphy *wiphy,
     struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
 #endif
     struct rwnx_vif *vif = netdev_priv(dev);
-    struct mm_add_if_cfm add_if_cfm;
-    bool_l p2p = false;
-    int ret;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 	AICWFDBG(LOGINFO, "change_if: %d to %d, %d, %d\r\n", vif->wdev.iftype, type, NL80211_IFTYPE_P2P_CLIENT, NL80211_IFTYPE_STATION);
 
-	/* Monitor queue ownership belongs to ndo_open/ndo_stop. */
-	if (vif->up && (type == NL80211_IFTYPE_MONITOR ||
-			RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_MONITOR))
+	/* ndo_stop must retire readers before reusing the role-specific union. */
+	if (READ_ONCE(vif->up))
 		return -EBUSY;
 
 #ifndef CONFIG_RWNX_MON_DATA
@@ -2789,46 +2811,6 @@ static int rwnx_cfg80211_change_iface(struct wiphy *wiphy,
     vif->wdev.iftype = type;
     if (params->use_4addr != -1)
         vif->use_4addr = params->use_4addr;
-    if (type == NL80211_IFTYPE_P2P_CLIENT || type == NL80211_IFTYPE_P2P_GO){
-        p2p = true;
-    }
-	if (vif->up) {
-#ifdef CONFIG_USE_WIRELESS_EXT
-		aicwf_wext_cache_purge(vif->rwnx_hw, &vif->wdev, false);
-#endif
-		if (rwnx_scan_complete(vif->rwnx_hw, &vif->wdev, true)) {
-			ret = rwnx_send_scanu_cancel_req(vif->rwnx_hw, NULL);
-			if (ret)
-				return ret;
-		}
-
-		ret = rwnx_send_remove_if(vif->rwnx_hw, vif->vif_index, false);
-		if (ret) {
-			AICWFDBG(LOGERROR, "remove_if fail\n");
-			return ret;
-		}
-		spin_lock_bh(&vif->rwnx_hw->cb_lock);
-		vif->rwnx_hw->vif_table[vif->vif_index] = NULL;
-		if (vif->rwnx_hw->monitor_vif == vif->vif_index)
-			vif->rwnx_hw->monitor_vif = RWNX_INVALID_VIF;
-		spin_unlock_bh(&vif->rwnx_hw->cb_lock);
-		ret = rwnx_send_add_if(vif->rwnx_hw, vif->wdev.address,
-				       RWNX_VIF_TYPE(vif), p2p, &add_if_cfm);
-		if (ret) {
-			AICWFDBG(LOGERROR, "add if fail\n");
-			return ret;
-		}
-		if (add_if_cfm.status != 0 ||
-		    add_if_cfm.inst_nbr >= NX_VIRT_DEV_MAX) {
-			AICWFDBG(LOGERROR, "add if status fail\n");
-			return -EIO;
-		}
-
-		spin_lock_bh(&vif->rwnx_hw->cb_lock);
-		vif->vif_index = add_if_cfm.inst_nbr;
-		vif->rwnx_hw->vif_table[add_if_cfm.inst_nbr] = vif;
-		spin_unlock_bh(&vif->rwnx_hw->cb_lock);
-	}
 
     return 0;
 }
@@ -2888,22 +2870,21 @@ static void rwnx_cfgp2p_stop_p2p_device(struct wiphy *wiphy, struct wireless_dev
 
 	if (rwnx_vif == rwnx_hw->p2p_dev_vif) {
 		rwnx_hw->is_p2p_alive = 0;
-		if (timer_pending(&rwnx_hw->p2p_alive_timer)) {
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
-			 timer_delete_sync(&rwnx_hw->p2p_alive_timer);
+		timer_delete_sync(&rwnx_hw->p2p_alive_timer);
 #else
-			del_timer_sync(&rwnx_hw->p2p_alive_timer);
+		del_timer_sync(&rwnx_hw->p2p_alive_timer);
 #endif
-		}
 		if (rwnx_vif->up) {
 			rwnx_send_remove_if(rwnx_hw, rwnx_vif->vif_index, true);
 			/* Ensure that we won't process disconnect ind */
 			spin_lock_bh(&rwnx_hw->cb_lock);
-			WRITE_ONCE(rwnx_vif->up, false);
-			rwnx_hw->vif_table[rwnx_vif->vif_index] = NULL;
+			rwnx_vif_unpublish_locked(rwnx_hw, rwnx_vif);
             AICWFDBG(LOGDEBUG, "%s rwnx_vif[%d] down \r\n", __func__, rwnx_vif->vif_index);
-			rwnx_hw->vif_started--;
+			if (rwnx_hw->vif_started)
+				rwnx_hw->vif_started--;
 			spin_unlock_bh(&rwnx_hw->cb_lock);
+			synchronize_srcu(&rwnx_hw->vif_readers);
 		}
 	}
 
@@ -3580,12 +3561,17 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
     /* Indicate we are in a STA addition process - This will allow handling
      * potential PS mode change indications correctly
      */
-    rwnx_hw->adding_sta = true;
+    WRITE_ONCE(rwnx_hw->adding_sta, true);
 
     /* Forward the information to the LMAC */
     if ((error = rwnx_send_me_sta_add(rwnx_hw, params, mac, rwnx_vif->vif_index,
                                       &me_sta_add_cfm)))
-        return error;
+	goto out_adding_sta;
+    if (me_sta_add_cfm.status == CO_OK &&
+	!rwnx_fw_sta_idx_valid(rwnx_hw, me_sta_add_cfm.sta_idx)) {
+	error = -EPROTO;
+	goto out_adding_sta;
+    }
 
     // Check the status
     switch (me_sta_add_cfm.status)
@@ -3594,6 +3580,13 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
         {
             struct rwnx_sta *sta = &rwnx_hw->sta_table[me_sta_add_cfm.sta_idx];
             int tid;
+
+	    spin_lock_bh(&rwnx_hw->cb_lock);
+	    if (rwnx_sta_is_valid(sta)) {
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		error = -EPROTO;
+		break;
+	    }
             sta->aid = params->aid;
 
             sta->sta_idx = me_sta_add_cfm.sta_idx;
@@ -3623,7 +3616,6 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
                 sta->mesh_pm = params->local_pm;
             else
                 sta->mesh_pm = rwnx_vif->ap.next_mesh_pm;
-            rwnx_update_mesh_power_mode(rwnx_vif);
 
             for (tid = 0; tid < NX_NB_TXQ_PER_STA; tid++) {
                 int uapsd_bit = rwnx_hwq2uapsd[rwnx_tid2hwq[tid]];
@@ -3633,16 +3625,23 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
                     sta->uapsd_tids &= ~(1 << tid);
             }
             memcpy(sta->mac_addr, mac, ETH_ALEN);
-#ifdef CONFIG_DEBUG_FS
-            rwnx_dbgfs_register_rc_stat(rwnx_hw, sta);
-#endif
             /* Ensure that we won't process PS change or channel switch ind*/
-            spin_lock_bh(&rwnx_hw->cb_lock);
             rwnx_txq_sta_init(rwnx_hw, sta, rwnx_txq_vif_get_status(rwnx_vif));
             list_add_tail(&sta->list, &rwnx_vif->ap.sta_list);
-	    WRITE_ONCE(sta->valid, true);
             rwnx_ps_bh_enable(rwnx_hw, sta, sta->ps.active || me_sta_add_cfm.pm_state);
+#ifdef CONFIG_RWNX_BFMER
+#if LINUX_VERSION_CODE >= HIGH_KERNEL_VERSION
+	    rwnx_mu_group_sta_init(sta, params->link_sta_params.vht_capa);
+#else
+	    rwnx_mu_group_sta_init(sta, params->vht_capa);
+#endif
+#endif
+	    rwnx_sta_publish(sta);
             spin_unlock_bh(&rwnx_hw->cb_lock);
+	    rwnx_update_mesh_power_mode(rwnx_vif);
+#ifdef CONFIG_DEBUG_FS
+	    rwnx_dbgfs_register_rc_stat(rwnx_hw, sta);
+#endif
 
             error = 0;
             if(atomic_read(&rwnx_hw->sta_flowctrl[sta->sta_idx].tx_pending_cnt) > 0)
@@ -3681,7 +3680,6 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
             if (rwnx_hw->mod_params->bfmer)
                 rwnx_send_bfmer_enable(rwnx_hw, sta, params->vht_capa);
 
-            rwnx_mu_group_sta_init(sta, params->vht_capa);
 #endif /* CONFIG_RWNX_BFMER */
 
             #define PRINT_STA_FLAG(f)                               \
@@ -3710,7 +3708,8 @@ static int rwnx_cfg80211_add_station(struct wiphy *wiphy,
             break;
     }
 
-    rwnx_hw->adding_sta = false;
+out_adding_sta:
+    WRITE_ONCE(rwnx_hw->adding_sta, false);
 
     return error;
 }
@@ -3770,7 +3769,7 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
 
 		if(found) {
             		cur->ps.active = false;
-			WRITE_ONCE(cur->valid, false);
+			rwnx_sta_unpublish(cur);
             		list_del(&cur->list);
         	}
 		spin_unlock_bh(&rwnx_hw->cb_lock);
@@ -3785,8 +3784,10 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
                     "Del sta %d (%pM)", cur->sta_idx, cur->mac_addr);
 			if (cur->vif_idx != cur->vlan_idx) {
 				struct rwnx_vif *vlan_vif;
-				vlan_vif = rwnx_hw->vif_table[cur->vlan_idx];
-				if (vlan_vif->up) {
+				int idx = srcu_read_lock(&rwnx_hw->vif_readers);
+
+				vlan_vif = rwnx_vif_lookup(rwnx_hw, cur->vlan_idx);
+				if (vlan_vif) {
 					if ((RWNX_VIF_TYPE(vlan_vif) == NL80211_IFTYPE_AP_VLAN) &&
 						(vlan_vif->use_4addr)) {
 						vlan_vif->ap_vlan.sta_4a = NULL;
@@ -3794,6 +3795,7 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
 						WARN(1, "Deleting sta belonging to VLAN other than AP_VLAN 4A");
 					}
 				}
+				srcu_read_unlock(&rwnx_hw->vif_readers, idx);
 			}
 			if (rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP || rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO) {
 				cfg80211_del_sta(
@@ -3861,9 +3863,8 @@ static int rwnx_cfg80211_del_station_compat(struct wiphy *wiphy,
 }
 
 
-void apm_staloss_work_process(struct work_struct *work)
+static void rwnx_apm_staloss_work(struct rwnx_hw *rwnx_hw)
 {
-	struct rwnx_hw *rwnx_hw = container_of(work, struct rwnx_hw, apmStalossWork);
 	struct rwnx_sta *cur, *tmp;
 	int error = 0;
 
@@ -3876,19 +3877,11 @@ void apm_staloss_work_process(struct work_struct *work)
 
 	RWNX_DBG(RWNX_FN_ENTRY_STR);
 
-    // Look for VIF entry
-    list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-        if (rwnx_vif->vif_index == rwnx_hw->apm_vif_idx) {
-            found = true;
-            break;
-        }
-    }
-
-	AICWFDBG(LOGINFO, "apm vif idx=%d, found=%d, mac addr=%pM\n", rwnx_hw->apm_vif_idx, found, mac);
-    if (!found || !rwnx_vif || (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_AP && RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_P2P_GO))
-    {
-        return;
-    }
+	rwnx_vif = rwnx_vif_lookup(rwnx_hw, READ_ONCE(rwnx_hw->apm_vif_idx));
+	if (!rwnx_vif || !rwnx_vif->ndev ||
+	    (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_AP &&
+	     RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_P2P_GO))
+		return;
 
 	found = false;
 	spin_lock_bh(&rwnx_hw->cb_lock);
@@ -3900,7 +3893,7 @@ void apm_staloss_work_process(struct work_struct *work)
 	}
         if(found) {
 		cur->ps.active = false;
-		WRITE_ONCE(cur->valid, false);
+		rwnx_sta_unpublish(cur);
 	        list_del(&cur->list);
 	}
 	spin_unlock_bh(&rwnx_hw->cb_lock);
@@ -3909,8 +3902,8 @@ void apm_staloss_work_process(struct work_struct *work)
 		netdev_info(rwnx_vif->ndev, "Del sta %d (%pM)", cur->sta_idx, cur->mac_addr);
 		if (cur->vif_idx != cur->vlan_idx) {
 			struct rwnx_vif *vlan_vif;
-			vlan_vif = rwnx_hw->vif_table[cur->vlan_idx];
-			if (vlan_vif->up) {
+			vlan_vif = rwnx_vif_lookup(rwnx_hw, cur->vlan_idx);
+			if (vlan_vif) {
 				if ((RWNX_VIF_TYPE(vlan_vif) == NL80211_IFTYPE_AP_VLAN) &&
 					(vlan_vif->use_4addr)) {
 					vlan_vif->ap_vlan.sta_4a = NULL;
@@ -3958,6 +3951,16 @@ void apm_staloss_work_process(struct work_struct *work)
 	}
 
 	rwnx_update_mesh_power_mode(rwnx_vif);
+}
+
+
+void apm_staloss_work_process(struct work_struct *work)
+{
+	struct rwnx_hw *hw = container_of(work, struct rwnx_hw, apmStalossWork);
+	int idx = srcu_read_lock(&hw->vif_readers);
+
+	rwnx_apm_staloss_work(hw);
+	srcu_read_unlock(&hw->vif_readers, idx);
 }
 
 
@@ -4039,6 +4042,8 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
     struct rwnx_sta *sta;
 
     sta = rwnx_get_sta(rwnx_hw, mac);
+    if (sta && sta->vif_idx != vif->vif_index)
+	return -ENOENT;
     if (!sta)
     {
         /* Add the TDLS station */
@@ -4055,12 +4060,19 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
             /* Indicate we are in a STA addition process - This will allow handling
              * potential PS mode change indications correctly
              */
-            rwnx_hw->adding_sta = true;
+	    WRITE_ONCE(rwnx_hw->adding_sta, true);
 
             /* Forward the information to the LMAC */
             if ((error = rwnx_send_me_sta_add(rwnx_hw, params, mac, rwnx_vif->vif_index,
-                                              &me_sta_add_cfm)))
+					      &me_sta_add_cfm))) {
+		WRITE_ONCE(rwnx_hw->adding_sta, false);
                 return error;
+	    }
+	    if (me_sta_add_cfm.status == CO_OK &&
+		!rwnx_fw_sta_idx_valid(rwnx_hw, me_sta_add_cfm.sta_idx)) {
+		WRITE_ONCE(rwnx_hw->adding_sta, false);
+		return -EPROTO;
+	    }
 
             // Check the status
             switch (me_sta_add_cfm.status)
@@ -4069,6 +4081,12 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
                 {
                     int tid;
                     sta = &rwnx_hw->sta_table[me_sta_add_cfm.sta_idx];
+		    spin_lock_bh(&rwnx_hw->cb_lock);
+		    if (rwnx_sta_is_valid(sta)) {
+			spin_unlock_bh(&rwnx_hw->cb_lock);
+			error = -EPROTO;
+			break;
+		    }
                     sta->aid = params->aid;
                     sta->sta_idx = me_sta_add_cfm.sta_idx;
                     sta->ch_idx = rwnx_vif->ch_index;
@@ -4091,11 +4109,7 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
                             sta->uapsd_tids &= ~(1 << tid);
                     }
                     memcpy(sta->mac_addr, mac, ETH_ALEN);
-#ifdef CONFIG_DEBUG_FS
-                    rwnx_dbgfs_register_rc_stat(rwnx_hw, sta);
-#endif
                     /* Ensure that we won't process PS change or channel switch ind*/
-                    spin_lock_bh(&rwnx_hw->cb_lock);
                     rwnx_txq_sta_init(rwnx_hw, sta, rwnx_txq_vif_get_status(rwnx_vif));
                     if (rwnx_vif->tdls_status == TDLS_SETUP_RSP_TX) {
                         rwnx_vif->tdls_status = TDLS_LINK_ACTIVE;
@@ -4103,17 +4117,21 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
                         sta->tdls.active = true;
                     }
                     /* Set TDLS channel switch capability */
-                    if ((params->ext_capab[3] & WLAN_EXT_CAPA4_TDLS_CHAN_SWITCH) &&
+		    if (params->ext_capab && params->ext_capab_len > 3 &&
+			(params->ext_capab[3] & WLAN_EXT_CAPA4_TDLS_CHAN_SWITCH) &&
                         !rwnx_vif->tdls_chsw_prohibited)
                         sta->tdls.chsw_allowed = true;
+		    rwnx_mu_group_sta_init(sta, NULL);
                     rwnx_vif->sta.tdls_sta = sta;
-		    WRITE_ONCE(sta->valid, true);
+		    rwnx_sta_publish(sta);
                     spin_unlock_bh(&rwnx_hw->cb_lock);
+#ifdef CONFIG_DEBUG_FS
+		    rwnx_dbgfs_register_rc_stat(rwnx_hw, sta);
+#endif
 #ifdef CONFIG_RWNX_BFMER
                     if (rwnx_hw->mod_params->bfmer)
                         rwnx_send_bfmer_enable(rwnx_hw, sta, params->vht_capa);
 
-                    rwnx_mu_group_sta_init(sta, NULL);
 #endif /* CONFIG_RWNX_BFMER */
 
                     #define PRINT_STA_FLAG(f)                               \
@@ -4144,7 +4162,9 @@ static int rwnx_cfg80211_change_station(struct wiphy *wiphy,
                     break;
             }
 
-            rwnx_hw->adding_sta = false;
+	    WRITE_ONCE(rwnx_hw->adding_sta, false);
+	    if (error)
+		return error;
         } else  {
             return -EINVAL;
         }
@@ -4231,6 +4251,21 @@ static int rwnx_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
         case CO_OK:
         {
             u8 txq_status = 0;
+
+	    if (apm_start_cfm.vif_idx != rwnx_vif->vif_index ||
+		!rwnx_fw_vif_idx_valid(apm_start_cfm.vif_idx) ||
+		!rwnx_fw_bcmc_idx_valid(rwnx_hw, apm_start_cfm.bcmc_idx) ||
+		apm_start_cfm.ch_idx >= NX_CHAN_CTXT_CNT) {
+		error = -EPROTO;
+		break;
+	    }
+	    spin_lock_bh(&rwnx_hw->cb_lock);
+	    sta = &rwnx_hw->sta_table[apm_start_cfm.bcmc_idx];
+	    if (rwnx_sta_is_valid(sta)) {
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		error = -EPROTO;
+		break;
+	    }
             rwnx_vif->ap.bcmc_index = apm_start_cfm.bcmc_idx;
             rwnx_vif->ap.flags = 0;
 	    rwnx_vif->ap.csa = NULL;
@@ -4243,17 +4278,15 @@ static int rwnx_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
 			rwnx_vif->ap.tmp_sta_idx = 0;
 #endif
             rwnx_vif->ap.ap_freq = ((settings->chandef).chan)->center_freq;
-            sta = &rwnx_hw->sta_table[apm_start_cfm.bcmc_idx];
-	    WRITE_ONCE(sta->valid, true);
             sta->aid = 0;
             sta->sta_idx = apm_start_cfm.bcmc_idx;
             sta->ch_idx = apm_start_cfm.ch_idx;
             sta->vif_idx = rwnx_vif->vif_index;
+	    sta->vlan_idx = sta->vif_idx;
             sta->qos = false;
             sta->acm = 0;
             sta->ps.active = false;
             rwnx_mu_group_sta_init(sta, NULL);
-            spin_lock_bh(&rwnx_hw->cb_lock);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
 	    rwnx_chanctx_link(rwnx_vif, apm_start_cfm.ch_idx,
                               NULL);
@@ -4265,6 +4298,7 @@ static int rwnx_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
                 txq_status = RWNX_TXQ_STOP_CHAN;
             }
             rwnx_txq_vif_init(rwnx_hw, rwnx_vif, txq_status);
+	    rwnx_sta_publish(sta);
             spin_unlock_bh(&rwnx_hw->cb_lock);
 
             netif_tx_start_all_queues(dev);
@@ -4443,7 +4477,12 @@ static int rwnx_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *dev)
     spin_unlock_bh(&rwnx_hw->cb_lock);
 
     /* delete BC/MC STA */
-    sta = &rwnx_hw->sta_table[rwnx_vif->ap.bcmc_index];
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    if (rwnx_fw_bcmc_idx_valid(rwnx_hw, rwnx_vif->ap.bcmc_index)) {
+	sta = &rwnx_hw->sta_table[rwnx_vif->ap.bcmc_index];
+	rwnx_sta_unpublish(sta);
+    }
+    spin_unlock_bh(&rwnx_hw->cb_lock);
     rwnx_txq_vif_deinit(rwnx_hw, rwnx_vif);
     rwnx_del_bcn(&rwnx_vif->ap.bcn);
     rwnx_del_csa(rwnx_vif);
@@ -4580,7 +4619,7 @@ int rwnx_cfg80211_probe_client(struct wiphy *wiphy, struct net_device *dev,
 
 	spin_lock_bh(&vif->rwnx_hw->cb_lock);
     list_for_each_entry(sta, &vif->ap.sta_list, list){
-        if (sta->valid && ether_addr_equal(sta->mac_addr, peer))
+	if (rwnx_sta_is_valid(sta) && ether_addr_equal(sta->mac_addr, peer))
             break;
     }
 	spin_unlock_bh(&vif->rwnx_hw->cb_lock);
@@ -4809,6 +4848,8 @@ rwnx_cfg80211_remain_on_channel_(struct wiphy *wiphy,
     struct mm_add_if_cfm add_if_cfm;
     struct mm_remain_on_channel_cfm roc_cfm;
     int error;
+    int srcu_idx;
+    bool detached;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
@@ -4824,21 +4865,10 @@ rwnx_cfg80211_remain_on_channel_(struct wiphy *wiphy,
 	}
 #endif
 
-    /* Check that no other RoC procedure has been launched */
-    if (rwnx_hw->roc_elem) {
-        msleep(2);
-        if (rwnx_hw->roc_elem) {
-			AICWFDBG(LOGERROR, "remain_on_channel fail\n");
-#if 0//AIDEN test
-			roc_elem = rwnx_hw->roc_elem;
-			kfree(roc_elem);
-			rwnx_hw->roc_elem = NULL;
-			//msleep(500);
-#else
-            return -EBUSY;
-#endif
-        }
-    }
+    /* Publication below repeats this check under cb_lock. */
+    if (READ_ONCE(rwnx_hw->roc_elem))
+	return -EBUSY;
+
 	//msleep(500);
 	AICWFDBG(LOGINFO, "remain:%d,%d,%d,duration:%d\n",rwnx_vif->vif_index, rwnx_vif->is_p2p_vif, rwnx_hw->is_p2p_alive, duration);
 	//if (rwnx_vif->is_p2p_vif) {
@@ -4855,16 +4885,19 @@ rwnx_cfg80211_remain_on_channel_(struct wiphy *wiphy,
 			if (error)
 				return -EIO;
 
-			if (add_if_cfm.status != 0) {
-				return -EIO;
+			if (add_if_cfm.status != 0 ||
+			    !rwnx_fw_vif_idx_valid(add_if_cfm.inst_nbr)) {
+				return -EPROTO;
 			}
             /* Save the index retrieved from LMAC */
             spin_lock_bh(&rwnx_hw->cb_lock);
-            rwnx_vif->vif_index = add_if_cfm.inst_nbr;
-	    WRITE_ONCE(rwnx_vif->up, true);
-            rwnx_hw->vif_started++;
-            rwnx_hw->vif_table[add_if_cfm.inst_nbr] = rwnx_vif;
+	    error = rwnx_vif_publish_locked(rwnx_hw, rwnx_vif,
+					    add_if_cfm.inst_nbr);
+	    if (!error)
+		rwnx_hw->vif_started++;
             spin_unlock_bh(&rwnx_hw->cb_lock);
+	    if (error)
+		return error;
             rwnx_hw->is_p2p_alive = 1;
 #ifndef CONFIG_USE_P2P0
             mod_timer(&rwnx_hw->p2p_alive_timer, jiffies + msecs_to_jiffies(1000));
@@ -4925,8 +4958,18 @@ rwnx_cfg80211_remain_on_channel_(struct wiphy *wiphy,
 #endif
     roc_elem->cookie = roc_cookie;
 
-    /* Forward the information to the FMAC */
-    rwnx_hw->roc_elem = roc_elem;
+    /* The request and RX indications share a fully initialized ROC object. */
+    srcu_idx = srcu_read_lock(&rwnx_hw->vif_readers);
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    if (rwnx_hw->roc_elem) {
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	srcu_read_unlock(&rwnx_hw->vif_readers, srcu_idx);
+	kfree(roc_elem);
+	rwnx_txq_offchan_deinit(rwnx_vif);
+	return -EBUSY;
+    }
+    smp_store_release(&rwnx_hw->roc_elem, roc_elem);
+    spin_unlock_bh(&rwnx_hw->cb_lock);
     error = rwnx_send_roc(rwnx_hw, rwnx_vif, chan, duration, &roc_cfm);
 
     /* If no error, keep all the information for handling of end of procedure */
@@ -4939,20 +4982,21 @@ rwnx_cfg80211_remain_on_channel_(struct wiphy *wiphy,
 #else
         *cookie = roc_cookie;
 #endif
-        if(roc_cfm.status) {
-            // failed to roc
-            rwnx_hw->roc_elem = NULL;
-            kfree(roc_elem);
-            rwnx_txq_offchan_deinit(rwnx_vif);
-            return -EBUSY;
-        }
-    } else {
-        /* Free the allocated element */
-        rwnx_hw->roc_elem = NULL;
-        kfree(roc_elem);
-        rwnx_txq_offchan_deinit(rwnx_vif);
+	if (roc_cfm.status)
+	    error = -EBUSY;
     }
-
+    if (error) {
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	detached = rwnx_hw->roc_elem == roc_elem;
+	if (detached)
+            rwnx_hw->roc_elem = NULL;
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	if (detached) {
+	    rwnx_roc_free(rwnx_hw, roc_elem);
+            rwnx_txq_offchan_deinit(rwnx_vif);
+        }
+    }
+    srcu_read_unlock(&rwnx_hw->vif_readers, srcu_idx);
     return error;
 }
 
@@ -5044,11 +5088,10 @@ static int rwnx_cfg80211_cancel_remain_on_channel(struct wiphy *wiphy,
     trace_cancel_roc(rwnx_vif->vif_index);
 #endif
     /* Check if a RoC procedure is pending */
-    if (!rwnx_hw->roc_elem) {
+    if (!READ_ONCE(rwnx_hw->roc_elem))
         return 0;
-    }
 
-    /* Forward the information to the FMAC */
+    /* The cancel request carries no borrowed ROC pointer. */
     return rwnx_send_cancel_roc(rwnx_hw);
 }
 
@@ -5288,22 +5331,22 @@ static int rwnx_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
         return -EINVAL;
     }
 
-    /* Check that a RoC is already pending */
-    if (rwnx_hw->roc_elem) {
-        /* Get VIF used for current ROC */
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 6, 0))
-        struct rwnx_vif *rwnx_roc_vif = netdev_priv(rwnx_hw->roc_elem->wdev->netdev);
-#else
-        struct rwnx_vif *rwnx_roc_vif = container_of(rwnx_hw->roc_elem->wdev, struct rwnx_vif, wdev);//netdev_priv(rwnx_hw->roc_elem->wdev->netdev);
-#endif
+    /* Expiry detaches under cb_lock and defers freeing until SRCU readers leave. */
+    {
+    int srcu_idx = srcu_read_lock(&rwnx_hw->vif_readers);
+    struct rwnx_roc_elem *roc = smp_load_acquire(&rwnx_hw->roc_elem);
 
-        /* Check if RoC channel is the same than the required one */
-        if ((rwnx_hw->roc_elem->chan->center_freq != channel->center_freq)
-            || (rwnx_vif->vif_index != rwnx_roc_vif->vif_index)) {
-            AICWFDBG(LOGERROR, "mgmt rx chan invalid: %d, %d", rwnx_hw->roc_elem->chan->center_freq, channel->center_freq);
+    if (roc) {
+	struct rwnx_vif *rwnx_roc_vif =
+	    container_of(roc->wdev, struct rwnx_vif, wdev);
+	bool mismatch = roc->chan->center_freq != channel->center_freq ||
+			rwnx_vif->vif_index != rwnx_roc_vif->vif_index;
+
+	srcu_read_unlock(&rwnx_hw->vif_readers, srcu_idx);
+	if (mismatch)
             return -EINVAL;
-        }
     } else {
+	srcu_read_unlock(&rwnx_hw->vif_readers, srcu_idx);
         /* The internal RoC's own cookie; deliberately not the mgmt_tx one. */
         u64 roc_cookie;
         int error;
@@ -5329,6 +5372,7 @@ static int rwnx_cfg80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
         /* Need to keep in mind that RoC has been launched internally in order to
          * avoid to call the cfg80211 callback once expired */
         //rwnx_hw->roc_elem->mgmt_roc = true;
+    }
     }
 
     #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
@@ -5675,7 +5719,7 @@ rwnx_cfg80211_tdls_oper(struct wiphy *wiphy,
         /* Ensure that we won't process PS change ind */
         spin_lock_bh(&rwnx_hw->cb_lock);
         rwnx_vif->sta.tdls_sta->ps.active = false;
-	WRITE_ONCE(rwnx_vif->sta.tdls_sta->valid, false);
+	rwnx_sta_unpublish(rwnx_vif->sta.tdls_sta);
         spin_unlock_bh(&rwnx_hw->cb_lock);
         rwnx_txq_sta_deinit(rwnx_hw, rwnx_vif->sta.tdls_sta);
         error = rwnx_send_me_sta_del(rwnx_hw, rwnx_vif->sta.tdls_sta->sta_idx, true);
@@ -6173,7 +6217,7 @@ static int rwnx_cfg80211_get_station(struct wiphy *wiphy,
         struct rwnx_sta *sta_iter;
 		spin_lock_bh(&vif->rwnx_hw->cb_lock);
         list_for_each_entry(sta_iter, &vif->ap.sta_list, list) {
-            if (sta_iter->valid && ether_addr_equal(sta_iter->mac_addr, mac)) {
+	    if (rwnx_sta_is_valid(sta_iter) && ether_addr_equal(sta_iter->mac_addr, mac)) {
                 sta = sta_iter;
                 break;
             }
@@ -6580,28 +6624,41 @@ static int rwnx_cfg80211_join_mesh(struct wiphy *wiphy, struct net_device *dev,
     /* Check the status */
     switch (mesh_start_cfm.status) {
         case CO_OK:
+	    if (mesh_start_cfm.vif_idx != rwnx_vif->vif_index ||
+		!rwnx_fw_vif_idx_valid(mesh_start_cfm.vif_idx) ||
+		!rwnx_fw_bcmc_idx_valid(rwnx_hw, mesh_start_cfm.bcmc_idx) ||
+		mesh_start_cfm.ch_idx >= NX_CHAN_CTXT_CNT) {
+		error = -EPROTO;
+		break;
+	    }
+	    spin_lock_bh(&rwnx_hw->cb_lock);
+	    sta = &rwnx_hw->sta_table[mesh_start_cfm.bcmc_idx];
+	    if (rwnx_sta_is_valid(sta)) {
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		error = -EPROTO;
+		break;
+	    }
             rwnx_vif->ap.bcmc_index = mesh_start_cfm.bcmc_idx;
             rwnx_vif->ap.flags = 0;
             rwnx_vif->use_4addr = true;
             rwnx_vif->user_mpm = setup->user_mpm;
 
-            sta = &rwnx_hw->sta_table[mesh_start_cfm.bcmc_idx];
-	    WRITE_ONCE(sta->valid, true);
             sta->aid = 0;
             sta->sta_idx = mesh_start_cfm.bcmc_idx;
             sta->ch_idx = mesh_start_cfm.ch_idx;
             sta->vif_idx = rwnx_vif->vif_index;
+	    sta->vlan_idx = sta->vif_idx;
             sta->qos = true;
             sta->acm = 0;
             sta->ps.active = false;
             rwnx_mu_group_sta_init(sta, NULL);
-            spin_lock_bh(&rwnx_hw->cb_lock);
             rwnx_chanctx_link(rwnx_vif, mesh_start_cfm.ch_idx,
                               (struct cfg80211_chan_def *)(&setup->chandef));
             if (rwnx_hw->cur_chanctx != mesh_start_cfm.ch_idx) {
                 txq_status = RWNX_TXQ_STOP_CHAN;
             }
             rwnx_txq_vif_init(rwnx_hw, rwnx_vif, txq_status);
+	    rwnx_sta_publish(sta);
             spin_unlock_bh(&rwnx_hw->cb_lock);
 
             netif_tx_start_all_queues(dev);
@@ -6658,6 +6715,10 @@ static int rwnx_cfg80211_leave_mesh(struct wiphy *wiphy, struct net_device *dev)
                 rwnx_radar_cancel_cac(&rwnx_hw->radar);
                 spin_unlock_bh(&rwnx_hw->cb_lock);
                 /* delete BC/MC STA */
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		if (rwnx_fw_bcmc_idx_valid(rwnx_hw, rwnx_vif->ap.bcmc_index))
+		    rwnx_sta_unpublish(&rwnx_hw->sta_table[rwnx_vif->ap.bcmc_index]);
+		spin_unlock_bh(&rwnx_hw->cb_lock);
                 rwnx_txq_vif_deinit(rwnx_hw, rwnx_vif);
                 rwnx_del_bcn(&rwnx_vif->ap.bcn);
 
@@ -9171,6 +9232,8 @@ static void rwnx_cfg80211_init_cleanup(struct rwnx_hw *rwnx_hw,
 	if (rwnx_hw->sdiodev->rwnx_hw == rwnx_hw)
 		WRITE_ONCE(rwnx_hw->sdiodev->rwnx_hw, NULL);
 #endif
+	srcu_barrier(&rwnx_hw->vif_readers);
+	cleanup_srcu_struct(&rwnx_hw->vif_readers);
 	wiphy_free(rwnx_hw->wiphy);
 }
 
@@ -9227,6 +9290,11 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     }
 
     rwnx_hw = wiphy_priv(wiphy);
+	ret = init_srcu_struct(&rwnx_hw->vif_readers);
+	if (ret) {
+		wiphy_free(wiphy);
+		goto err_out;
+	}
 	spin_lock_init(&rwnx_hw->tx_lock);
 	spin_lock_init(&rwnx_hw->cb_lock);
 	spin_lock_init(&rwnx_hw->defrag_lock);
@@ -9802,8 +9870,10 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 	aicwf_wakeup_lock_deinit(rwnx_hw);
 
 #ifdef AICWF_USB_SUPPORT
-	rwnx_hw->usbdev->rwnx_hw = NULL;
+	WRITE_ONCE(rwnx_hw->usbdev->rwnx_hw, NULL);
 #endif
+	srcu_barrier(&rwnx_hw->vif_readers);
+	cleanup_srcu_struct(&rwnx_hw->vif_readers);
 	if(rwnx_hw->wiphy){
     	wiphy_free(rwnx_hw->wiphy);
 	}

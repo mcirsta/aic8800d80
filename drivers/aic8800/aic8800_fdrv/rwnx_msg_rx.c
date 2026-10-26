@@ -29,8 +29,38 @@
 #include "aicwf_wext_linux.h"
 #endif
 #include "rwnx_msg_rx.h"
+#include "rwnx_state.h"
 
 void rwnx_cfg80211_unlink_bss(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif);
+
+/* Firmware VIF IDs never name host-only AP VLAN slots.  These semantic
+ * checks require the event ingress lifetime protection supplied by the caller.
+ */
+#ifdef CONFIG_RWNX_FULLMAC
+static struct rwnx_vif *rwnx_event_vif(struct rwnx_hw *hw, unsigned int index)
+{
+	if (!rwnx_fw_vif_idx_valid(index))
+		return NULL;
+	return rwnx_vif_lookup(hw, index);
+}
+
+static struct rwnx_sta *rwnx_event_sta(struct rwnx_hw *hw, unsigned int index)
+{
+	struct rwnx_sta *sta;
+	struct rwnx_vif *vif;
+
+	if (!rwnx_fw_sta_idx_valid(hw, index) &&
+	    !rwnx_fw_bcmc_idx_valid(hw, index))
+		return NULL;
+	sta = &hw->sta_table[index];
+	if (!rwnx_sta_is_valid(sta) || sta->sta_idx != index)
+		return NULL;
+	vif = rwnx_event_vif(hw, sta->vif_idx);
+	if (!vif || !vif->ndev)
+		return NULL;
+	return sta;
+}
+#endif
 
 static int rwnx_freq_to_idx(struct rwnx_hw *rwnx_hw, int freq)
 {
@@ -52,7 +82,7 @@ static int rwnx_freq_to_idx(struct rwnx_hw *rwnx_hw, int freq)
         }
     }
 
-    BUG_ON(1);
+    return -EINVAL;
 
 exit:
     // Channel has been found, return the index
@@ -69,13 +99,17 @@ static inline int rwnx_rx_chan_pre_switch_ind(struct rwnx_hw *rwnx_hw,
     struct rwnx_vif *rwnx_vif;
     int chan_idx = ((struct mm_channel_pre_switch_ind *)msg->param)->chan_index;
 
+    if (chan_idx >= NX_CHAN_CTXT_CNT)
+	return -EINVAL;
+
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
     REG_SW_SET_PROFILING_CHAN(rwnx_hw, SW_PROF_CHAN_CTXT_PSWTCH_BIT);
 
 #ifdef CONFIG_RWNX_FULLMAC
-    list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-        if (rwnx_vif->up && rwnx_vif->ch_index == chan_idx) {
+    list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (smp_load_acquire(&rwnx_vif->up) && rwnx_vif->ch_index == chan_idx) {
 			AICWFDBG(LOGDEBUG, "rwnx_txq_vif_stop\r\n");
             rwnx_txq_vif_stop(rwnx_vif, RWNX_TXQ_STOP_CHAN, rwnx_hw);
         }
@@ -96,6 +130,10 @@ static inline int rwnx_rx_chan_switch_ind(struct rwnx_hw *rwnx_hw,
     bool roc     = ((struct mm_channel_switch_ind *)msg->param)->roc;
     bool roc_tdls = ((struct mm_channel_switch_ind *)msg->param)->roc_tdls;
 
+    if ((!roc && chan_idx >= NX_CHAN_CTXT_CNT) ||
+	(roc_tdls && ((struct mm_channel_switch_ind *)msg->param)->vif_index >= NX_VIRT_DEV_MAX))
+	return -EINVAL;
+
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
     REG_SW_SET_PROFILING_CHAN(rwnx_hw, SW_PROF_CHAN_CTXT_SWTCH_BIT);
@@ -103,21 +141,23 @@ static inline int rwnx_rx_chan_switch_ind(struct rwnx_hw *rwnx_hw,
 #ifdef CONFIG_RWNX_FULLMAC
     if (roc_tdls) {
         u8 vif_index = ((struct mm_channel_switch_ind *)msg->param)->vif_index;
-        list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-            if (rwnx_vif->vif_index == vif_index) {
+	list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	    if (rwnx_vif->vif_index == vif_index && smp_load_acquire(&rwnx_vif->up)) {
                 rwnx_vif->roc_tdls = true;
                 rwnx_txq_tdls_sta_start(rwnx_vif, RWNX_TXQ_STOP_CHAN, rwnx_hw);
             }
         }
     } else if (!roc) {
-        list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-            if (rwnx_vif->up && rwnx_vif->ch_index == chan_idx) {
+	list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	    if (smp_load_acquire(&rwnx_vif->up) && rwnx_vif->ch_index == chan_idx) {
                 rwnx_txq_vif_start(rwnx_vif, RWNX_TXQ_STOP_CHAN, rwnx_hw);
             }
         }
     } else {
         /* Retrieve the allocated RoC element */
-        struct rwnx_roc_elem *roc_elem = rwnx_hw->roc_elem;
+	struct rwnx_roc_elem *roc_elem = smp_load_acquire(&rwnx_hw->roc_elem);
         if (roc_elem) {
             /* If mgmt_roc is true, remain on channel has been started by ourself */
             if (!roc_elem->mgmt_roc) {
@@ -185,8 +225,13 @@ static inline int rwnx_rx_tdls_chan_switch_base_ind(struct rwnx_hw *rwnx_hw,
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
 #ifdef CONFIG_RWNX_FULLMAC
-    list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-        if (rwnx_vif->vif_index == vif_index) {
+    if (vif_index >= NX_VIRT_DEV_MAX)
+	return -EINVAL;
+    list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (rwnx_vif->vif_index == vif_index && smp_load_acquire(&rwnx_vif->up) &&
+	    (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||
+	     RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT)) {
             rwnx_vif->roc_tdls = false;
             rwnx_txq_tdls_sta_stop(rwnx_vif, RWNX_TXQ_STOP_CHAN, rwnx_hw);
         }
@@ -204,11 +249,23 @@ static inline int rwnx_rx_tdls_peer_ps_ind(struct rwnx_hw *rwnx_hw,
     bool ps_on = ((struct tdls_peer_ps_ind *)msg->param)->ps_on;
 
 #ifdef CONFIG_RWNX_FULLMAC
-    list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-        if (rwnx_vif->vif_index == vif_index) {
-            rwnx_vif->sta.tdls_sta->tdls.ps_on = ps_on;
-            // Update PS status for the TDLS station
-            rwnx_ps_bh_enable(rwnx_hw, rwnx_vif->sta.tdls_sta, ps_on);
+    if (vif_index >= NX_VIRT_DEV_MAX)
+	return -EINVAL;
+    list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (rwnx_vif->vif_index == vif_index && smp_load_acquire(&rwnx_vif->up) &&
+	    (RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION ||
+	     RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_P2P_CLIENT)) {
+	    struct rwnx_sta *sta;
+
+	    spin_lock_bh(&rwnx_hw->cb_lock);
+	    sta = rwnx_vif->sta.tdls_sta;
+	    if (READ_ONCE(rwnx_vif->up) && sta && rwnx_sta_is_valid(sta) &&
+		sta->vif_idx == vif_index) {
+		sta->tdls.ps_on = ps_on;
+		rwnx_ps_bh_enable(rwnx_hw, sta, ps_on);
+	    }
+	    spin_unlock_bh(&rwnx_hw->cb_lock);
         }
     }
 
@@ -222,11 +279,16 @@ static inline int rwnx_rx_remain_on_channel_exp_ind(struct rwnx_hw *rwnx_hw,
 {
 #ifdef CONFIG_RWNX_FULLMAC
     /* Retrieve the allocated RoC element */
-    struct rwnx_roc_elem *roc_elem = rwnx_hw->roc_elem;
+    struct rwnx_roc_elem *roc_elem;
     /* Get VIF on which RoC has been started */
     struct rwnx_vif *rwnx_vif = NULL;// = container_of(roc_elem->wdev, struct rwnx_vif, wdev);
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
+    /* Claim the completion once; all other event readers hold vif_readers SRCU. */
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    roc_elem = rwnx_hw->roc_elem;
+    WRITE_ONCE(rwnx_hw->roc_elem, NULL);
+    spin_unlock_bh(&rwnx_hw->cb_lock);
     if(roc_elem == NULL){
         AICWFDBG(LOGERROR,"%s roc_elem == NULL \r\n", __func__);
         return 0;
@@ -267,8 +329,7 @@ static inline int rwnx_rx_remain_on_channel_exp_ind(struct rwnx_hw *rwnx_hw,
     }
 
     /* Free the allocated RoC element */
-    kfree(roc_elem);
-    rwnx_hw->roc_elem = NULL;
+    rwnx_roc_free(rwnx_hw, roc_elem);
 
 	AICWFDBG(LOGTRACE, "%s exit\r\n", __func__);
 #endif /* CONFIG_RWNX_FULLMAC */
@@ -285,10 +346,14 @@ static inline int rwnx_rx_p2p_vif_ps_change_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
+    if (ps_state > 1)
+	return -EINVAL;
 #ifdef CONFIG_RWNX_FULLMAC
-    vif_entry = rwnx_hw->vif_table[vif_idx];
+    vif_entry = rwnx_event_vif(rwnx_hw, vif_idx);
 
-    if (vif_entry) {
+    if (vif_entry && vif_entry->ndev &&
+	(RWNX_VIF_TYPE(vif_entry) == NL80211_IFTYPE_P2P_CLIENT ||
+	 RWNX_VIF_TYPE(vif_entry) == NL80211_IFTYPE_P2P_GO)) {
         goto found_vif;
     }
 #endif /* CONFIG_RWNX_FULLMAC */
@@ -326,7 +391,7 @@ static inline int rwnx_rx_channel_survey_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
-    if (idx >  ARRAY_SIZE(rwnx_hw->survey))
+    if (idx < 0 || idx >= ARRAY_SIZE(rwnx_hw->survey))
         return 0;
 
     rwnx_survey = &rwnx_hw->survey[idx];
@@ -365,8 +430,8 @@ static inline int rwnx_rx_rssi_status_ind(struct rwnx_hw *rwnx_hw,
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
 #ifdef CONFIG_RWNX_FULLMAC
-    vif_entry = rwnx_hw->vif_table[vif_idx];
-    if (vif_entry) {
+    vif_entry = rwnx_event_vif(rwnx_hw, vif_idx);
+    if (vif_entry && vif_entry->ndev) {
         cfg80211_cqm_rssi_notify(vif_entry->ndev,
                                  rssi_status ? NL80211_CQM_RSSI_THRESHOLD_EVENT_LOW :
                                                NL80211_CQM_RSSI_THRESHOLD_EVENT_HIGH,
@@ -388,8 +453,8 @@ static inline int rwnx_rx_pktloss_notify_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
-    vif_entry = rwnx_hw->vif_table[vif_idx];
-    if (vif_entry) {
+    vif_entry = rwnx_event_vif(rwnx_hw, vif_idx);
+    if (vif_entry && vif_entry->ndev) {
         cfg80211_cqm_pktloss_notify(vif_entry->ndev, (const u8 *)ind->mac_addr.array,
                                     ind->num_packets, GFP_ATOMIC);
     }
@@ -444,6 +509,14 @@ static inline int rwnx_apm_staloss_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
+    {
+	struct rwnx_vif *vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
+
+	if (!vif || !vif->ndev ||
+	    (RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_AP &&
+	     RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_P2P_GO))
+	    return 0;
+    }
     memcpy(rwnx_hw->sta_mac_addr, ind->mac_addr, 6);
     rwnx_hw->apm_vif_idx = ind->vif_idx;
 
@@ -463,9 +536,13 @@ static inline int rwnx_rx_csa_counter_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
+    if (ind->vif_index >= NX_VIRT_DEV_MAX)
+	return -EINVAL;
+
     // Look for VIF entry
-    list_for_each_entry(vif, &rwnx_hw->vifs, list) {
-        if (vif->vif_index == ind->vif_index) {
+    list_for_each_entry_rcu(vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (vif->vif_index == ind->vif_index && smp_load_acquire(&vif->up)) {
             found=true;
             break;
         }
@@ -473,6 +550,9 @@ static inline int rwnx_rx_csa_counter_ind(struct rwnx_hw *rwnx_hw,
 
     if (found) {
 #ifdef CONFIG_RWNX_FULLMAC
+	if (RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_AP &&
+	    RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_P2P_GO)
+	    return 0;
         if (vif->ap.csa)
             vif->ap.csa->count = ind->csa_count;
         else
@@ -495,15 +575,21 @@ static inline int rwnx_rx_csa_finish_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
+    if (ind->vif_index >= NX_VIRT_DEV_MAX)
+	return -EINVAL;
+
     // Look for VIF entry
-    list_for_each_entry(vif, &rwnx_hw->vifs, list) {
-        if (vif->vif_index == ind->vif_index) {
+    list_for_each_entry_rcu(vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (vif->vif_index == ind->vif_index && smp_load_acquire(&vif->up)) {
             found=true;
             break;
         }
     }
 
     if (found) {
+	if (!ind->status && ind->chan_idx >= NX_CHAN_CTXT_CNT)
+	    return -EINVAL;
         if (RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP ||
             RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_P2P_GO) {
             if (vif->ap.csa) {
@@ -538,9 +624,13 @@ static inline int rwnx_rx_csa_traffic_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
+    if (ind->vif_index >= NX_VIRT_DEV_MAX)
+	return -EINVAL;
+
     // Look for VIF entry
-    list_for_each_entry(vif, &rwnx_hw->vifs, list) {
-        if (vif->vif_index == ind->vif_index) {
+    list_for_each_entry_rcu(vif, &rwnx_hw->vifs, list,
+			    srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (vif->vif_index == ind->vif_index && smp_load_acquire(&vif->up)) {
             found=true;
             break;
         }
@@ -560,38 +650,25 @@ static inline int rwnx_rx_ps_change_ind(struct rwnx_hw *rwnx_hw,
                                         struct rwnx_cmd *cmd,
                                         struct ipc_e2a_msg *msg)
 {
-    struct mm_ps_change_ind *ind = (struct mm_ps_change_ind *)msg->param;
-    struct rwnx_sta *sta = &rwnx_hw->sta_table[ind->sta_idx];
+    struct mm_ps_change_ind *ind = (void *)msg->param;
+    struct rwnx_sta *sta;
+    struct rwnx_vif *vif;
 
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
-
-#if 1//2022-01-15 add for rwnx_hw->vif_table[sta->vif_idx] if null when rwnx_close
-	if (!rwnx_hw->vif_table[sta->vif_idx]){
-        wiphy_err(rwnx_hw->wiphy, "rwnx_hw->vif_table[sta->vif_idx] is null\n");	
-		return 0;
-	}
-#endif
-
-    if (ind->sta_idx >= (NX_REMOTE_STA_MAX + NX_VIRT_DEV_MAX)) {
-        wiphy_err(rwnx_hw->wiphy, "Invalid sta index reported by fw %d\n",
-                  ind->sta_idx);
-        return 1;
+    if ((!rwnx_fw_sta_idx_valid(rwnx_hw, ind->sta_idx) &&
+	 !rwnx_fw_bcmc_idx_valid(rwnx_hw, ind->sta_idx)) || ind->ps_state > 1)
+	return -EINVAL;
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    sta = &rwnx_hw->sta_table[ind->sta_idx];
+    if (!rwnx_sta_is_valid(sta)) {
+	if (READ_ONCE(rwnx_hw->adding_sta) && rwnx_fw_sta_idx_valid(rwnx_hw, ind->sta_idx))
+	    WRITE_ONCE(sta->ps.active, !!ind->ps_state);
+	spin_unlock_bh(&rwnx_hw->cb_lock);
+	return 0;
     }
-
-    netdev_dbg(rwnx_hw->vif_table[sta->vif_idx]->ndev,
-               "Sta %d, change PS mode to %s", sta->sta_idx,
-               ind->ps_state ? "ON" : "OFF");
-
-    if (sta->valid) {
+    vif = rwnx_event_vif(rwnx_hw, sta->vif_idx);
+    if (vif && vif->ndev && sta->sta_idx == ind->sta_idx)
         rwnx_ps_bh_enable(rwnx_hw, sta, ind->ps_state);
-    } else if (rwnx_hw->adding_sta) {
-        sta->ps.active = ind->ps_state ? true : false;
-    } else {
-        netdev_err(rwnx_hw->vif_table[sta->vif_idx]->ndev,
-                   "Ignore PS mode change on invalid sta\n");
-    }
-	
-
+    spin_unlock_bh(&rwnx_hw->cb_lock);
     return 0;
 }
 
@@ -600,17 +677,19 @@ static inline int rwnx_rx_traffic_req_ind(struct rwnx_hw *rwnx_hw,
                                           struct rwnx_cmd *cmd,
                                           struct ipc_e2a_msg *msg)
 {
-    struct mm_traffic_req_ind *ind = (struct mm_traffic_req_ind *)msg->param;
-    struct rwnx_sta *sta = &rwnx_hw->sta_table[ind->sta_idx];
+    struct mm_traffic_req_ind *ind = (void *)msg->param;
+    struct rwnx_sta *sta;
+	const u8 *uapsd = (const u8 *)&ind->uapsd;
 
-    RWNX_DBG(RWNX_FN_ENTRY_STR);
-
-    netdev_dbg(rwnx_hw->vif_table[sta->vif_idx]->ndev,
-               "Sta %d, asked for %d pkt", sta->sta_idx, ind->pkt_cnt);
-
-    rwnx_ps_bh_traffic_req(rwnx_hw, sta, ind->pkt_cnt,
-                           ind->uapsd ? UAPSD_ID : LEGACY_PS_ID);
-
+	/* Validate the firmware byte before evaluating the bool_l member. */
+	if (*uapsd > 1)
+		return 0;
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    sta = rwnx_event_sta(rwnx_hw, ind->sta_idx);
+    if (sta)
+	rwnx_ps_bh_traffic_req(rwnx_hw, sta, ind->pkt_cnt,
+			     ind->uapsd ? UAPSD_ID : LEGACY_PS_ID);
+    spin_unlock_bh(&rwnx_hw->cb_lock);
     return 0;
 }
 #endif /* CONFIG_RWNX_FULLMAC */
@@ -738,8 +817,12 @@ static inline int rwnx_rx_me_tkip_mic_failure_ind(struct rwnx_hw *rwnx_hw,
                                                   struct ipc_e2a_msg *msg)
 {
     struct me_tkip_mic_failure_ind *ind = (struct me_tkip_mic_failure_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
-    struct net_device *dev = rwnx_vif->ndev;
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
+    struct net_device *dev;
+
+    if (!rwnx_vif || !rwnx_vif->ndev)
+	return 0;
+    dev = rwnx_vif->ndev;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
@@ -758,7 +841,12 @@ static inline int rwnx_rx_me_tx_credits_update_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
-    rwnx_txq_credit_update(rwnx_hw, ind->sta_idx, ind->tid, ind->credits);
+    if (ind->tid >= NX_NB_TXQ_PER_STA)
+	return 0;
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    if (rwnx_event_sta(rwnx_hw, ind->sta_idx))
+	rwnx_txq_credit_update(rwnx_hw, ind->sta_idx, ind->tid, ind->credits);
+    spin_unlock_bh(&rwnx_hw->cb_lock);
 
     return 0;
 }
@@ -806,7 +894,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
                                          struct ipc_e2a_msg *msg)
 {
     struct sm_connect_ind *ind = (struct sm_connect_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
     struct net_device *dev = NULL;
     const u8 *req_ie, *rsp_ie;
     const u8 *extcap_ie;
@@ -818,7 +906,9 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 	
-	if(!rwnx_vif){
+	if (!rwnx_vif || !rwnx_vif->ndev ||
+	(RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_STATION &&
+	 RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_P2P_CLIENT)) {
 		AICWFDBG(LOGERROR, "%s rwnx_vif is null \r\n", __func__);
 		return 0;
 	}
@@ -834,9 +924,15 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
     rsp_ie = req_ie + ind->assoc_req_ie_len;
 
 
-	if (rwnx_vif->sta.external_auth)
-		rwnx_vif->sta.external_auth = false;
+    if (!ind->status_code &&
+	(!rwnx_fw_sta_idx_valid(rwnx_hw, ind->ap_idx) || ind->ch_idx >= NX_CHAN_CTXT_CNT ||
+	 ind->width > PHY_CHNL_BW_80P80 || ind->band >= NUM_NL80211_BANDS))
+	return -EINVAL;
+    if (!ind->status_code && !ieee80211_get_channel(rwnx_hw->wiphy, ind->center_freq))
+	return -EINVAL;
 
+    if (rwnx_vif->sta.external_auth)
+	rwnx_vif->sta.external_auth = false;
 
     // Fill-in the AP information
 	AICWFDBG(LOGINFO, "%s ind->status_code:%d \r\n", __func__, ind->status_code);
@@ -846,7 +942,15 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
         u8 txq_status;
         struct cfg80211_chan_def chandef;
 
-	WRITE_ONCE(sta->valid, true);
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	if (!READ_ONCE(rwnx_vif->up) ||
+	    (rwnx_sta_is_valid(sta) &&
+	     (sta->vif_idx != ind->vif_idx || rwnx_vif->sta.ap != sta))) {
+	    spin_unlock_bh(&rwnx_hw->cb_lock);
+	    return 0;
+	}
+	/* Keep the slot unpublished until fields and queues are initialized. */
+	rwnx_sta_unpublish(sta);
         sta->sta_idx = ind->ap_idx;
         sta->ch_idx = ind->ch_idx;
         sta->vif_idx = ind->vif_idx;
@@ -860,7 +964,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
         sta->center_freq = ind->center_freq;
         sta->center_freq1 = ind->center_freq1;
         sta->center_freq2 = ind->center_freq2;
-        rwnx_vif->sta.ap = sta;
+	/* The AP pointer is published with the completed station below. */
 
         chan = ieee80211_get_channel(rwnx_hw->wiphy, ind->center_freq);
         cfg80211_chandef_create(&chandef, chan, NL80211_CHAN_NO_HT);
@@ -880,10 +984,13 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
         memcpy(sta->ac_param, ind->ac_param, sizeof(sta->ac_param));
         rwnx_txq_sta_init(rwnx_hw, sta, txq_status);
         rwnx_txq_tdls_vif_init(rwnx_vif);
+	rwnx_mu_group_sta_init(sta, NULL);
+	rwnx_sta_publish(sta);
+	WRITE_ONCE(rwnx_vif->sta.ap, sta);
+	spin_unlock_bh(&rwnx_hw->cb_lock);
 #ifdef CONFIG_DEBUG_FS
         rwnx_dbgfs_register_rc_stat(rwnx_hw, sta);
 #endif
-        rwnx_mu_group_sta_init(sta, NULL);
         /* Look for TDLS Channel Switch Prohibited flag in the Extended Capability
          * Information Element*/
         extcap_ie = cfg80211_find_ie(WLAN_EID_EXT_CAPABILITY, rsp_ie, ind->assoc_rsp_ie_len);
@@ -920,7 +1027,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
                                                ind->assoc_rsp_ie_len);
 
                 /* Stop here if peer device does not support VHT */
-                if (!vht_capa_ie) {
+		if (!vht_capa_ie || vht_capa_ie[1] < sizeof(*vht_cap)) {
                     break;
                 }
 
@@ -937,9 +1044,11 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
         // monitor interface channel context is always the same as the STA interface.
         // This doesn't work with 2 STA interfaces but we don't want to support it.
         if (rwnx_hw->monitor_vif != RWNX_INVALID_VIF) {
-            struct rwnx_vif *rwnx_mon_vif = rwnx_hw->vif_table[rwnx_hw->monitor_vif];
-            rwnx_chanctx_unlink(rwnx_mon_vif);
-            rwnx_chanctx_link(rwnx_mon_vif, ind->ch_idx, NULL);
+	    struct rwnx_vif *rwnx_mon_vif = rwnx_event_vif(rwnx_hw, rwnx_hw->monitor_vif);
+	    if (rwnx_mon_vif) {
+		rwnx_chanctx_unlink(rwnx_mon_vif);
+		rwnx_chanctx_link(rwnx_mon_vif, ind->ch_idx, NULL);
+	    }
         }
 #endif
 		//atomic_set(&rwnx_vif->drv_conn_state, (int)RWNX_DRV_STATUS_CONNECTED);
@@ -1039,6 +1148,7 @@ static inline int rwnx_rx_sm_connect_ind(struct rwnx_hw *rwnx_hw,
 exit:
     rwnx_vif->sta.is_roam = false;
 #ifdef CONFIG_DYNAMIC_PWR
+    if (!ind->status_code)
 	rwnx_hw->sta_rssi_idx = ind->ap_idx;
 #endif
 
@@ -1081,11 +1191,17 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
                                             struct ipc_e2a_msg *msg)
 {
     struct sm_disconnect_ind *ind = (struct sm_disconnect_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
     struct net_device *dev;
+    struct rwnx_sta *ap;
 #ifdef AICWF_RX_REORDER
     struct aicwf_rx_priv *rx_priv;
 #endif
+
+    if (!rwnx_vif || !rwnx_vif->ndev ||
+	(RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_STATION &&
+	 RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_P2P_CLIENT))
+	return 0;
 
     //RWNX_DBG(RWNX_FN_ENTRY_STR);
     AICWFDBG(LOGINFO, "%s reason code:%d \r\n", __func__, ind->reason_code);
@@ -1096,11 +1212,6 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
 
     dhcped = 0;
 
-    if(!rwnx_vif){
-		AICWFDBG(LOGERROR, "%s rwnx_vif is null \r\n", __func__);
-		//atomic_set(&rwnx_vif->drv_conn_state, RWNX_DRV_STATUS_DISCONNECTED);
-        return 0;
-    }
     dev = rwnx_vif->ndev;
 	if (rwnx_vif->sta.is_roam == false) {
 		rwnx_cfg80211_unlink_bss(rwnx_hw, rwnx_vif);
@@ -1108,9 +1219,6 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
 		AICWFDBG(LOGINFO, "%s roaming no rwnx_cfg80211_unlink_bss \r\n", __func__);
 	}
 
-#ifdef CONFIG_DEBUG_FS
-	rwnx_dbgfs_unregister_rc_stat(rwnx_hw, rwnx_vif->sta.ap);
-#endif
 
 #ifdef CONFIG_BR_SUPPORT
 	struct rwnx_vif *vif = netdev_priv(dev);
@@ -1130,10 +1238,21 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
         netif_carrier_off(dev);
     }
 
+    spin_lock_bh(&rwnx_hw->cb_lock);
+    ap = rwnx_vif->sta.ap;
+    if (ap && ap->vif_idx == ind->vif_idx) {
+	rwnx_sta_unpublish(ap);
+	rwnx_txq_sta_deinit(rwnx_hw, ap);
+#ifdef CONFIG_DEBUG_FS
+	rwnx_dbgfs_unregister_rc_stat(rwnx_hw, ap);
+#endif
 #ifdef CONFIG_RWNX_BFMER
-    /* Disable Beamformer if supported */
-    rwnx_bfmer_report_del(rwnx_hw, rwnx_vif->sta.ap);
-#endif //(CONFIG_RWNX_BFMER)
+	rwnx_bfmer_report_del(rwnx_hw, ap);
+#endif
+    }
+    WRITE_ONCE(rwnx_vif->sta.ap, NULL);
+    rwnx_txq_tdls_vif_deinit(rwnx_vif);
+    spin_unlock_bh(&rwnx_hw->cb_lock);
 
 #ifdef AICWF_RX_REORDER
 #ifdef AICWF_SDIO_SUPPORT
@@ -1141,26 +1260,10 @@ static inline int rwnx_rx_sm_disconnect_ind(struct rwnx_hw *rwnx_hw,
 #else
     rx_priv = rwnx_hw->usbdev ? rwnx_hw->usbdev->rx_priv : NULL;
 #endif
-    if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_STATION) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_CLIENT)) {
-		/* Close station admission before retiring its reorder objects. */
-		spin_lock_bh(&rwnx_hw->cb_lock);
-		if (rwnx_vif->sta.ap)
-			WRITE_ONCE(rwnx_vif->sta.ap->valid, false);
-		spin_unlock_bh(&rwnx_hw->cb_lock);
-		if (rx_priv)
-			reord_deinit_sta(rx_priv, rwnx_vif, NULL);
-    }
-    else if((rwnx_vif->wdev.iftype == NL80211_IFTYPE_AP) || (rwnx_vif->wdev.iftype == NL80211_IFTYPE_P2P_GO))
-        BUG();//should be not here: del_sta function
+    if (rx_priv)
+	reord_deinit_sta(rx_priv, rwnx_vif, NULL);
 #endif
 
-    rwnx_txq_sta_deinit(rwnx_hw, rwnx_vif->sta.ap);
-    rwnx_txq_tdls_vif_deinit(rwnx_vif);
-    #if 0
-    rwnx_dbgfs_unregister_rc_stat(rwnx_hw, rwnx_vif->sta.ap);
-    #endif
-    WRITE_ONCE(rwnx_vif->sta.ap->valid, false);
-    rwnx_vif->sta.ap = NULL;
     rwnx_external_auth_disable(rwnx_vif);
     rwnx_chanctx_unlink(rwnx_vif);
 
@@ -1178,7 +1281,11 @@ static inline int rwnx_rx_sm_external_auth_required_ind(struct rwnx_hw *rwnx_hw,
 {
     struct sm_external_auth_required_ind *ind =
         (struct sm_external_auth_required_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
+    if (!rwnx_vif || !rwnx_vif->ndev ||
+	RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_STATION ||
+	ind->ssid.length > sizeof(ind->ssid.array))
+	return 0;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0) || defined(CONFIG_WPA3_FOR_OLD_KERNEL)
     struct net_device *dev = rwnx_vif->ndev;
     struct cfg80211_external_auth_params params;
@@ -1207,9 +1314,11 @@ static inline int rwnx_rx_sm_external_auth_required_ind(struct rwnx_hw *rwnx_hw,
 	}
 	AICWFDBG(LOGINFO, "%s wdev->conn_owner_nlportid:%d \r\n", __func__, (int)wdev->conn_owner_nlportid);
 
-    if ((ind->vif_idx > NX_VIRT_DEV_MAX) || !rwnx_vif->up ||
-        (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_STATION) ||
-        (ret = cfg80211_external_auth_request(dev, &params, GFP_ATOMIC))) {
+    ret = -ENETDOWN;
+    if (READ_ONCE(rwnx_vif->up) &&
+	RWNX_VIF_TYPE(rwnx_vif) == NL80211_IFTYPE_STATION)
+	ret = cfg80211_external_auth_request(dev, &params, GFP_ATOMIC);
+    if (ret) {
 		wiphy_err(rwnx_hw->wiphy, "Failed to start external auth on vif %d, rwnx_vif->up %d, iftype:%d, ret %d",
 				  ind->vif_idx, rwnx_vif->up, RWNX_VIF_TYPE(rwnx_vif), ret);
         rwnx_send_sm_external_auth_required_rsp(rwnx_hw, rwnx_vif,
@@ -1231,7 +1340,7 @@ static inline int rwnx_rx_mesh_path_create_cfm(struct rwnx_hw *rwnx_hw,
                                                struct ipc_e2a_msg *msg)
 {
     struct mesh_path_create_cfm *cfm = (struct mesh_path_create_cfm *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[cfm->vif_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, cfm->vif_idx);
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
@@ -1248,25 +1357,33 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
                                                struct ipc_e2a_msg *msg)
 {
     struct mesh_peer_update_ind *ind = (struct mesh_peer_update_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
-    struct rwnx_sta *rwnx_sta = &rwnx_hw->sta_table[ind->sta_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
+    struct rwnx_sta *rwnx_sta;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
-    if ((ind->vif_idx >= (NX_VIRT_DEV_MAX + NX_REMOTE_STA_MAX)) ||
-        (rwnx_vif && (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MESH_POINT)) ||
-        (ind->sta_idx >= NX_REMOTE_STA_MAX))
-        return 1;
+    if (!rwnx_vif || RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MESH_POINT ||
+	!rwnx_fw_sta_idx_valid(rwnx_hw, ind->sta_idx) || rwnx_vif->ch_index >= NX_CHAN_CTXT_CNT)
+	return 0;
+    rwnx_sta = &rwnx_hw->sta_table[ind->sta_idx];
 
     /* Check we well have a Mesh Point Interface */
     if (!rwnx_vif->user_mpm)
     {
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	if (!READ_ONCE(rwnx_vif->up) ||
+	    (rwnx_sta_is_valid(rwnx_sta) &&
+	     (rwnx_sta->sta_idx != ind->sta_idx || rwnx_sta->vif_idx != ind->vif_idx ||
+	      memcmp(rwnx_sta->mac_addr, ind->peer_addr.array, ETH_ALEN)))) {
+	    spin_unlock_bh(&rwnx_hw->cb_lock);
+	    return 0;
+	}
         /* Check if peer link has been established or lost */
         if (ind->estab) {
             if (!rwnx_sta->valid) {
                 u8 txq_status;
 
-		WRITE_ONCE(rwnx_sta->valid, true);
+		rwnx_sta_unpublish(rwnx_sta);
                 rwnx_sta->sta_idx = ind->sta_idx;
                 rwnx_sta->ch_idx = rwnx_vif->ch_index;
                 rwnx_sta->vif_idx = ind->vif_idx;
@@ -1291,6 +1408,9 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
                 }
 
                 rwnx_txq_sta_init(rwnx_hw, rwnx_sta, txq_status);
+		rwnx_mu_group_sta_init(rwnx_sta, NULL);
+		rwnx_sta_publish(rwnx_sta);
+		spin_unlock_bh(&rwnx_hw->cb_lock);
 #ifdef CONFIG_DEBUG_FS
                 rwnx_dbgfs_register_rc_stat(rwnx_hw, rwnx_sta);
 #endif
@@ -1299,8 +1419,8 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
                 if (rwnx_hw->mod_params->bfmer)
                     rwnx_send_bfmer_enable(rwnx_hw, rwnx_sta, NULL);
 
-                rwnx_mu_group_sta_init(rwnx_sta, NULL);
 #endif /* CONFIG_RWNX_BFMER */
+		return 0;
 
             } else {
                 WARN_ON(0);
@@ -1308,7 +1428,7 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
         } else {
             if (rwnx_sta->valid) {
                 rwnx_sta->ps.active = false;
-		WRITE_ONCE(rwnx_sta->valid, false);
+		rwnx_sta_unpublish(rwnx_sta);
 
                 /* Remove the station from the list of VIF's station */
                 list_del_init(&rwnx_sta->list);
@@ -1321,12 +1441,21 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
                 WARN_ON(0);
             }
         }
+	spin_unlock_bh(&rwnx_hw->cb_lock);
     } else {
+	spin_lock_bh(&rwnx_hw->cb_lock);
+	if (!READ_ONCE(rwnx_vif->up) ||
+	    (rwnx_sta_is_valid(rwnx_sta) &&
+	     (rwnx_sta->sta_idx != ind->sta_idx || rwnx_sta->vif_idx != ind->vif_idx ||
+	      memcmp(rwnx_sta->mac_addr, ind->peer_addr.array, ETH_ALEN)))) {
+	    spin_unlock_bh(&rwnx_hw->cb_lock);
+	    return 0;
+	}
         if (!ind->estab && rwnx_sta->valid) {
             /* There is no way to inform upper layer for lost of peer, still
                clean everything in the driver */
             rwnx_sta->ps.active = false;
-	    WRITE_ONCE(rwnx_sta->valid, false);
+	    rwnx_sta_unpublish(rwnx_sta);
 
             /* Remove the station from the list of VIF's station */
             list_del_init(&rwnx_sta->list);
@@ -1338,6 +1467,7 @@ static inline int rwnx_rx_mesh_peer_update_ind(struct rwnx_hw *rwnx_hw,
         } else {
             WARN_ON(0);
         }
+	spin_unlock_bh(&rwnx_hw->cb_lock);
     }
 
     return 0;
@@ -1348,17 +1478,23 @@ static inline int rwnx_rx_mesh_path_update_ind(struct rwnx_hw *rwnx_hw,
                                                struct ipc_e2a_msg *msg)
 {
     struct mesh_path_update_ind *ind = (struct mesh_path_update_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
     struct rwnx_mesh_path *mesh_path;
     bool found = false;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
 
-    if (ind->vif_idx >= (NX_VIRT_DEV_MAX + NX_REMOTE_STA_MAX))
-        return 1;
-
-    if (!rwnx_vif || (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MESH_POINT))
+    if (!rwnx_vif || RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MESH_POINT)
         return 0;
+    if (!ind->delete) {
+	struct rwnx_sta *next_hop;
+
+	if (!rwnx_fw_sta_idx_valid(rwnx_hw, ind->nhop_sta_idx))
+	    return 0;
+	next_hop = rwnx_event_sta(rwnx_hw, ind->nhop_sta_idx);
+	if (!next_hop || next_hop->vif_idx != ind->vif_idx)
+	    return 0;
+    }
 
     /* Look for path with provided target address */
     list_for_each_entry(mesh_path, &rwnx_vif->ap.mpath_list, list) {
@@ -1415,14 +1551,11 @@ static inline int rwnx_rx_mesh_proxy_update_ind(struct rwnx_hw *rwnx_hw,
                                                struct ipc_e2a_msg *msg)
 {
     struct mesh_proxy_update_ind *ind = (struct mesh_proxy_update_ind *)msg->param;
-    struct rwnx_vif *rwnx_vif = rwnx_hw->vif_table[ind->vif_idx];
+    struct rwnx_vif *rwnx_vif = rwnx_event_vif(rwnx_hw, ind->vif_idx);
     struct rwnx_mesh_proxy *mesh_proxy;
     bool found = false;
 
     RWNX_DBG(RWNX_FN_ENTRY_STR);
-
-    if (ind->vif_idx >= (NX_VIRT_DEV_MAX + NX_REMOTE_STA_MAX))
-        return 1;
 
     if (!rwnx_vif || (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MESH_POINT))
         return 0;
@@ -1667,6 +1800,7 @@ int rwnx_rx_handle_msg(struct rwnx_hw *rwnx_hw, struct ipc_e2a_msg *msg,
 	const struct rwnx_msg_task *task;
 	const struct rwnx_msg_handler *handler;
 	unsigned int task_id, index;
+	int reader, ret;
 
 	if (!rwnx_hw || !rwnx_hw->cmd_mgr || !msg ||
 		received_len < offsetof(struct ipc_e2a_msg, param))
@@ -1681,9 +1815,13 @@ int rwnx_rx_handle_msg(struct rwnx_hw *rwnx_hw, struct ipc_e2a_msg *msg,
 		return -EINVAL;
 	handler = &task->handlers[index];
 
+	/* Callbacks may sleep; retain VIF/wdev storage through their last use. */
+	reader = srcu_read_lock(&rwnx_hw->vif_readers);
 	/* A null callback is valid for command confirmations in known tasks. */
-	return rwnx_hw->cmd_mgr->msgind(rwnx_hw->cmd_mgr, msg, received_len,
-								   handler->cb, handler->min_len);
+	ret = rwnx_hw->cmd_mgr->msgind(rwnx_hw->cmd_mgr, msg, received_len,
+								 handler->cb, handler->min_len);
+	srcu_read_unlock(&rwnx_hw->vif_readers, reader);
+	return ret;
 }
 
 void rwnx_rx_handle_print(struct rwnx_hw *rwnx_hw, u8 *msg, u32 len)

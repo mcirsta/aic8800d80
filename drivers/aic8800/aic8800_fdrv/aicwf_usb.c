@@ -13,6 +13,7 @@
 #include "aicwf_usb.h"
 #include "rwnx_tx.h"
 #include "rwnx_defs.h"
+#include "rwnx_state.h"
 #include "usb_host.h"
 #include "rwnx_platform.h"
 #include "rwnx_msg_tx.h"
@@ -61,15 +62,19 @@ u32 aicwf_usb_max_pkt_size = AICWF_USB_MAX_PKT_SIZE;
 void aicwf_usb_tx_flowctrl(struct rwnx_hw *rwnx_hw, bool state)
 {
     struct rwnx_vif *rwnx_vif;
+	int idx = srcu_read_lock(&rwnx_hw->vif_readers);
 
-    list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-        if (!rwnx_vif || !rwnx_vif->ndev || !rwnx_vif->up)
+    list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+			   srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	if (!rwnx_vif->ndev || !smp_load_acquire(&rwnx_vif->up) ||
+	    !netif_running(rwnx_vif->ndev))
             continue;
         if (state)
             netif_tx_stop_all_queues(rwnx_vif->ndev);//netif_stop_queue(rwnx_vif->ndev);
         else
             netif_tx_wake_all_queues(rwnx_vif->ndev);//netif_wake_queue(rwnx_vif->ndev);
 	}
+	srcu_read_unlock(&rwnx_hw->vif_readers, idx);
 }
 
 static struct aicwf_usb_buf *aicwf_usb_tx_dequeue(struct aic_usb_dev *usb_dev,
@@ -184,17 +189,20 @@ static void usb_txc_sta_flowctrl(struct aicwf_usb_buf *usb_buf, struct aic_usb_d
 	struct rwnx_sta *sta;
 	struct txdesc_api *hostdesc;
 	u8 sta_idx;
+	int srcu_idx;
 	hostdesc = (struct txdesc_api *)((u8 *)usb_buf->urb->transfer_buffer + 4);
 	//printk("txcpl: sta %d\n", hostdesc->host.staid);
 	sta_idx = hostdesc->host.staid;
 	if(sta_idx < NX_REMOTE_STA_MAX && !(hostdesc->host.flags & TXU_CNTRL_MGMT)) {
 		struct rwnx_vif *vif = NULL;
 		sta = &usb_dev->rwnx_hw->sta_table[sta_idx];
-		vif = usb_dev->rwnx_hw->vif_table[sta->vif_idx];
+		srcu_idx = srcu_read_lock(&usb_dev->rwnx_hw->vif_readers);
+		vif = rwnx_vif_lookup(usb_dev->rwnx_hw, READ_ONCE(sta->vif_idx));
 		spin_lock_irqsave(&usb_dev->tx_flow_lock, flags);
 		atomic_dec(&usb_dev->rwnx_hw->sta_flowctrl[sta_idx].tx_pending_cnt);
 		//printk("sta:%d, pending:%d, flowctrl=%d\n", sta->sta_idx, sta->tx_pending_cnt, sta->flowctrl);
-		if(RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP) {
+		if (vif && rwnx_sta_is_valid(sta) &&
+		    RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP) {
 			if(atomic_read(&usb_dev->rwnx_hw->sta_flowctrl[sta_idx].tx_pending_cnt) < AICWF_USB_FC_PERSTA_LOW_WATER &&
 							usb_dev->rwnx_hw->sta_flowctrl[sta_idx].flowctrl) {
 				//AICWFDBG(LOGDEBUG, "sta 0x%x:0x%x, %d pending %d, wake\n", sta->mac_addr[4], sta->mac_addr[5], sta->sta_idx, atomic_read(&usb_dev->rwnx_hw->sta_flowctrl[sta_idx].tx_pending_cnt));
@@ -204,6 +212,7 @@ static void usb_txc_sta_flowctrl(struct aicwf_usb_buf *usb_buf, struct aic_usb_d
 			}
 		}
 		spin_unlock_irqrestore(&usb_dev->tx_flow_lock, flags);
+		srcu_read_unlock(&usb_dev->rwnx_hw->vif_readers, srcu_idx);
 	}
 #endif
 }
@@ -1647,6 +1656,7 @@ static void usb_tx_flow_ctrl(struct rwnx_txhdr *txhdr, struct aic_usb_dev *usb_d
 #ifdef CONFIG_PER_STA_FC
 	struct rwnx_sta *sta;
 	u8 sta_idx;
+	int srcu_idx;
 	unsigned long flags;
 
 	//printk("txdata: sta %d\n", txhdr->sw_hdr->desc.host.staid);
@@ -1654,11 +1664,13 @@ static void usb_tx_flow_ctrl(struct rwnx_txhdr *txhdr, struct aic_usb_dev *usb_d
 	if(sta_idx < NX_REMOTE_STA_MAX && !(txhdr->sw_hdr->desc.host.flags & TXU_CNTRL_MGMT)) {
 		struct rwnx_vif *vif = NULL;
 		sta = &rwnx_hw->sta_table[sta_idx];
-		vif = rwnx_hw->vif_table[sta->vif_idx];
+		srcu_idx = srcu_read_lock(&rwnx_hw->vif_readers);
+		vif = rwnx_vif_lookup(rwnx_hw, READ_ONCE(sta->vif_idx));
 		spin_lock_irqsave(&usb_dev->tx_flow_lock, flags);
 		atomic_inc(&rwnx_hw->sta_flowctrl[sta_idx].tx_pending_cnt);
 		//printk("sta %d pending %d >= 64, flowctrl=%d\n", sta->sta_idx, sta->tx_pending_cnt, sta->flowctrl);
-		if(RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP) {
+		if (vif && rwnx_sta_is_valid(sta) &&
+		    RWNX_VIF_TYPE(vif) == NL80211_IFTYPE_AP) {
 			if((atomic_read(&rwnx_hw->sta_flowctrl[sta_idx].tx_pending_cnt) >= AICWF_USB_FC_PERSTA_HIGH_WATER && rwnx_hw->sta_flowctrl[sta_idx].flowctrl == 0) ||
 										rwnx_hw->sta_flowctrl[sta_idx].flowctrl) {
 				//AICWFDBG(LOGDEBUG, "sta 0x%x:0x%x, %d pending %d, stop\n", sta->mac_addr[4], sta->mac_addr[5], sta->sta_idx, atomic_read(&rwnx_hw->sta_flowctrl[sta_idx].tx_pending_cnt));
@@ -1668,6 +1680,7 @@ static void usb_tx_flow_ctrl(struct rwnx_txhdr *txhdr, struct aic_usb_dev *usb_d
 			}
 		}
 		spin_unlock_irqrestore(&usb_dev->tx_flow_lock, flags);
+		srcu_read_unlock(&rwnx_hw->vif_readers, srcu_idx);
 	}
 #endif
 }
@@ -2604,7 +2617,8 @@ static int aicwf_usb_suspend(struct usb_interface *intf, pm_message_t state)
 {
     struct aic_usb_dev *usb_dev =
     (struct aic_usb_dev *) usb_get_intfdata(intf);
-    struct rwnx_vif *rwnx_vif, *tmp;
+    struct rwnx_vif *rwnx_vif;
+	int srcu_idx = srcu_read_lock(&usb_dev->rwnx_hw->vif_readers);
         
     AICWFDBG(LOGINFO, "%s enter\r\n", __func__);
 #ifdef CONFIG_WOWLAN 
@@ -2612,7 +2626,8 @@ static int aicwf_usb_suspend(struct usb_interface *intf, pm_message_t state)
     rwnx_send_dummy_reboot(usb_dev->rwnx_hw);
 #endif
 #endif       
-    list_for_each_entry_safe(rwnx_vif, tmp, &usb_dev->rwnx_hw->vifs, list) {
+    list_for_each_entry_rcu(rwnx_vif, &usb_dev->rwnx_hw->vifs, list,
+			   srcu_read_lock_held(&usb_dev->rwnx_hw->vif_readers)) {
         if (rwnx_vif->ndev){
             netif_tx_stop_all_queues(rwnx_vif->ndev);
             mdelay(1000);
@@ -2621,21 +2636,25 @@ static int aicwf_usb_suspend(struct usb_interface *intf, pm_message_t state)
     aicwf_usb_state_change(usb_dev, USB_SLEEP_ST);
     aicwf_bus_stop(usb_dev->bus_if);
 
-    list_for_each_entry_safe(rwnx_vif, tmp, &usb_dev->rwnx_hw->vifs, list) {
+    list_for_each_entry_rcu(rwnx_vif, &usb_dev->rwnx_hw->vifs, list,
+			   srcu_read_lock_held(&usb_dev->rwnx_hw->vif_readers)) {
         if (rwnx_vif->ndev)
             netif_device_detach(rwnx_vif->ndev);
     }
 
-return 0;
+srcu_read_unlock(&usb_dev->rwnx_hw->vif_readers, srcu_idx);
+    return 0;
 }
 
 static int aicwf_usb_resume(struct usb_interface *intf)
 {
     struct aic_usb_dev *usb_dev =
          (struct aic_usb_dev *) usb_get_intfdata(intf);
-    struct rwnx_vif *rwnx_vif, *tmp;
+    struct rwnx_vif *rwnx_vif;
+	int srcu_idx = srcu_read_lock(&usb_dev->rwnx_hw->vif_readers);
     AICWFDBG(LOGINFO, "%s enter\r\n", __func__);
-    list_for_each_entry_safe(rwnx_vif, tmp, &usb_dev->rwnx_hw->vifs, list) {
+    list_for_each_entry_rcu(rwnx_vif, &usb_dev->rwnx_hw->vifs, list,
+			   srcu_read_lock_held(&usb_dev->rwnx_hw->vif_readers)) {
         if (rwnx_vif->ndev)
             netif_device_attach(rwnx_vif->ndev);
     }
@@ -2645,12 +2664,14 @@ static int aicwf_usb_resume(struct usb_interface *intf)
             g_rwnx_plat->wait_disconnect_cb = false;
         }
 
-    list_for_each_entry_safe(rwnx_vif, tmp, &usb_dev->rwnx_hw->vifs, list) {
+    list_for_each_entry_rcu(rwnx_vif, &usb_dev->rwnx_hw->vifs, list,
+			   srcu_read_lock_held(&usb_dev->rwnx_hw->vif_readers)) {
         if (rwnx_vif->ndev){
             netif_tx_wake_all_queues(rwnx_vif->ndev);
         }
     }
-     return 0;
+     srcu_read_unlock(&usb_dev->rwnx_hw->vif_readers, srcu_idx);
+    return 0;
 }
 
 static int aicwf_usb_reset_resume(struct usb_interface *intf)

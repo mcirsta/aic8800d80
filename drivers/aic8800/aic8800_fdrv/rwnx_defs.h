@@ -19,6 +19,7 @@
 #include <linux/skbuff.h>
 #include <net/cfg80211.h>
 #include <linux/slab.h>
+#include <linux/srcu.h>
 
 #include "rwnx_mod_params.h"
 #include "rwnx_debugfs.h"
@@ -674,6 +675,7 @@ struct rwnx_sec_phy_chan {
 
 /* Structure that will contains all RoC information received from cfg80211 */
 struct rwnx_roc_elem {
+    struct rcu_head rcu;
     struct wireless_dev *wdev;
     struct ieee80211_channel *chan;
     unsigned int duration;
@@ -828,6 +830,8 @@ struct rwnx_hw {
 
     spinlock_t tx_lock;
     spinlock_t cb_lock;
+    /* Firmware/data readers may sleep; unpublish VIF roots before draining. */
+    struct srcu_struct vif_readers;
     struct mutex mutex;                         /* per-device perimeter lock */
 
     struct tasklet_struct task;

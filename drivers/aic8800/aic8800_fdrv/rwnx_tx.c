@@ -12,6 +12,7 @@
 #include <net/sock.h>
 
 #include "rwnx_defs.h"
+#include "rwnx_state.h"
 #include "rwnx_tx.h"
 #include "rwnx_msg_tx.h"
 #include "rwnx_mesh.h"
@@ -40,8 +41,13 @@ void rwnx_set_traffic_status(struct rwnx_hw *rwnx_hw,
                              u8 ps_id)
 {
     if (sta->tdls.active) {
-        rwnx_send_tdls_peer_traffic_ind_req(rwnx_hw,
-                                            rwnx_hw->vif_table[sta->vif_idx]);
+		struct rwnx_vif *vif;
+		int idx = srcu_read_lock(&rwnx_hw->vif_readers);
+
+		vif = rwnx_vif_lookup(rwnx_hw, READ_ONCE(sta->vif_idx));
+		if (vif && rwnx_sta_is_valid(sta))
+			rwnx_send_tdls_peer_traffic_ind_req(rwnx_hw, vif);
+		srcu_read_unlock(&rwnx_hw->vif_readers, idx);
     } else {
         bool uapsd = (ps_id != LEGACY_PS_ID);
         rwnx_send_me_traffic_ind(rwnx_hw, sta->sta_idx, uapsd, available);

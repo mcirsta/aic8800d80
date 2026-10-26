@@ -13,6 +13,7 @@
 #include <net/ieee80211_radiotap.h>
 
 #include "rwnx_defs.h"
+#include "rwnx_state.h"
 #include "rwnx_rx.h"
 #include "rwnx_tx.h"
 #include "rwnx_prof.h"
@@ -125,10 +126,10 @@ struct rwnx_vif *rwnx_rx_get_vif(struct rwnx_hw *rwnx_hw, int vif_idx)
 {
 	struct rwnx_vif *vif;
 
-	if (vif_idx < 0 || vif_idx >= NX_VIRT_DEV_MAX)
+	if (vif_idx < 0 || !rwnx_fw_vif_idx_valid(vif_idx))
 		return NULL;
-	vif = rwnx_hw->vif_table[vif_idx];
-	if (!vif || !vif->up)
+	vif = rwnx_vif_lookup(rwnx_hw, vif_idx);
+	if (!vif || (vif->ndev && !netif_running(vif->ndev)))
 		return NULL;
 	return vif;
 }
@@ -508,7 +509,9 @@ static void rwnx_rx_data_skb(struct rwnx_hw *rwnx_hw, struct rwnx_vif *rwnx_vif,
                layer simply resend on wireless interface */
 			if (flags_dst_idx < ARRAY_SIZE(rwnx_hw->sta_table)) {
                 struct rwnx_sta *sta = &rwnx_hw->sta_table[flags_dst_idx];
-                if (sta->valid && (sta->vlan_idx == rwnx_vif->vif_index))
+		if (rwnx_sta_is_valid(sta) &&
+				    sta->vif_idx == master_vif_idx(rwnx_vif) &&
+				    sta->vlan_idx == rwnx_vif->vif_index)
                 {
                     forward = false;
                     resend = true;
@@ -1009,8 +1012,9 @@ static void rwnx_rx_mgmt_any(struct rwnx_hw *rwnx_hw, struct sk_buff *skb,
 #endif
 
     if (vif_idx == RWNX_INVALID_VIF) {
-        list_for_each_entry(rwnx_vif, &rwnx_hw->vifs, list) {
-            if (! rwnx_vif->up)
+	list_for_each_entry_rcu(rwnx_vif, &rwnx_hw->vifs, list,
+				   srcu_read_lock_held(&rwnx_hw->vif_readers)) {
+	    if (!smp_load_acquire(&rwnx_vif->up))
                 continue;
             rwnx_rx_mgmt(rwnx_hw, rwnx_vif, skb, hw_rxhdr);
         }
@@ -1781,7 +1785,7 @@ static struct reord_ctrl_info *reord_sta_get(struct aicwf_rx_priv *rx_priv,
 
 	spin_lock_bh(&rx_priv->stas_reord_lock);
 	if (rx_priv->reord_stopping || !READ_ONCE(vif->up) || !vif->ndev ||
-	    (create && (!peer || !READ_ONCE(peer->valid))))
+	    (create && (!peer || !rwnx_sta_is_valid(peer))))
 		goto out;
 	list_for_each_entry(info, &rx_priv->stas_reord_list, list) {
 		if (info->vif == vif && ether_addr_equal(info->mac_addr, mac) &&
@@ -2143,7 +2147,7 @@ module_param(reorder_timeout, int, 0660);
 static bool reord_ctrl_active(struct reord_ctrl *ctrl)
 {
 	return ctrl->enable && !READ_ONCE(ctrl->owner->dying) &&
-		READ_ONCE(ctrl->owner->vif->up) && READ_ONCE(ctrl->owner->peer->valid);
+		READ_ONCE(ctrl->owner->vif->up) && rwnx_sta_is_valid(ctrl->owner->peer);
 }
 
 static void reord_timer_arm(struct reord_ctrl *ctrl)
@@ -2250,7 +2254,7 @@ int reord_process_unit(struct recv_msdu *frame, struct aicwf_rx_priv *rx_priv,
 	}
 	ctrl = &info->preorder_ctrl[tid];
 	spin_lock_bh(&ctrl->reord_list_lock);
-	if (READ_ONCE(info->dying) || !READ_ONCE(peer->valid) || !READ_ONCE(vif->up)) {
+	if (READ_ONCE(info->dying) || !rwnx_sta_is_valid(peer) || !READ_ONCE(vif->up)) {
 		ret = -ESHUTDOWN;
 		goto unlock_fail;
 	}
@@ -2385,7 +2389,7 @@ static bool rwnx_rx_strip_mgmt_security(struct hw_rxhdr *hw_rxhdr,
 	return true;
 }
 
-void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb,
+static void rwnx_rxdata_process_amsdu_inner(struct rwnx_hw *rwnx_hw, struct sk_buff *skb,
 				u8 vif_idx, struct sk_buff_head *list)
 {
 	struct rwnx_vif *rwnx_vif = rwnx_rx_get_vif(rwnx_hw, vif_idx);
@@ -2413,6 +2417,15 @@ void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb,
 		count = min_t(unsigned int, count, ARRAY_SIZE(rwnx_hw->stats.amsdus_rx));
 		rwnx_hw->stats.amsdus_rx[count - 1]++;
 	}
+}
+
+void rwnx_rxdata_process_amsdu(struct rwnx_hw *rwnx_hw, struct sk_buff *skb,
+				u8 vif_idx, struct sk_buff_head *list)
+{
+	int idx = srcu_read_lock(&rwnx_hw->vif_readers);
+
+	rwnx_rxdata_process_amsdu_inner(rwnx_hw, skb, vif_idx, list);
+	srcu_read_unlock(&rwnx_hw->vif_readers, idx);
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
@@ -2594,7 +2607,7 @@ static bool rwnx_rx_data_indexes_valid(struct rwnx_hw *rwnx_hw,
 	return true;
 }
 
-u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
+static u8 rwnx_rxdataind_aicwf_inner(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 {
 	struct hw_rxhdr hw_rxhdr_copy;
 	struct hw_rxhdr *hw_rxhdr = &hw_rxhdr_copy;
@@ -2813,7 +2826,7 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 #ifdef CONFIG_BR_SUPPORT
 			if((skb->data[1] & 0x3) == 0x2) {
 				for (vif_idx = 0; vif_idx < NX_VIRT_DEV_MAX; vif_idx++) {
-					vif_itr = rwnx_hw->vif_table[vif_idx];
+					vif_itr = rwnx_vif_lookup(rwnx_hw, vif_idx);
 					if (vif_itr && vif_itr->up && RWNX_VIF_TYPE(vif_itr) == NL80211_IFTYPE_AP) {
 						spin_lock_bh(&vif_itr->rwnx_hw->cb_lock);
 						list_for_each_entry(cur_sta, &vif_itr->ap.sta_list, list) {
@@ -2928,18 +2941,30 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 
             if (hw_rxhdr->flags_sta_idx != RWNX_INVALID_STA) {
                 struct rwnx_sta *sta;
+		u8 vlan_idx;
+		bool valid;
 
                 sta = &rwnx_hw->sta_table[hw_rxhdr->flags_sta_idx];
+		spin_lock_bh(&rwnx_hw->cb_lock);
+		valid = rwnx_sta_is_valid(sta) &&
+			sta->sta_idx == hw_rxhdr->flags_sta_idx &&
+			sta->vif_idx == hw_rxhdr->flags_vif_idx;
+		vlan_idx = sta->vlan_idx;
+		spin_unlock_bh(&rwnx_hw->cb_lock);
+		if (!valid)
+			goto drop;
                 rwnx_rx_statistic(rwnx_hw, hw_rxhdr, sta);
 
-                if (sta->vlan_idx != rwnx_vif->vif_index) {
-			if (sta->vlan_idx >= ARRAY_SIZE(rwnx_hw->vif_table))
-				goto drop;
-                    rwnx_vif = rwnx_hw->vif_table[sta->vlan_idx];
-			if (!rwnx_vif || !rwnx_vif->up || !rwnx_vif->ndev) {
+		if (vlan_idx != rwnx_vif->vif_index) {
+			struct rwnx_vif *vlan = rwnx_vif_lookup(rwnx_hw, vlan_idx);
+
+			if (!vlan || !vlan->ndev || !netif_running(vlan->ndev) ||
+			    RWNX_VIF_TYPE(vlan) != NL80211_IFTYPE_AP_VLAN ||
+			    vlan->ap_vlan.master != rwnx_vif) {
                         dev_kfree_skb(skb);
                         goto end;
                     }
+			rwnx_vif = vlan;
                 }
 
                 if (hw_rxhdr->flags_is_4addr && !rwnx_vif->use_4addr) {
@@ -3037,7 +3062,9 @@ u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
 						   layer simply resend on wireless interface */
 						if ((flags_dst_idx != RWNX_INVALID_STA) && !flags_is_amsdu) {
 							struct rwnx_sta *sta = &rwnx_hw->sta_table[flags_dst_idx];
-							if (sta->valid && (sta->vlan_idx == rwnx_vif->vif_index)) {
+							if (rwnx_sta_is_valid(sta) &&
+				    sta->vif_idx == master_vif_idx(rwnx_vif) &&
+				    sta->vlan_idx == rwnx_vif->vif_index) {
 								resend = true;
 								forward = false;
 							}
@@ -3158,3 +3185,14 @@ end:
     return 0;
 }
 
+
+/* Firmware callbacks can sleep; keep VIF storage alive through the last use. */
+u8 rwnx_rxdataind_aicwf(struct rwnx_hw *rwnx_hw, void *hostid, void *rx_priv)
+{
+	int idx = srcu_read_lock(&rwnx_hw->vif_readers);
+	u8 ret;
+
+	ret = rwnx_rxdataind_aicwf_inner(rwnx_hw, hostid, rx_priv);
+	srcu_read_unlock(&rwnx_hw->vif_readers, idx);
+	return ret;
+}
