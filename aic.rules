@@ -10,5 +10,6 @@ KERNEL=="sd*", ATTRS{idVendor}=="a69c", ATTRS{idProduct}=="572a",  SYMLINK+="ten
 KERNEL=="sd*", ATTRS{idVendor}=="a69c", ATTRS{idProduct}=="572c",  SYMLINK+="cudydiskv2", RUN+="/usr/bin/eject /dev/%k"
 KERNEL=="sd*", ATTRS{idVendor}=="a69c", ATTRS{idProduct}=="572f",  SYMLINK+="aicudisk572f", RUN+="/usr/bin/eject /dev/%k"
 
-# AIC8800D80 "Pandora" clone: switch 1111:1111 to its operational USB ID.
-ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1111", ATTR{idProduct}=="1111", RUN+="/bin/sh -c 'if [ -x /usr/sbin/usb_modeswitch ]; then exec /usr/sbin/usb_modeswitch -c /etc/usb_modeswitch.d/1111:1111; elif [ -x /usr/bin/usb_modeswitch ]; then exec /usr/bin/usb_modeswitch -c /etc/usb_modeswitch.d/1111:1111; fi'"
+# Generic 1111:1111 is not a unique AIC identity. Do not send vendor SCSI
+# commands automatically. The verified compound installer revision is handled
+# by 59-aic8800-installer.rules; standalone Pandora switching is manual-only.

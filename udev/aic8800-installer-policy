@@ -1,0 +1,212 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Suppress the verified installer function of one AIC USB compound revision.
+
+This is device policy, not a security/authentication boundary. It performs no
+SCSI commands, mode switches, NVM writes, mounts or driver loading. Missing or
+ambiguous evidence leaves the storage available. No code runs on import.
+"""
+import argparse
+import contextlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+HUB = {"idVendor": "214b", "idProduct": "7260", "bcdDevice": "0100",
+       "bDeviceClass": "09", "maxchild": "4"}
+INSTALLER = {"idVendor": "1111", "idProduct": "1111", "bcdDevice": "1001",
+             "bDeviceClass": "00", "bNumConfigurations": "1",
+             "bNumInterfaces": "1", "manufacturer": "FLASH", "product": "FLASH",
+             "serial": "12345FLN1H"}
+INTERFACE = {"bInterfaceNumber": "00", "bAlternateSetting": "0",
+             "bInterfaceClass": "08", "bInterfaceSubClass": "06",
+             "bInterfaceProtocol": "50", "bNumEndpoints": "02"}
+AIC_PRODUCTS = {"8d80", "8d81"}
+INSTALLER_SECTORS = 7944
+
+
+def read_attr(path, name):
+    try:
+        with (path / name).open("r", encoding="ascii") as source:
+            value = source.read(257)
+        return value.strip() if len(value) <= 256 else None
+    except (OSError, UnicodeError):
+        return None
+
+
+def matches(path, attributes):
+    return all(read_attr(path, key) == value for key, value in attributes.items())
+
+
+def beneath(path, parent):
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+class Policy:
+    def __init__(self, sysroot=Path("/sys"), devroot=Path("/dev")):
+        self.sysroot = sysroot.resolve()
+        self.devices = self.sysroot / "devices"
+        self.devroot = devroot
+
+    def event_device(self, event):
+        # udev supplies a kernel DEVPATH, never a shell command or disk name.
+        if event.startswith("/devices/"):
+            event = str(self.sysroot) + event
+        path = Path(event).resolve(strict=True)
+        if not beneath(path, self.devices):
+            raise ValueError("event is outside sysfs devices")
+        while path != self.devices:
+            if read_attr(path, "idVendor") is not None:
+                return path
+            path = path.parent
+        return None
+
+    def candidates(self, event):
+        device = self.event_device(event)
+        if device is None:
+            return []
+        vendor = read_attr(device, "idVendor")
+        product = read_attr(device, "idProduct")
+        if not ((vendor == "1111" and product == "1111") or
+                (vendor == "a69c" and product in AIC_PRODUCTS)):
+            return []
+        hub = device.parent
+        if not matches(hub, HUB):
+            return []
+        children = [child for child in hub.iterdir() if child.is_dir() and
+                    read_attr(child, "idVendor") is not None]
+        if not any(read_attr(child, "idVendor") == "a69c" and
+                   read_attr(child, "idProduct") in AIC_PRODUCTS and
+                   read_attr(child, "authorized") == "1" for child in children):
+            return []
+        found = []
+        for child in children:
+            if not matches(child, INSTALLER) or read_attr(child, "authorized") != "1":
+                continue
+            interfaces = [node for node in child.iterdir() if node.is_dir() and
+                          read_attr(node, "bInterfaceNumber") is not None]
+            if len(interfaces) != 1 or not matches(interfaces[0], INTERFACE):
+                continue
+            interface = interfaces[0]
+            generation = read_attr(child, "devnum")
+            if generation is None or not generation.isdecimal():
+                continue
+            found.append((child, interface, generation))
+        return found
+
+    def disk(self, interface):
+        disks = [node for node in interface.glob("host*/target*/*/block/*")
+                 if (node / "dev").is_file() and not (node / "partition").exists()]
+        if len(disks) != 1:
+            return None
+        disk = disks[0]
+        if not re.fullmatch(r"sd[a-z]+", disk.name):
+            return None
+        if read_attr(disk, "size") != str(INSTALLER_SECTORS):
+            return None
+        if read_attr(disk, "removable") != "1":
+            return None
+        holders = disk / "holders"
+        if not holders.is_dir() or any(holders.iterdir()):
+            return None
+        numbers = read_attr(disk, "dev")
+        if numbers is None or not re.fullmatch(r"[0-9]+:[0-9]+", numbers):
+            return None
+        return disk
+
+    @contextlib.contextmanager
+    def claim_disk(self, disk):
+        # A mounted/claimed filesystem (in any mount namespace) makes O_EXCL
+        # fail with EBUSY. Hold the claim through deauthorization so a new mount
+        # cannot race the decision. Never use O_RDWR or issue block writes.
+        numbers = read_attr(disk, "dev")
+        if numbers is None or not re.fullmatch(r"[0-9]+:[0-9]+", numbers):
+            raise ValueError("disk identity disappeared")
+        major, minor = (int(value) for value in numbers.split(":"))
+        flags = os.O_RDONLY | os.O_EXCL | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(str(self.devroot / disk.name), flags)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISBLK(metadata.st_mode) or metadata.st_rdev != os.makedev(major, minor):
+                raise ValueError("disk node does not match sysfs device")
+            yield
+        finally:
+            os.close(fd)
+
+    def apply(self, event, check=False):
+        results = []
+        for device, interface, generation in self.candidates(event):
+            row = {"interface": str(interface), "generation": generation}
+            if read_attr(interface, "authorized") == "0":
+                row["status"] = "already-disabled"
+                results.append(row)
+                continue
+            disk = self.disk(interface)
+            if disk is None:
+                # Both USB sides and the disk-add event call us. Waiting for
+                # that event avoids polling, deferred workers and early-probe
+                # races with a disk that has not been published yet.
+                row["status"] = "pending-or-unsupported-disk"
+                results.append(row)
+                continue
+            row["disk"] = disk.name
+            if check:
+                row["status"] = "matches; no action"
+                results.append(row)
+                continue
+            try:
+                with self.claim_disk(disk):
+                    # Pin this exact kernfs attribute before revalidation. A
+                    # replacement device at the same path must never receive
+                    # an authorization write intended for the previous one.
+                    flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+                    authorized_fd = os.open(str(interface / "authorized"), flags)
+                    try:
+                        current = self.candidates(event)
+                        if (device, interface, generation) not in current or self.disk(interface) != disk:
+                            row["status"] = "changed; no action"
+                        elif read_attr(interface, "authorized") == "0":
+                            row["status"] = "already-disabled"
+                        else:
+                            if os.write(authorized_fd, b"0\n") != 2:
+                                raise OSError("short interface authorization write")
+                            row["status"] = "disabled"
+                    finally:
+                        os.close(authorized_fd)
+            except OSError as error:
+                # Busy, missing or newly removed storage must stay untouched.
+                row["status"] = "busy-or-unavailable; no action"
+                row["errno"] = error.errno
+            except ValueError:
+                row["status"] = "identity-changed; no action"
+            results.append(row)
+        return results
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true", help="inspect matching evidence without opening a disk or changing authorization")
+    mode.add_argument("--apply", action="store_true", help="apply the fixed installer-only authorization policy")
+    parser.add_argument("event", help="kernel DEVPATH or absolute sysfs event path")
+    options = parser.parse_args(argv)
+    if options.apply and os.geteuid() != 0:
+        parser.error("--apply requires root")
+    try:
+        result = Policy().apply(options.event, check=options.check)
+    except (OSError, ValueError):
+        result = []  # Event removal or a malformed path is a harmless no-match.
+    if options.check:
+        print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

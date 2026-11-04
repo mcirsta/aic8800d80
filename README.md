@@ -61,13 +61,10 @@ Before installing the driver, delete all aic8800-related folders under /lib/firm
 
 #### Pandora 88M80 mode switching
 
-Pandora 88M80 adapters that initially appear as USB device `1111:1111` are
-automatically switched to `a69c:8d80` by sending the required `F3` then `F2`
-commands. Existing users must rerun `sudo ./install.sh` to replace the installed
-usb_modeswitch configuration, then unplug the adapter completely and plug it
-back in.
-
-If automatic switching does not occur, try the same sequence manually:
+`1111:1111` is not a unique AIC identifier. Automatic vendor-command mode
+switching for every device with that ID has been removed. For a confirmed
+standalone Pandora 88M80 adapter that initially exposes only its installer,
+the known volatile F3/F2 sequence can be requested manually:
 
 ```bash
 sudo usb_modeswitch -v 1111 -p 1111 \
@@ -78,6 +75,23 @@ sudo usb_modeswitch -v 1111 -p 1111 \
 This only addresses switching from `1111:1111` to `a69c:8d80`. If the device
 has reached `a69c:8d80` but firmware startup still fails, see
 [issue #79](https://github.com/shenmintao/aic8800d80/issues/79).
+
+#### Compound adapter installer storage
+
+The verified compound revision has a separate 3.9 MiB Windows installer disk
+beside the AIC Wi-Fi function. The packaged [installer-interface policy](udev/README.md)
+suppresses only that verified installer interface on Linux. It matches the
+hardware descriptors and actual AIC sibling, works on any USB port, and sends
+no vendor mode-switch or storage-write commands. Mounted or claimed storage
+is left available. Other `1111:1111` devices are unaffected.
+
+The normal installer installs this policy. Distribution packages can stage it
+separately with `DESTDIR=... sh udev/install-policy.sh`; this does not build,
+install or reload kernel modules. Existing administrator modeswitch files are
+preserved. Remove any externally installed broad `1111:1111` vendor-command
+rules before relying on this policy; the package cannot neutralize unrelated
+rules safely. A complete replug restores USB authorization if the policy is
+removed or locally disabled.
 
 ### Installation Steps
 
