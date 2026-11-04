@@ -79,19 +79,17 @@ has reached `a69c:8d80` but firmware startup still fails, see
 #### Compound adapter installer storage
 
 The verified compound revision has a separate 3.9 MiB Windows installer disk
-beside the AIC Wi-Fi function. The packaged [installer-interface policy](udev/README.md)
-suppresses only that verified installer interface on Linux. It matches the
-hardware descriptors and actual AIC sibling, works on any USB port, and sends
-no vendor mode-switch or storage-write commands. Mounted or claimed storage
-is left available. Other `1111:1111` devices are unaffected.
+beside the AIC Wi-Fi function. The experimental userspace suppression policy
+has been removed from this package. A [draft normal USB-storage kernel
+quirk](kernel-patches/usb-storage/README.md) declines this verified installer on
+future probes when its compound-device fingerprint matches. It must be built
+into the normal USB-storage driver; the Wi-Fi module alone does not apply it.
 
-The normal installer installs this policy. Distribution packages can stage it
-separately with `DESTDIR=... sh udev/install-policy.sh`; this does not build,
-install or reload kernel modules. Existing administrator modeswitch files are
-preserved. Remove any externally installed broad `1111:1111` vendor-command
-rules before relying on this policy; the package cannot neutralize unrelated
-rules safely. A complete replug restores USB authorization if the policy is
-removed or locally disabled.
+`1111:1111` is a generic identity, so a broad storage blacklist is unsuitable.
+The kernel draft checks the observed revision, descriptors, parent hub and AIC
+sibling without depending on the Wi-Fi driver's readiness. It remains
+experimental and enumeration-order sensitive when that sibling is absent. No
+automatic vendor command or generic `1111:1111` suppression rule is installed here.
 
 ### Installation Steps
 

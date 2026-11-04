@@ -11,5 +11,5 @@ KERNEL=="sd*", ATTRS{idVendor}=="a69c", ATTRS{idProduct}=="572c",  SYMLINK+="cud
 KERNEL=="sd*", ATTRS{idVendor}=="a69c", ATTRS{idProduct}=="572f",  SYMLINK+="aicudisk572f", RUN+="/usr/bin/eject /dev/%k"
 
 # Generic 1111:1111 is not a unique AIC identity. Do not send vendor SCSI
-# commands automatically. The verified compound installer revision is handled
-# by 59-aic8800-installer.rules; standalone Pandora switching is manual-only.
+# commands automatically. Standalone Pandora switching is manual-only;
+# this package does not install a generic installer-suppression policy.

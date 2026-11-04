@@ -1,0 +1,128 @@
+--- a/drivers/usb/storage/initializers.c
++++ b/drivers/usb/storage/initializers.c
+@@ -92,3 +92,99 @@
+ 	usb_stor_dbg(us, "Huawei mode set result is %d\n", result);
+ 	return 0;
+ }
++
++/* Decline the verified compound adapter's separate installer storage. */
++
++struct aic_installer_sibling {
++	struct usb_device *installer;
++	struct usb_device *hub;
++};
++
++static int aic_installer_has_sibling(struct usb_device *udev, void *data)
++{
++	struct aic_installer_sibling *match = data;
++	u16 product;
++
++	if (udev == match->installer || udev->parent != match->hub ||
++	    udev->portnum != 1)
++		return 0;
++
++	/* Registered device descriptors are immutable; binding state is irrelevant. */
++	product = le16_to_cpu(udev->descriptor.idProduct);
++	return le16_to_cpu(udev->descriptor.idVendor) == 0xa69c &&
++	       (product == 0x8d80 || product == 0x8d81);
++}
++
++static bool aic_installer_layout(struct us_data *us)
++{
++	struct usb_device *udev = us->pusb_dev;
++	struct usb_host_interface *alt;
++	struct usb_host_config *config;
++	struct usb_interface *intf = us->pusb_intf;
++	bool bulk_in = false, bulk_out = false;
++	int i;
++
++	if (!udev || !intf || udev->portnum != 2 ||
++	    le16_to_cpu(udev->descriptor.idVendor) != 0x1111 ||
++	    le16_to_cpu(udev->descriptor.idProduct) != 0x1111 ||
++	    le16_to_cpu(udev->descriptor.bcdDevice) != 0x1001 ||
++	    udev->descriptor.bDeviceClass ||
++	    udev->descriptor.bNumConfigurations != 1 ||
++	    !udev->manufacturer || strcmp(udev->manufacturer, "FLASH") ||
++	    !udev->product || strcmp(udev->product, "FLASH") ||
++	    !udev->serial || strcmp(udev->serial, "12345FLN1H"))
++		return false;
++
++	config = udev->actconfig;
++	if (!config || config != udev->config ||
++	    config->desc.bNumInterfaces != 1 || config->interface[0] != intf ||
++	    intf->num_altsetting != 1 || !intf->altsetting ||
++	    intf->cur_altsetting != intf->altsetting)
++		return false;
++
++	alt = intf->cur_altsetting;
++	if (alt->desc.bInterfaceNumber || alt->desc.bAlternateSetting ||
++	    alt->desc.bInterfaceClass != USB_CLASS_MASS_STORAGE ||
++	    alt->desc.bInterfaceSubClass != USB_SC_SCSI ||
++	    alt->desc.bInterfaceProtocol != USB_PR_BULK ||
++	    alt->desc.bNumEndpoints != 2 || !alt->endpoint)
++		return false;
++
++	for (i = 0; i < 2; i++) {
++		struct usb_endpoint_descriptor *ep = &alt->endpoint[i].desc;
++
++		if (usb_endpoint_is_bulk_in(ep) && ep->bEndpointAddress == 0x81)
++			bulk_in = true;
++		if (usb_endpoint_is_bulk_out(ep) && ep->bEndpointAddress == 0x01)
++			bulk_out = true;
++	}
++	return bulk_in && bulk_out;
++}
++
++int usb_stor_aic_compound_installer_init(struct us_data *us)
++{
++	struct aic_installer_sibling match;
++	struct usb_device *hub;
++
++	if (!us || !aic_installer_layout(us))
++		return 0;
++
++	hub = us->pusb_dev->parent;
++	if (!hub ||
++	    le16_to_cpu(hub->descriptor.idVendor) != 0x214b ||
++	    le16_to_cpu(hub->descriptor.idProduct) != 0x7260 ||
++	    le16_to_cpu(hub->descriptor.bcdDevice) != 0x0100 ||
++	    hub->descriptor.bDeviceClass != USB_CLASS_HUB ||
++	    READ_ONCE(hub->maxchild) != 4)
++		return 0;
++
++	match.installer = us->pusb_dev;
++	match.hub = hub;
++	/* usb_for_each_dev() holds each device alive during its callback. */
++	if (usb_for_each_dev(&match, aic_installer_has_sibling) != 1)
++		return 0;
++
++	dev_info(&us->pusb_intf->dev,
++		 "ignoring verified AIC compound installer storage\n");
++	return -ENODEV;
++}
+--- a/drivers/usb/storage/initializers.h
++++ b/drivers/usb/storage/initializers.h
+@@ -37,3 +37,6 @@
+ 
+ /* This places the HUAWEI E220 devices in multi-port mode */
+ int usb_stor_huawei_e220_init(struct us_data *us);
++
++/* Decline only the verified compound-device installer. */
++int usb_stor_aic_compound_installer_init(struct us_data *us);
+--- a/drivers/usb/storage/unusual_devs.h
++++ b/drivers/usb/storage/unusual_devs.h
+@@ -1762,6 +1762,14 @@
+ 		0),
+ 
+ /*
++ * This FLASH installer is a separate child of the AIC compound dongle.
++ * Shared-looking IDs require descriptor and actual-sibling validation.
++ */
++UNUSUAL_DEV(0x1111, 0x1111, 0x1001, 0x1001,
++		"FLASH", "FLASH",
++		USB_SC_DEVICE, USB_PR_DEVICE, usb_stor_aic_compound_installer_init, 0),
++
++/*
+  * Reported by Pascal Terjan <pterjan@mandriva.com>
+  * Ignore driver CD mode and force into modem mode by default.
+  */

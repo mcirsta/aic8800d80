@@ -1,0 +1,39 @@
+# AIC compound installer quirk
+
+`0001-ignore-aic-compound-installer.patch` is a draft change to the normal Linux
+USB-storage driver. It declines the verified adapter's separate Windows
+installer before registering a SCSI host or disk. It sends no eject, vendor
+mode-switch or firmware command and requires no userspace suppression daemon.
+
+The quirk matches the observed FLASH revision, descriptors and serial under
+the matching four-port hub, with FLASH on relative internal port 2 and an AIC
+ROM/runtime sibling on port 1. These are ports inside the adapter, independent
+of the computer's USB bus/port. The AIC driver need not be ready, configured or
+authorized: cached numeric descriptor identity is sufficient. No sibling mutex
+or readiness-dependent check is used. Other devices continue normal probing.
+
+This is a normal kernel patch, separate from the Wi-Fi module. Building or
+installing `aic8800_fdrv.ko` alone does not apply it. Apply the patch to the
+matching kernel source and include it in the distribution's normal kernel or
+USB-storage module build; keep that kernel's module ABI, signing and initramfs
+requirements. Preserve a working original module/kernel and boot fallback.
+Do not replace or unload USB-storage while it serves mounted/in-use media.
+
+The patch was generated against the official CachyOS 7.3.1-1 source. Its normal
+module build retains stock storage IDs, exports and ordinary probing. It has no
+test-only forced rejection, renamed driver, dynamic-ID injection or symbol hook.
+The narrow initializer is covered by focused source tests; physical cold-plug
+ordering and persistent activation require separate runtime evidence.
+
+An absent AIC sibling remains a nonmatch. A ROM-to-runtime enumeration gap may
+therefore leave storage available; no unsafe assumption about a missing device,
+unbounded deferred probe or bus-notifier policy is added. The observed revision
+and ordinary board plug ordering need validation before claiming broader model
+support. This patch is not yet submitted or accepted upstream.
+
+Mainline has accepted installer ignore quirks, including the
+[2025 Realtek change](https://patchew.org/linux/20250813162415.2630-1-zenmchen@gmail.com/).
+Acceptance of this draft remains a separate review question: the generic USB
+identity and a working installer require a clear hardware/model justification.
+The preference to remove the Windows disk is not presented as a demonstrated
+failure of ordinary USB-storage discovery.

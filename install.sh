@@ -239,7 +239,7 @@ install_dependencies() {
             print_info "Updating package database..."
             run_logged "Package database update" apt-get update
 
-            local -a packages=(dkms build-essential mokutil eject usb-modeswitch python3)
+            local -a packages=(dkms build-essential mokutil eject usb-modeswitch)
             if [ "$install_kernel_headers" = true ]; then
                 packages+=("linux-headers-$(uname -r)")
             fi
@@ -248,7 +248,7 @@ install_dependencies() {
             ;;
             
         dnf)
-            local -a packages=(dkms make gcc mokutil util-linux usb_modeswitch python3)
+            local -a packages=(dkms make gcc mokutil util-linux usb_modeswitch)
             if [ "$install_kernel_headers" = true ]; then
                 packages+=(kernel-devel kernel-headers)
             fi
@@ -257,7 +257,7 @@ install_dependencies() {
             ;;
             
         yum)
-            local -a packages=(dkms make gcc mokutil util-linux usb_modeswitch python3)
+            local -a packages=(dkms make gcc mokutil util-linux usb_modeswitch)
             if [ "$install_kernel_headers" = true ]; then
                 packages+=(kernel-devel)
             fi
@@ -271,7 +271,7 @@ install_dependencies() {
             print_info "Syncing package database..."
             run_logged "Package database sync" pacman -Sy --noconfirm
 
-            local -a packages=(dkms base-devel mokutil util-linux usb_modeswitch python)
+            local -a packages=(dkms base-devel mokutil util-linux usb_modeswitch)
             if [ "$install_kernel_headers" = true ]; then
                 packages+=(linux-headers)
             fi
@@ -280,7 +280,7 @@ install_dependencies() {
             ;;
             
         zypper)
-            local -a packages=(dkms make gcc mokutil util-linux usb_modeswitch python3)
+            local -a packages=(dkms make gcc mokutil util-linux usb_modeswitch)
             if [ "$install_kernel_headers" = true ]; then
                 packages+=(kernel-devel)
             fi
@@ -424,13 +424,6 @@ install_firmware() {
     else
         print_warning "Udev rules file not found: $rules_source"
     fi
-
-    # This portable device policy is independent of module/firmware contents.
-    # Never delete an administrator's modeswitch configuration during upgrade.
-    print_info "Installing the verified compound USB installer policy..."
-    run_logged "Installer-interface policy installation" sh "${SCRIPT_DIR}/udev/install-policy.sh"
-    udevadm control --reload-rules >> "$LOG_FILE" 2>&1 || true
-    print_info "Replug the adapter to apply the model policy; no global device trigger is run."
 
     print_success "Firmware installed successfully."
 }
