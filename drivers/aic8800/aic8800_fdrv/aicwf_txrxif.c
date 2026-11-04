@@ -195,14 +195,16 @@ void aicwf_bus_deinit(struct device *dev)
     bus_if = dev_get_drvdata(dev);
 	if (!bus_if)
 		return;
-    aicwf_bus_stop(bus_if);
 
 #ifdef AICWF_USB_SUPPORT
-    usb = bus_if->bus_priv.usb;
-	aicwf_usb_cancel_all_urbs(usb);//AIDEN
-
+	usb = bus_if->bus_priv.usb;
+	/* Warm unbind must acknowledge firmware stack-stop before stopping USB. */
 	aicwf_rwnx_usb_platform_deinit(usb);
+#endif
+	aicwf_bus_stop(bus_if);
 
+#ifdef AICWF_USB_SUPPORT
+	aicwf_usb_cancel_all_urbs(usb);
 #endif
 #ifdef AICWF_SDIO_SUPPORT
     sdiodev =bus_if->bus_priv.sdio;

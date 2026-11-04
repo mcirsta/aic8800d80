@@ -2618,6 +2618,8 @@ static struct usb_driver aicwf_usbdrvr = {
     .probe = aicwf_usb_probe,
     .disconnect = aicwf_usb_disconnect,
     .id_table = aicwf_usb_id_table,
+	/* Keep endpoints usable for acknowledged stack-stop; disconnect drains them. */
+	.soft_unbind = 1,
 	/*
 	 * Firmware state retention and wake-on-Wi-Fi are not implemented. USB core
 	 * unbinds before system sleep and reprobes after resume/restore, giving
