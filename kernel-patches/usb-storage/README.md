@@ -31,10 +31,18 @@ and other storage were preserved.
 The local 7.3.1-1-cachyos installation now selects the patched normal module and
 contains its exact bytes in the rebuilt initramfs, with matching Limine hashes
 and the LTS fallback unchanged. The userspace helper/rule and temporary guard
-are removed. This validates installation and a live probe; reboot and physical
-cold-plug ordering have not been tested. This local override is kernel-version
-specific and must be rebuilt for a kernel upgrade until the patch is integrated
-in the kernel package.
+are removed. One subsequent physical unplug/replug also left the installer
+authorized without a SCSI host or disk, matching the AIC ROM sibling on port 1.
+Reboot and successful ROM-to-runtime enumeration remain untested. This local
+override is kernel-version specific and must be rebuilt for a kernel upgrade
+until the patch is integrated in the kernel package.
+
+That fresh plug separately exposed a failure in the preserved installed AIC
+loader: it could not open the existing patch-table firmware file and stayed in
+`a69c:8d80` ROM mode without a network interface. Kernel logs show this failure
+before the FLASH child is enumerated or this initializer runs. It is not a
+passing Wi-Fi hot-plug result. The development loader uses `request_firmware()`;
+the installed DKMS loader still uses `filp_open()` and has not been replaced.
 
 An absent AIC sibling remains a nonmatch. A ROM-to-runtime enumeration gap may
 therefore leave storage available; no unsafe assumption about a missing device,
