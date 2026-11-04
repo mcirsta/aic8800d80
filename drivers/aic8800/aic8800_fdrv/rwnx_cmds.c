@@ -13,6 +13,7 @@
 
 //#define CREATE_TRACE_POINTS
 #include <linux/list.h>
+#include <linux/sched.h>
 
 #include "rwnx_cmds.h"
 #include "rwnx_msg_tx.h"
@@ -83,6 +84,10 @@ static int cmd_mgr_queue(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd)
 	int ret;
 
 	spin_lock_bh(&cmd_mgr->lock);
+	if (cmd_mgr->shutdown_owner && cmd_mgr->shutdown_owner != current) {
+		ret = -ESHUTDOWN;
+		goto reject;
+	}
 	if (cmd_mgr->state != RWNX_CMD_MGR_STATE_INITED || !cmd_mgr->cmd_wq) {
 		ret = -EPIPE;
 		goto reject;
@@ -319,6 +324,7 @@ void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_hw *hw)
 	complete_all(&cmd_mgr->users_idle);
 	cmd_mgr->hw = hw;
 	cmd_mgr->active = NULL;
+	cmd_mgr->shutdown_owner = NULL;
 	cmd_mgr->users = 0;
 	cmd_mgr->queue_sz = 0;
 	cmd_mgr->next_tkn = 0;
@@ -333,6 +339,22 @@ void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_hw *hw)
 	cmd_mgr->cmd_wq = create_singlethread_workqueue("cmd_wq");
 	if (!cmd_mgr->cmd_wq)
 		cmd_mgr->state = RWNX_CMD_MGR_STATE_CRASHED;
+}
+
+/* Seal ordinary admission, then finish admitted commands with RX still live. */
+void rwnx_cmd_mgr_begin_shutdown(struct rwnx_cmd_mgr *cmd_mgr)
+{
+	spin_lock_bh(&cmd_mgr->lock);
+	if (WARN_ON_ONCE(cmd_mgr->shutdown_owner &&
+			 cmd_mgr->shutdown_owner != current)) {
+		spin_unlock_bh(&cmd_mgr->lock);
+		return;
+	}
+	cmd_mgr->shutdown_owner = current;
+	spin_unlock_bh(&cmd_mgr->lock);
+	if (cmd_mgr->cmd_wq)
+		flush_work(&cmd_mgr->cmdWork);
+	wait_for_completion(&cmd_mgr->users_idle);
 }
 
 /* Producers/RX stop first; wake and join owners before releasing hw or work. */

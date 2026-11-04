@@ -240,6 +240,13 @@ callbacks before sleeping and rebinds it after the resume transition. This
 fully drains the old USB/command/RX/TX state and initializes a fresh binding;
 a network manager must reconnect a saved network after wake.
 
+Warm teardown stops data TX and drains admitted commands, then sends an
+acknowledged firmware reset while command RX remains live. Only the teardown
+caller can submit commands after that drain begins. The stack-stop notification
+alone does not reset the firmware's MAC timers; leaving them active can crash
+the next RF calibration. Host interfaces and callback state remain allocated
+until the existing teardown drains their owners.
+
 Retaining firmware association across sleep, USB runtime autosuspend and
 wake-on-Wi-Fi are not supported. USB builds reject the legacy `CONFIG_WOWLAN`
 and `CONFIG_GPIO_WAKEUP` options instead of advertising unsupported wake flags.

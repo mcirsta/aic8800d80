@@ -109,6 +109,7 @@ struct rwnx_cmd_mgr {
 
 	struct rwnx_hw *hw;
 	struct rwnx_cmd *active;
+	struct task_struct *shutdown_owner;
 	unsigned int users;
 	struct completion users_idle;
 
@@ -122,6 +123,7 @@ struct rwnx_cmd_mgr {
     } while (0)
 
 void rwnx_cmd_mgr_init(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_hw *hw);
+void rwnx_cmd_mgr_begin_shutdown(struct rwnx_cmd_mgr *cmd_mgr);
 void rwnx_cmd_mgr_quiesce(struct rwnx_cmd_mgr *cmd_mgr);
 void rwnx_cmd_mgr_deinit(struct rwnx_cmd_mgr *cmd_mgr);
 int cmd_mgr_queue_force_defer(struct rwnx_cmd_mgr *cmd_mgr, struct rwnx_cmd *cmd);

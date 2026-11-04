@@ -9799,17 +9799,28 @@ void rwnx_cfg80211_deinit(struct rwnx_hw *rwnx_hw)
 	aicwf_wext_cache_purge(rwnx_hw, NULL, true);
 #endif
 #ifdef AICWF_USB_SUPPORT
+	aicwf_usb_tx_stop(rwnx_hw->usbdev);
+	/* Keep command RX live, but prevent any new ordinary firmware mutations. */
+	rwnx_cmd_mgr_begin_shutdown(rwnx_hw->cmd_mgr);
 	/* Physical removal has no firmware peer; warm unbind still needs its ACK. */
 	if (rwnx_close_bus_ready(rwnx_hw->usbdev->bus_if) &&
-	    READ_ONCE(rwnx_hw->usbdev->udev->state) == USB_STATE_CONFIGURED)
-#endif
+	    READ_ONCE(rwnx_hw->usbdev->udev->state) == USB_STATE_CONFIGURED) {
+		/* Stack-stop only notifies firmware; MM_RESET drains its MAC timers. */
+		ret = rwnx_send_reset(rwnx_hw);
+		if (ret)
+			dev_warn(rwnx_hw->dev,
+				 "firmware reset failed during teardown: %d\n", ret);
 		ret = rwnx_send_set_stack_start_req(rwnx_hw, 0, 0, 0, 0,
 						  &set_start_cfm);
+	}
+#else
+	ret = rwnx_send_set_stack_start_req(rwnx_hw, 0, 0, 0, 0,
+					 &set_start_cfm);
+#endif
 	if (ret)
 		dev_warn(rwnx_hw->dev, "firmware stack-stop failed during teardown: %d\n", ret);
 
 #ifdef AICWF_USB_SUPPORT
-	aicwf_usb_tx_stop(rwnx_hw->usbdev);
 	aicwf_usb_rx_quiesce(rwnx_hw->usbdev);
 #ifdef AICWF_RX_REORDER
 	if (rwnx_hw->usbdev->rx_priv)
