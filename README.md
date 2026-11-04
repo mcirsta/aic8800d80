@@ -267,4 +267,11 @@ before unwinding. A device reset does not reuse the old firmware/station state.
 A device-specific Wi-Fi interface unbind/rebind test exercises the teardown and
 reprobe boundary without putting the PC or other USB devices to sleep. Such a
 test does not establish physical suspend, wake signaling or power-loss behavior.
+One short D80 test on `7.3.1-1-cachyos` passed an active Wi-Fi interface
+unbind/rebind, automatic reconnection and two gateway pings before and after.
+The USB generation and Bluetooth HCI stayed unchanged, with no firmware timer
+assertion or reset/stack-stop warning. A temporary Ethernet-only ARP guard kept
+the same-subnet test replies on Wi-Fi and was restored afterward. This is
+functional boundary evidence; it did not directly trace the reset acknowledgement
+or exercise a PC suspend/resume cycle. Installed DKMS and firmware were preserved.
 The policy follows the [kernel USB power-management model](https://docs.kernel.org/driver-api/usb/power-management.html).
