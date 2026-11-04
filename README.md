@@ -56,8 +56,21 @@ Radxa's [current copyright metadata](https://github.com/radxa-pkg/aic8800/blob/d
 assigns GPL-2 to `src/*` and the same license to driver patches; its root
 GPL-3.0-or-later license covers Radxa's packaging files.
 
-### Attention
-Before installing the driver, delete all aic8800-related folders under /lib/firmware. Using an incorrect firmware version may cause the system to freeze.
+### Firmware loading
+
+Use firmware matching the adapter revision, keeping recoverable copies before
+an update. The development loader and runtime use `request_firmware()` with
+the actual USB device and relative chip-directory names. For this D80 adapter,
+`aic8800D80/fw_patch_table_8800d80_u02.bin` resolves beneath the normal Linux
+firmware search root, usually `/lib/firmware`.
+
+Build and load the matching loader/runtime pair: the original vendor runtime
+requires an export removed from the development loader. A short D80 test on
+Linux `7.3.1-1-cachyos` verified firmware loading, association and DHCP, then
+automatic firmware reload and reconnection after one physical unplug/replug.
+Two interface-bound gateway pings passed before and after the plug. That test
+kept the validated modules in RAM and preserved installed DKMS/firmware files;
+it does not make the development pair persistent across reboot.
 
 #### Pandora 88M80 mode switching
 

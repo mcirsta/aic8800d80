@@ -43,6 +43,10 @@ loader: it could not open the existing patch-table firmware file and stayed in
 before the FLASH child is enumerated or this initializer runs. It is not a
 passing Wi-Fi hot-plug result. The development loader uses `request_firmware()`;
 the installed DKMS loader still uses `filp_open()` and has not been replaced.
+The follow-up matching development loader/runtime pair passed one physical
+unplug/replug with automatic firmware reload, DHCP/reconnection and two gateway
+pings. It remains active in RAM while the installed legacy files are preserved;
+reloading those installed files restores their older behavior.
 
 An absent AIC sibling remains a nonmatch. A ROM-to-runtime enumeration gap may
 therefore leave storage available; no unsafe assumption about a missing device,
