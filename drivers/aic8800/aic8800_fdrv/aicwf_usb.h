@@ -121,7 +121,9 @@ typedef enum {
 enum aicwf_usb_state {
     USB_DOWN_ST,
     USB_UP_ST,
-    USB_SLEEP_ST
+	USB_SLEEP_ST,
+	/* RX preparation is allowed, but normal traffic is not yet admitted. */
+	USB_STARTING_ST
 };
 
 struct aicwf_usb_buf {
@@ -166,6 +168,8 @@ struct aic_usb_dev {
     struct device *dev;
     struct aicwf_rx_priv* rx_priv;
     enum aicwf_usb_state state;
+	/* Serialize RX check/anchor/submit against transport shutdown. */
+	spinlock_t rx_submit_lock;
     struct rwnx_cmd_mgr cmd_mgr;
 	struct rwnx_plat *plat;
 	spinlock_t recovery_lock;

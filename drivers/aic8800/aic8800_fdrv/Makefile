@@ -111,6 +111,12 @@ else
 CONFIG_USB_NO_TRANS_DMA_MAP = n
 endif
 CONFIG_GPIO_WAKEUP = n
+# USB system sleep uses disconnect/reprobe, with no firmware wake contract.
+ifeq ($(CONFIG_USB_SUPPORT),y)
+ifneq ($(filter y,$(CONFIG_WOWLAN) $(CONFIG_GPIO_WAKEUP)),)
+$(error USB wake-on-Wi-Fi is unsupported with the disconnect/reprobe PM policy)
+endif
+endif
 CONFIG_CREATE_TRACE_POINTS = n
 CONFIG_SUPPORT_REALTIME_CHANGE_MAC = y
 CONFIG_USE_USB_ZERO_PACKET = y

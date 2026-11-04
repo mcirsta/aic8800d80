@@ -217,3 +217,22 @@ The Wi-Fi-reset recovery behavior tracked in
 limitation: after an airplane-mode or hotspot reset, Bluetooth may require a
 physical unplug/replug of the adapter.
 
+
+### System sleep and resume
+
+The USB driver uses USB core's disconnect/reprobe policy for system suspend,
+hibernation and resume. USB core unbinds an interface whose driver has no PM
+callbacks before sleeping and rebinds it after the resume transition. This
+fully drains the old USB/command/RX/TX state and initializes a fresh binding;
+a network manager must reconnect a saved network after wake.
+
+Retaining firmware association across sleep, USB runtime autosuspend and
+wake-on-Wi-Fi are not supported. USB builds reject the legacy `CONFIG_WOWLAN`
+and `CONFIG_GPIO_WAKEUP` options instead of advertising unsupported wake flags.
+Fresh probe reports RX preparation errors and drains partially submitted URBs
+before unwinding. A device reset does not reuse the old firmware/station state.
+
+A device-specific Wi-Fi interface unbind/rebind test exercises the teardown and
+reprobe boundary without putting the PC or other USB devices to sleep. Such a
+test does not establish physical suspend, wake signaling or power-loss behavior.
+The policy follows the [kernel USB power-management model](https://docs.kernel.org/driver-api/usb/power-management.html).
