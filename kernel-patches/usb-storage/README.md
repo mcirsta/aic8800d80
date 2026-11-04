@@ -22,8 +22,19 @@ Do not replace or unload USB-storage while it serves mounted/in-use media.
 The patch was generated against the official CachyOS 7.3.1-1 source. Its normal
 module build retains stock storage IDs, exports and ordinary probing. It has no
 test-only forced rejection, renamed driver, dynamic-ID injection or symbol hook.
-The narrow initializer is covered by focused source tests; physical cold-plug
-ordering and persistent activation require separate runtime evidence.
+The narrow initializer passed 82 focused source tests. On the verified board,
+a short live test of the normal module returned `-ENODEV` before SCSI/disk
+publication with the userspace policy removed. The separate empty card reader
+returned through ordinary probing; Wi-Fi, Bluetooth, installed DKMS/firmware
+and other storage were preserved.
+
+The local 7.3.1-1-cachyos installation now selects the patched normal module and
+contains its exact bytes in the rebuilt initramfs, with matching Limine hashes
+and the LTS fallback unchanged. The userspace helper/rule and temporary guard
+are removed. This validates installation and a live probe; reboot and physical
+cold-plug ordering have not been tested. This local override is kernel-version
+specific and must be rebuilt for a kernel upgrade until the patch is integrated
+in the kernel package.
 
 An absent AIC sibling remains a nonmatch. A ROM-to-runtime enumeration gap may
 therefore leave storage available; no unsafe assumption about a missing device,
