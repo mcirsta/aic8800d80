@@ -1,0 +1,28 @@
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -2289,6 +2289,7 @@
+ 	struct btusb_data *data = hci_get_drvdata(hdev);
+ 	unsigned long flags;
+ 	bool suspending;
++	int err;
+ 
+ 	spin_lock_irqsave(&data->txlock, flags);
+ 	suspending = test_bit(BTUSB_SUSPENDING, &data->flags);
+@@ -2296,8 +2297,15 @@
+ 		data->tx_in_flight++;
+ 	spin_unlock_irqrestore(&data->txlock, flags);
+ 
+-	if (!suspending)
+-		return submit_tx_urb(hdev, urb);
++	if (!suspending) {
++		err = submit_tx_urb(hdev, urb);
++		if (err < 0) {
++			spin_lock_irqsave(&data->txlock, flags);
++			data->tx_in_flight--;
++			spin_unlock_irqrestore(&data->txlock, flags);
++		}
++		return err;
++	}
+ 
+ 	usb_anchor_urb(urb, &data->deferred);
+ 	schedule_work(&data->waker);
