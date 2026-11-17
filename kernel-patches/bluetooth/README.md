@@ -5,6 +5,8 @@ Apply these in order against the matching kernel source:
 1. `0001-btusb-balance-failed-tx-submissions.patch`: balance a failed counted TX.
 2. `0002-btusb-order-unbind-after-hci-close.patch`: use soft unbind so HCI close
    drains RX before USB core disables a present device's endpoints.
+3. `0003-btusb-free-deferred-tx-packets.patch`: release accepted deferred packets
+   on close/resume errors and serialize queue insertion with resume.
 
 `0001-btusb-balance-failed-tx-submissions.patch` fixes the standard kernel
 `btusb` driver; it is separate from the AIC Wi-Fi modules.
@@ -52,3 +54,29 @@ diagnostic, fixed and restored-stock discovery, preserving the installed drivers
 The captured journal passed offline replay after a diagnostic-only cancellation
 classification correction; raw records were retained. Other vendors, audio and
 real system sleep remain unvalidated. Neither patch has been submitted upstream.
+
+## Deferred TX ownership follow-up
+
+A deferred send returns success to HCI core, transferring skb ownership to
+`btusb`. Dropping USB-anchor references alone does not free that skb or its
+control setup packet. The third patch drains both allocations on close,
+failed/closed-HCI resume and deferred submission failure. Successfully submitted
+packets remain completion-owned; ordinary negative-return cleanup remains with
+HCI core. Deferred anchoring now holds `txlock` across the suspension decision,
+so resume cannot drain the queue before a late enqueue strands a packet.
+
+Four old failures were reproduced with extracted actual-function host tests;
+eight fixed control groups passed with ASan/UBSan and explicit resource counters.
+Production and diagnostic module builds were warning-free with `W=1`.
+A diagnostic-only native check exercised the real discard helper on three
+synthetic packets without submitting USB traffic. Eight seconds of candidate
+discovery and three seconds after stock restoration passed; candidate unload was
+clean. Installed source, firmware and module hashes, Wi-Fi/network state and USB
+generation were preserved. The diagnostic code is absent from this patch.
+
+This did not force an actual controller resume failure or test system sleep,
+audio or other adapters. The current upstream file is
+`drivers/bluetooth/btusb_main.c`; the ownership issues were also found in pinned
+Torvalds and Bluetooth-next sources. These matching-kernel patches need rebasing
+and maintainer review before submission. In particular, the global soft-unbind
+change needs broader hardware evidence. None has been submitted or accepted.

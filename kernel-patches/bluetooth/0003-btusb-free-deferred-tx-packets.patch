@@ -1,0 +1,97 @@
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -2113,6 +2113,18 @@
+ 	usb_kill_anchored_urbs(&data->tx_anchor);
+ }
+ 
++/* Deferred packets were accepted by send(), but never reached USB core. */
++static void btusb_free_deferred(struct btusb_data *data)
++{
++	struct urb *urb;
++
++	while ((urb = usb_get_from_anchor(&data->deferred))) {
++		kfree(urb->setup_packet);
++		kfree_skb(urb->context);
++		usb_free_urb(urb);
++	}
++}
++
+ static int btusb_close(struct hci_dev *hdev)
+ {
+ 	struct btusb_data *data = hci_get_drvdata(hdev);
+@@ -2153,7 +2165,7 @@
+ 	usb_autopm_put_interface(data->intf);
+ 
+ failed:
+-	usb_scuttle_anchored_urbs(&data->deferred);
++	btusb_free_deferred(data);
+ 	return 0;
+ }
+ 
+@@ -2295,6 +2307,8 @@
+ 	suspending = test_bit(BTUSB_SUSPENDING, &data->flags);
+ 	if (!suspending)
+ 		data->tx_in_flight++;
++	else
++		usb_anchor_urb(urb, &data->deferred);
+ 	spin_unlock_irqrestore(&data->txlock, flags);
+ 
+ 	if (!suspending) {
+@@ -2307,7 +2321,6 @@
+ 		return err;
+ 	}
+ 
+-	usb_anchor_urb(urb, &data->deferred);
+ 	schedule_work(&data->waker);
+ 
+ 	usb_free_urb(urb);
+@@ -4748,6 +4761,7 @@
+ 				BT_ERR("%s urb %p submission failed (%d)",
+ 				       data->hdev->name, urb, -err);
+ 			kfree(urb->setup_packet);
++			kfree_skb(urb->context);
+ 			usb_unanchor_urb(urb);
+ 			usb_free_urb(urb);
+ 			break;
+@@ -4758,10 +4772,7 @@
+ 	}
+ 
+ 	/* Cleanup the rest deferred urbs. */
+-	while ((urb = usb_get_from_anchor(&data->deferred))) {
+-		kfree(urb->setup_packet);
+-		usb_free_urb(urb);
+-	}
++	btusb_free_deferred(data);
+ }
+ 
+ static int btusb_resume(struct usb_interface *intf)
+@@ -4788,7 +4799,7 @@
+ 		err = btusb_submit_intr_urb(hdev, GFP_NOIO);
+ 		if (err < 0) {
+ 			clear_bit(BTUSB_INTR_RUNNING, &data->flags);
+-			goto failed;
++			goto done;
+ 		}
+ 	}
+ 
+@@ -4796,7 +4807,7 @@
+ 		err = btusb_submit_bulk_urb(hdev, GFP_NOIO);
+ 		if (err < 0) {
+ 			clear_bit(BTUSB_BULK_RUNNING, &data->flags);
+-			goto failed;
++			goto done;
+ 		}
+ 
+ 		btusb_submit_bulk_urb(hdev, GFP_NOIO);
+@@ -4820,10 +4831,9 @@
+ 
+ 	return 0;
+ 
+-failed:
+-	usb_scuttle_anchored_urbs(&data->deferred);
+ done:
+ 	spin_lock_irq(&data->txlock);
++	btusb_free_deferred(data);
+ 	clear_bit(BTUSB_SUSPENDING, &data->flags);
+ 	spin_unlock_irq(&data->txlock);
+ 
