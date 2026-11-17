@@ -3,6 +3,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/atomic.h>
+#include <linux/err.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/mm.h>
@@ -61,7 +62,7 @@ static bool is_aic_bulk_out(const struct urb *urb)
 {
 	const struct usb_device *udev;
 
-	if (!urb)
+	if (IS_ERR_OR_NULL(urb))
 		return false;
 
 	udev = urb->dev;
