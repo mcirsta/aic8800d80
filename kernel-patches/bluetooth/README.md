@@ -1,4 +1,10 @@
-# Bluetooth USB TX accounting fix
+# Bluetooth USB fixes
+
+Apply these in order against the matching kernel source:
+
+1. `0001-btusb-balance-failed-tx-submissions.patch`: balance a failed counted TX.
+2. `0002-btusb-order-unbind-after-hci-close.patch`: use soft unbind so HCI close
+   drains RX before USB core disables a present device's endpoints.
 
 `0001-btusb-balance-failed-tx-submissions.patch` fixes the standard kernel
 `btusb` driver; it is separate from the AIC Wi-Fi modules.
@@ -29,3 +35,20 @@ Validation on Linux `7.3.4-1-cachyos`:
 
 The installed driver was preserved and restored. This is not a live USB-failure,
 SCO/audio, autosuspend or system-sleep validation claim.
+
+## RX unload follow-up
+
+The second patch addresses the teardown messages recorded above. A diagnostic
+comparison directly captured endpoint shutdown while HCI/RX flags remained set,
+followed by rejected resubmission before disconnect. With soft unbind, HCI close
+cleared running state and drained receive URBs while endpoints remained enabled;
+the fixed unload made no RX resubmission attempt. This changes sequencing, not
+the error-logging filters. Physical removal retains USB core's forced flush.
+
+Eight actual-function host regression groups passed with ASan/UBSan. Production
+and diagnostic builds were warning-free with `W=1`; diagnostic instrumentation
+is absent from these patches. One short AIC hardware comparison completed
+diagnostic, fixed and restored-stock discovery, preserving the installed drivers.
+The captured journal passed offline replay after a diagnostic-only cancellation
+classification correction; raw records were retained. Other vendors, audio and
+real system sleep remain unvalidated. Neither patch has been submitted upstream.
