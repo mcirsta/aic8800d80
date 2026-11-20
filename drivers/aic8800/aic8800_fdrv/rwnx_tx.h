@@ -132,8 +132,8 @@ struct rwnx_sw_txhdr {
     struct sk_buff *skb;
     /*
      * The cookie cfg80211_mgmt_tx_status() reports for this frame. sw_txhdr
-     * comes from a kmem_cache and is never zeroed, so every allocation site
-     * sets this: (unsigned long)skb, which is what the completion path
+     * comes from a kmem_cache; every allocation site explicitly sets this:
+     * (unsigned long)skb, which is what the completion path
      * reported before the field existed, except in rwnx_start_mgmt_xmit(),
      * which stores the cfg80211-assigned cookie it was handed on 7.3+ (see
      * use_given_cookie there). Only frames flagged TXU_CNTRL_MGMT are ever

@@ -1792,8 +1792,8 @@ int rwnx_start_mgmt_xmit(struct rwnx_vif *vif, struct rwnx_sta *sta,
 
     //----------------------------------------------------------------------
 
-    /* Fill the SW TX Header */
-    sw_txhdr = kmem_cache_alloc(rwnx_hw->sw_txhdr_cache, GFP_ATOMIC);
+    /* Clear unused descriptor fields and padding before sending them to FW. */
+    sw_txhdr = kmem_cache_zalloc(rwnx_hw->sw_txhdr_cache, GFP_ATOMIC);
 	
     if (unlikely(sw_txhdr == NULL)) {
         dev_kfree_skb(skb);
