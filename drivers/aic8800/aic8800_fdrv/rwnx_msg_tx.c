@@ -342,6 +342,9 @@ static size_t rwnx_cfm_min_len(const struct lmac_msg *msg,
 		return 0;
 
 	switch (reqid) {
+	case ME_STA_ADD_CFM:
+		/* Firmware omits the unused fourth alignment byte. */
+		return offsetofend(struct me_sta_add_cfm, pm_state);
 	case MM_GET_STA_INFO_CFM:
 		/* Older firmware supplies rate, failure count and RSSI only. */
 		return offsetof(struct mm_get_sta_info_cfm, chan_time);
