@@ -323,7 +323,7 @@ void rwnx_get_countrycode_channels(struct wiphy *wiphy,
 #ifdef CONFIG_USE_WIRELESS_EXT
 	rwnx_hw->support_freqs_number = support_freqs_counter;
 #endif
-	AICWFDBG(LOGINFO, "%s support channel:%s\r\n", __func__, ccode_channels);
+	AICWFDBG(LOGDEBUG, "%s support channel:%s\r\n", __func__, ccode_channels);
 }
 
 
@@ -338,7 +338,7 @@ struct ieee80211_regdomain *getRegdomainFromRwnxDBIndex(struct wiphy *wiphy,
 	country_code[0] = reg_regdb[idx]->alpha2[0];
 	country_code[1] = reg_regdb[idx]->alpha2[1];
 
-	AICWFDBG(LOGINFO, "%s set ccode:%s \r\n", __func__, country_code);
+	AICWFDBG(LOGDEBUG, "%s set ccode:%s \r\n", __func__, country_code);
 
 	rwnx_get_countrycode_channels(wiphy, reg_regdb[idx]);
 
@@ -354,7 +354,7 @@ struct ieee80211_regdomain *getRegdomainFromRwnxDB(struct wiphy *wiphy,
 
 	memset(country_code, 0, 4);
 	
-	AICWFDBG(LOGINFO, "%s set ccode:%s \r\n", __func__, alpha2);
+	AICWFDBG(LOGDEBUG, "%s set ccode:%s \r\n", __func__, alpha2);
 
 	idx = 0;
 
@@ -1659,8 +1659,7 @@ static void rwnx_set_wiphy_params(struct rwnx_hw *rwnx_hw, struct wiphy *wiphy)
         // function, that needs to be called after wiphy registration
         memcpy(country_code, default_ccode, sizeof(default_ccode));
 		regdomain = getRegdomainFromRwnxDB(wiphy, default_ccode);
-        printk(KERN_CRIT
-               "\n\n%s: CAUTION: USING PERMISSIVE CUSTOM REGULATORY RULES\n\n",
+        pr_warn("\n\n%s: CAUTION: USING PERMISSIVE CUSTOM REGULATORY RULES\n\n",
                __func__);
         wiphy->regulatory_flags |= REGULATORY_CUSTOM_REG;
         wiphy->regulatory_flags |= REGULATORY_IGNORE_STALE_KICKOFF;
@@ -1668,7 +1667,7 @@ static void rwnx_set_wiphy_params(struct rwnx_hw *rwnx_hw, struct wiphy *wiphy)
 #elif (LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0))
         memcpy(country_code, default_ccode, sizeof(default_ccode));
 		regdomain = getRegdomainFromRwnxDB(wiphy, default_ccode);
-		printk(KERN_CRIT"%s: Registering custom regulatory\n", __func__);
+		pr_info("%s: Registering custom regulatory\n", __func__);
 		wiphy->flags |= WIPHY_FLAG_CUSTOM_REGULATORY;
 		wiphy_apply_custom_regulatory(wiphy, regdomain);
 #endif
@@ -1860,7 +1859,7 @@ void rwnx_custregd(struct rwnx_hw *rwnx_hw, struct wiphy *wiphy)
 #endif
 
 	else{
-		wiphy_err(wiphy,"\n"
+		wiphy_warn(wiphy,"\n"
 				  "*******************************************************\n"
 				  "** CAUTION: USING PERMISSIVE CUSTOM REGULATORY RULES **\n"
 				  "*******************************************************\n");

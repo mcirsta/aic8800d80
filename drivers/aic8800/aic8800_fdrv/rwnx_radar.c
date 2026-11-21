@@ -1214,7 +1214,7 @@ bool dfs_pattern_detector_set_domain(struct dfs_pattern_detector *dpd,
 
     dpd->region = region;
 
-    AICWFDBG(LOGINFO,"set_region %d \n",region);
+    AICWFDBG(LOGDEBUG,"set_region %d \n",region);
     return true;
 }
 
@@ -1530,7 +1530,7 @@ bool rwnx_radar_detection_init(struct rwnx_radar *radar)
                                                            RWNX_RADAR_FCU);
     rwnx_radar_init_rmem(radar);
     radar->status = RWNX_RADAR_IDLE;
-    AICWFDBG(LOGINFO, "DFS: radar st = %d\n", radar->status);
+    AICWFDBG(LOGDEBUG, "DFS: radar st = %d\n", radar->status);
 
     if (radar->dpd[RWNX_RADAR_FCU] == NULL) {
         rwnx_radar_detection_deinit(radar);

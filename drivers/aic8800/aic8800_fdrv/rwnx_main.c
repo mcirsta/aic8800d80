@@ -548,7 +548,7 @@ static const int rwnx_hwq2uapsd[NL80211_NUM_ACS] = {
 struct semaphore aicwf_deinit_sem;
 atomic_t aicwf_deinit_atomic;
 
-int aicwf_dbg_level = LOGERROR|LOGINFO|LOGFW;
+int aicwf_dbg_level = LOGERROR | LOGINFO;
 module_param(aicwf_dbg_level, int, 0660);
 #ifdef CONFIG_DYNAMIC_PWR
 int dynamic_pwr = 1;
@@ -2579,7 +2579,7 @@ static struct wireless_dev *rwnx_virtual_interface_add(struct rwnx_hw *rwnx_hw,
     memcpy(vif->wdev.address, rwnx_hw->wiphy->perm_addr, ETH_ALEN);
     vif->wdev.address[0] |= 0x02;
     vif->wdev.address[0] ^= (vif_idx << 2);
-    AICWFDBG(LOGERROR, "p2p dev addr=%x %x %x %x %x %x\n", vif->wdev.address[0], vif->wdev.address[1], \
+    AICWFDBG(LOGDEBUG, "p2p dev addr=%x %x %x %x %x %x\n", vif->wdev.address[0], vif->wdev.address[1], \
         vif->wdev.address[2], vif->wdev.address[3], vif->wdev.address[4], vif->wdev.address[5]);
 
     spin_lock_bh(&rwnx_hw->cb_lock);
@@ -9347,7 +9347,7 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
 
 
 #ifdef CONFIG_FILTER_TCP_ACK
-     AICWFDBG(LOGINFO, "%s: FILTER_TCP_ACK\n", __func__);
+     AICWFDBG(LOGDEBUG, "%s: FILTER_TCP_ACK\n", __func__);
     tcp_ack_init(rwnx_hw);
 	state.ack_initialized = true;
 #endif
@@ -9585,7 +9585,7 @@ if((g_rwnx_plat->usbdev->chipid == PRODUCT_ID_AIC8801) ||
     	AICWFDBG(LOGERROR, "no mac address in efuse!");
 	}
 
-	AICWFDBG(LOGINFO, "get macaddr:%x,%x\r\n", mac_addr_efuse[0], mac_addr_efuse[5]);
+	AICWFDBG(LOGDEBUG, "get macaddr:%x,%x\r\n", mac_addr_efuse[0], mac_addr_efuse[5]);
 
 
     memcpy(wiphy->perm_addr, init_conf.mac_addr, ETH_ALEN);

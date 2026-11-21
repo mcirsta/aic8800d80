@@ -23,6 +23,7 @@
 #endif
 #endif
 #include "aic_txrxif.h"
+#include "aicwf_debug.h"
 #include "aicbluetooth.h"
 #include "aicbluetooth_cmds.h"
 
@@ -100,7 +101,7 @@ void aicwf_bus_deinit(struct device *dev)
         txrx_err("device not found\n");
         return;
     }
-    printk("%s", __func__);
+    AICWFDBG(LOGDEBUG, "%s\n", __func__);
 
     bus_if = dev_get_drvdata(dev);
     usbdev = bus_if->bus_priv.usb;
@@ -134,7 +135,7 @@ void aicwf_bus_deinit(struct device *dev)
         bus_if->cmd_buf = NULL;
     }
 
-    printk("exit %s\n", __func__);
+    AICWFDBG(LOGDEBUG, "exit %s\n", __func__);
 }
 
 void aicwf_frame_tx(void *dev, struct sk_buff *skb)

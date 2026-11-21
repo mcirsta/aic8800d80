@@ -96,7 +96,7 @@ int system_config_8800d80(struct rwnx_hw *rwnx_hw)
 	struct dbg_mem_read_cfm rd_mem_addr_cfm;
 	ret = rwnx_send_dbg_mem_read_req(rwnx_hw, mem_addr, &rd_mem_addr_cfm);
 	if (ret) {
-		AICWFDBG(LOGINFO, "%x rd fail: %d\n", mem_addr, ret);
+		AICWFDBG(LOGERROR, "%x rd fail: %d\n", mem_addr, ret);
 		return ret;
 	}
 	if (((rd_mem_addr_cfm.memdata >> 25) & 0x01UL) == 0x00UL) {

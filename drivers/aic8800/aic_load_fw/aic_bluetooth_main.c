@@ -20,7 +20,7 @@ int adap_test = 0;
 char paringid[100];
 int n_para = 1;
 int ble_scan_wakeup_reboot_time = 1000;
-int aicwf_dbg_level = LOGERROR|LOGINFO|LOGDEBUG|LOGTRACE;
+int aicwf_dbg_level = LOGERROR | LOGINFO;
 int flash_erase_len = 0x400000;
 uint32_t ad_data_filter_mask = 0;
 uint32_t gpio_num = 2;//default select gpiob2 for fw_wakeup_host
@@ -39,8 +39,8 @@ static int __init aic_bluetooth_mod_init(void)
 {
 	int ret;
 
-    printk("%s \n", __func__);
-    printk("RELEASE DATE:%s \r\n", RELEASE_DATE);
+    AICWFDBG(LOGDEBUG, "%s\n", __func__);
+    pr_info("AIC firmware loader release date: %s\n", RELEASE_DATE);
 #ifdef CONFIG_PREALLOC_RX_SKB
 	ret = aicwf_prealloc_init();
 	if (ret)
@@ -63,7 +63,7 @@ out_free_prealloc:
 
 static void __exit aic_bluetooth_mod_exit(void)
 {
-    printk("%s\n", __func__);
+    AICWFDBG(LOGDEBUG, "%s\n", __func__);
     aicwf_usb_exit();
     
 #ifdef CONFIG_PREALLOC_RX_SKB

@@ -162,19 +162,19 @@ int aicwf_patch_config_8800d80x2(struct aic_usb_dev *usb_dev)
     rd_patch_addr = RAM_FMAC_FW_ADDR_8800D80X2 + 0x01A8;
     aic_patch_addr = rd_patch_addr + 8;
 
-    AICWFDBG(LOGERROR, "Read FW mem: %08x\n", rd_patch_addr);
+    AICWFDBG(LOGDEBUG, "Read FW mem: %08x\n", rd_patch_addr);
     if ((ret = rwnx_send_dbg_mem_read_req(usb_dev, rd_patch_addr, &rd_patch_addr_cfm))) {
         AICWFDBG(LOGERROR, "setting base[0x%x] rd fail: %d\n", rd_patch_addr, ret);
         return ret;
     }
-    AICWFDBG(LOGERROR, "%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
+    AICWFDBG(LOGDEBUG, "%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
     config_base = rd_patch_addr_cfm.memdata;
 
     if ((ret = rwnx_send_dbg_mem_read_req(usb_dev, aic_patch_addr, &rd_patch_addr_cfm))) {
         AICWFDBG(LOGERROR, "patch_str_base[0x%x] rd fail: %d\n", aic_patch_addr, ret);
         return ret;
     }
-    AICWFDBG(LOGERROR, "%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
+    AICWFDBG(LOGDEBUG, "%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
     aic_patch_str_base = rd_patch_addr_cfm.memdata;
 
     #if (NEW_PATCH_BUFFER_MAP)
@@ -184,7 +184,7 @@ int aicwf_patch_config_8800d80x2(struct aic_usb_dev *usb_dev)
         return ret;
     }
     rd_version_val = rd_patch_addr_cfm.memdata;
-    AICWFDBG(LOGINFO, "rd_version_val=%08X\n", rd_version_val);
+    AICWFDBG(LOGDEBUG, "rd_version_val=%08X\n", rd_version_val);
     usb_dev->fw_version_uint = rd_version_val;
     patch_buff_addr = rd_patch_addr + 12;
     ret = rwnx_send_dbg_mem_read_req(usb_dev, patch_buff_addr, &rd_patch_addr_cfm);
@@ -192,7 +192,7 @@ int aicwf_patch_config_8800d80x2(struct aic_usb_dev *usb_dev)
         AICWFDBG(LOGERROR, "patch buf rd fail\n");
         return ret;
     }
-    AICWFDBG(LOGINFO, "%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
+    AICWFDBG(LOGDEBUG, "%x=%x\n", rd_patch_addr_cfm.memaddr, rd_patch_addr_cfm.memdata);
     patch_buff_base = rd_patch_addr_cfm.memdata;
     patch_addr = start_addr = patch_buff_base;
     #endif
@@ -367,7 +367,7 @@ int system_config_8800d80x2(struct aic_usb_dev *usb_dev){
         chip_mcu_id = 1;
     }
 
-    printk("chip_id=%x, chip_mcu_id = %d\n", chip_id, chip_mcu_id);
+    pr_info("chip_id=%x, chip_mcu_id = %d\n", chip_id, chip_mcu_id);
 
     syscfg_num = sizeof(syscfg_tbl_8800d80x2) / sizeof(u32) / 2;
     for (cnt = 0; cnt < syscfg_num; cnt++) {

@@ -1195,18 +1195,18 @@ int usb_bustx_thread(void *data)
 
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0))
-	AICWFDBG(LOGINFO, "%s the cpu is:%d\n", __func__, current->thread_info.cpu);
+	AICWFDBG(LOGDEBUG, "%s the cpu is:%d\n", __func__, current->thread_info.cpu);
 #else
-    AICWFDBG(LOGINFO, "%s the cpu is:%d\n", __func__, current->cpu);
+    AICWFDBG(LOGDEBUG, "%s the cpu is:%d\n", __func__, current->cpu);
 #endif
 #endif
     set_cpu_ret = set_cpus_allowed_ptr(current, cpumask_of(1));
 #ifdef CONFIG_THREAD_INFO_IN_TASK
-    AICWFDBG(LOGINFO, "%s set_cpu_ret is:%d\n", __func__, set_cpu_ret);
+    AICWFDBG(LOGDEBUG, "%s set_cpu_ret is:%d\n", __func__, set_cpu_ret);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0))
-	AICWFDBG(LOGINFO, "%s change cpu to:%d\n", __func__, current->thread_info.cpu);
+	AICWFDBG(LOGDEBUG, "%s change cpu to:%d\n", __func__, current->thread_info.cpu);
 #else
-    AICWFDBG(LOGINFO, "%s change cpu to:%d\n", __func__, current->cpu);
+    AICWFDBG(LOGDEBUG, "%s change cpu to:%d\n", __func__, current->cpu);
 #endif
 #endif
 
@@ -1222,9 +1222,9 @@ int usb_bustx_thread(void *data)
 #endif
 	}
 #endif
-	AICWFDBG(LOGINFO, "%s the policy of current thread is:%d\n", __func__, current->policy);
-	AICWFDBG(LOGINFO, "%s the rt_priority of current thread is:%d\n", __func__, current->rt_priority);
-	AICWFDBG(LOGINFO, "%s the current pid is:%d\n", __func__, current->pid);
+	AICWFDBG(LOGDEBUG, "%s the policy of current thread is:%d\n", __func__, current->policy);
+	AICWFDBG(LOGDEBUG, "%s the rt_priority of current thread is:%d\n", __func__, current->rt_priority);
+	AICWFDBG(LOGDEBUG, "%s the current pid is:%d\n", __func__, current->pid);
 
 
 	while (!kthread_should_stop()) {
@@ -1242,7 +1242,7 @@ int usb_bustx_thread(void *data)
 	}
 
 	aic_thread_wait_stop();
-	AICWFDBG(LOGINFO, "usb bustx thread stop\n");
+	AICWFDBG(LOGDEBUG, "usb bustx thread stop\n");
 
     return 0;
 }
@@ -1255,18 +1255,18 @@ int usb_busrx_thread(void *data)
     
 #ifdef CONFIG_THREAD_INFO_IN_TASK
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0))
-	AICWFDBG(LOGINFO, "%s the cpu is:%d\n", __func__, current->thread_info.cpu);
+	AICWFDBG(LOGDEBUG, "%s the cpu is:%d\n", __func__, current->thread_info.cpu);
 #else
-    AICWFDBG(LOGINFO, "%s the cpu is:%d\n", __func__, current->cpu);
+    AICWFDBG(LOGDEBUG, "%s the cpu is:%d\n", __func__, current->cpu);
 #endif
 #endif
     set_cpu_ret = set_cpus_allowed_ptr(current, cpumask_of(1));
 #ifdef CONFIG_THREAD_INFO_IN_TASK
-    AICWFDBG(LOGINFO, "%s set_cpu_ret is:%d\n", __func__, set_cpu_ret);
+    AICWFDBG(LOGDEBUG, "%s set_cpu_ret is:%d\n", __func__, set_cpu_ret);
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0))
-	AICWFDBG(LOGINFO, "%s change cpu to:%d\n", __func__, current->thread_info.cpu);
+	AICWFDBG(LOGDEBUG, "%s change cpu to:%d\n", __func__, current->thread_info.cpu);
 #else
-    AICWFDBG(LOGINFO, "%s change cpu to:%d\n", __func__, current->cpu);
+    AICWFDBG(LOGDEBUG, "%s change cpu to:%d\n", __func__, current->cpu);
 #endif
 #endif
 
@@ -1281,9 +1281,9 @@ int usb_busrx_thread(void *data)
 #endif
 	}
 #endif
-	AICWFDBG(LOGINFO, "%s the policy of current thread is:%d\n", __func__, current->policy);
-	AICWFDBG(LOGINFO, "%s the rt_priority of current thread is:%d\n", __func__, current->rt_priority);
-	AICWFDBG(LOGINFO, "%s the current pid is:%d\n", __func__, current->pid);
+	AICWFDBG(LOGDEBUG, "%s the policy of current thread is:%d\n", __func__, current->policy);
+	AICWFDBG(LOGDEBUG, "%s the rt_priority of current thread is:%d\n", __func__, current->rt_priority);
+	AICWFDBG(LOGDEBUG, "%s the current pid is:%d\n", __func__, current->pid);
 
     while (1) {
 #if 0
@@ -1295,7 +1295,7 @@ int usb_busrx_thread(void *data)
 		//rx_priv->rx_thread_working = 0;//AIDEN
         if (!wait_for_completion_interruptible(&bus_if->busrx_trgg)) {
             if(bus_if->state == BUS_DOWN_ST){
-				AICWFDBG(LOGINFO, "usb busrx thread will to stop\n");
+				AICWFDBG(LOGDEBUG, "usb busrx thread will to stop\n");
 				break;
             }
 			//rx_priv->rx_thread_working = 1;//AIDEN
@@ -1304,7 +1304,7 @@ int usb_busrx_thread(void *data)
     }
 
 	aic_thread_wait_stop();
-	AICWFDBG(LOGINFO, "usb busrx thread stop\n");
+	AICWFDBG(LOGDEBUG, "usb busrx thread stop\n");
 
     return 0;
 }
@@ -1326,9 +1326,9 @@ int usb_msg_busrx_thread(void *data)
 #endif
 	}
 #endif
-	AICWFDBG(LOGINFO, "%s the policy of current thread is:%d\n", __func__, current->policy);
-	AICWFDBG(LOGINFO, "%s the rt_priority of current thread is:%d\n", __func__, current->rt_priority);
-	AICWFDBG(LOGINFO, "%s the current pid is:%d\n", __func__, current->pid);
+	AICWFDBG(LOGDEBUG, "%s the policy of current thread is:%d\n", __func__, current->policy);
+	AICWFDBG(LOGDEBUG, "%s the rt_priority of current thread is:%d\n", __func__, current->rt_priority);
+	AICWFDBG(LOGDEBUG, "%s the current pid is:%d\n", __func__, current->pid);
 
 
 
@@ -1341,7 +1341,7 @@ int usb_msg_busrx_thread(void *data)
 #endif
         if (!wait_for_completion_interruptible(&bus_if->msg_busrx_trgg)) {
             if(bus_if->state == BUS_DOWN_ST){
-		AICWFDBG(LOGINFO, "usb msg busrx thread will to stop\n");
+		AICWFDBG(LOGDEBUG, "usb msg busrx thread will to stop\n");
                 break;
 	    }
             aicwf_process_msg_rxframes(rx_priv);
@@ -1349,7 +1349,7 @@ int usb_msg_busrx_thread(void *data)
     }
 
 	aic_thread_wait_stop();
-	AICWFDBG(LOGINFO, "usb msg busrx thread stop\n");
+	AICWFDBG(LOGDEBUG, "usb msg busrx thread stop\n");
 
     return 0;
 }

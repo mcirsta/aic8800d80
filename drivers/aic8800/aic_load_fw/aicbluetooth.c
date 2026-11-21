@@ -365,7 +365,7 @@ int rwnx_plat_bin_fw_upload_android(struct aic_usb_dev *usbdev, u32 fw_addr,
     }
 
     /* Copy the file on the Embedded side */
-    printk("### Upload %s firmware, @ = %x  size=%d\n", filename, fw_addr, size);
+    pr_info("### Upload %s firmware, @ = %x  size=%d\n", filename, fw_addr, size);
 
     if (size > 1024) {// > 1KB data
         for (i = 0; i < (size - 1024); i += 1024) {//each time write 1KB
@@ -432,7 +432,7 @@ int rwnx_plat_m2d_flash_ota_android(struct aic_usb_dev *usbdev, char *filename)
     }
 
     /* Copy the file on the Embedded side */
-    printk("### Upload m2d %s flash, size=%d\n", filename, size);
+    pr_info("### Upload m2d %s flash, size=%d\n", filename, size);
 
 	/*send info first*/
 	err = rwnx_send_dbg_mem_block_write_req(usbdev, AIC_M2D_OTA_INFO_ADDR, 4, (u32 *)&size);
@@ -581,7 +581,7 @@ int rwnx_plat_m2d_flash_ota_check(struct aic_usb_dev *usbdev, char *filename)
 	}
 
     /* Copy the file on the Embedded side */
-    printk("### Upload m2d %s flash, size=%d\n", filename, size);
+    pr_info("### Upload m2d %s flash, size=%d\n", filename, size);
 
 	/*send info first*/
 	err = rwnx_send_dbg_mem_block_write_req(usbdev, AIC_M2D_OTA_INFO_ADDR, 4, (u32 *)&size);
@@ -672,7 +672,7 @@ int rwnx_plat_flash_bin_upload_android(struct aic_usb_dev *usbdev, u32 fw_addr,
     }
 
     /* Copy the file on the Embedded side */
-    printk("### Upload %s firmware, @ = %x  size=%d\n", filename, fw_addr, size);
+    pr_info("### Upload %s firmware, @ = %x  size=%d\n", filename, fw_addr, size);
     crc = aic_crc32((u8 *)dst, size, crc);
     flash_write_bin_crc = crc;
 
@@ -1002,7 +1002,7 @@ int rwnx_plat_userconfig_upload_android(struct aic_usb_dev *usbdev, char *filena
     }
 
 	/* Copy the file on the Embedded side */
-    printk("### Upload %s userconfig, size=%d\n", filename, size);
+    pr_info("### Upload %s userconfig, size=%d\n", filename, size);
 
 	rwnx_plat_userconfig_parsing((char *)dst, size);
 
@@ -1070,7 +1070,7 @@ struct aicbt_patch_table *aicbt_patch_table_alloc(struct aic_usb_dev *usbdev,
 	size = aic_load_firmware((u32 **)&rawdata, filename, dev);
 
 	/* Copy the file on the Embedded side */
-	printk("### Upload %s fw_patch_table, size=%d\n", filename, size);
+	pr_info("### Upload %s fw_patch_table, size=%d\n", filename, size);
 
 	if (size <= 0) {
 		printk("wrong size of firmware file\n");
