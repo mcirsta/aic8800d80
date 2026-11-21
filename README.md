@@ -284,3 +284,9 @@ the same-subnet test replies on Wi-Fi and was restored afterward. This is
 functional boundary evidence; it did not directly trace the reset acknowledgement
 or exercise a PC suspend/resume cycle. Installed DKMS and firmware were preserved.
 The policy follows the [kernel USB power-management model](https://docs.kernel.org/driver-api/usb/power-management.html).
+
+On `7.3.4-1-cachyos`, the installed D80 USB build passed one module reload,
+one physical unplug/replug, and one deep (ACPI S3) suspend/resume. The same
+`wpa_supplicant` process handled all three reconnects. Bluetooth returned
+powered after the replug and found two BLE devices after resume. See the
+[test results](USB-VALIDATION.md) and [mainline readiness review](UPSTREAM.md).
