@@ -1884,7 +1884,8 @@ int get_cs_info(struct rwnx_vif *vif, u8 *mac_addr, u8 *val)
     u8 phymode = 0;
     u32 tx_phyrate = 0, rx_phyrate = 0;
     struct aicwf_cs_info cs_info;
-    struct station_info sinfo;
+	struct station_info sinfo = {};
+	int ret;
     struct rwnx_sta_stats *stats;
     struct rx_vector_2 *rx_vect2;
     struct rwnx_chanctx *ctxt;
@@ -1924,7 +1925,9 @@ int get_cs_info(struct rwnx_vif *vif, u8 *mac_addr, u8 *val)
         rx_vect2 = &stats->last_rx.rx_vect2;
 
         AICWFDBG(LOGINFO, "fill: staidx=%d\n", sta->sta_idx);
-        rwnx_fill_station_info(sta, vif, &sinfo, &phymode, &tx_phyrate, &rx_phyrate);
+		ret = rwnx_fill_station_info(sta, vif, &sinfo, &phymode, &tx_phyrate, &rx_phyrate);
+		if (ret)
+			return ret;
 
         cs_info.rssi = sinfo.signal;
         //cs_info.bandwidth = sta->width;
@@ -2161,7 +2164,8 @@ int android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd)
         AICWFDBG(LOGDEBUG, "bytewritten=%d, addr=%pM\n", bytes_written, mac_addr);
 
 
-        memcpy(command, val, bytes_written);
+		if (bytes_written > 0)
+			memcpy(command, val, bytes_written);
 
         goto exit;
     }

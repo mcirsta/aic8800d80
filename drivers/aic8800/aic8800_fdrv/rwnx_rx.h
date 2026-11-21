@@ -332,7 +332,7 @@ struct rwnx_legrate {
 };
 
 extern struct rwnx_legrate legrates_lut[];
-extern u16 tx_legrates_lut_rate[];
+extern u16 tx_legrates_lut_rate[12];
 
 struct DHCPInfo {
     u8 op;

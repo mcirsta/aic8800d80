@@ -551,6 +551,7 @@ struct rwnx_rx_rate_stats {
  * struct rwnx_sta_stats - Structure Used to store statistics specific to a STA
  *
  * @last_rx: Hardware vector of the last received frame
+ * @last_rx_valid: A frame was received during the current station lifetime
  * @rx_rate: Statistics of the received rates
  */
 struct rwnx_sta_stats {
@@ -560,6 +561,7 @@ struct rwnx_sta_stats {
     u64 tx_bytes;
     unsigned long last_act;
     struct hw_vect last_rx;
+	bool last_rx_valid;
     struct rwnx_rx_rate_stats rx_rate;
     u32 last_chan_time;
     u32 last_chan_busy_time;

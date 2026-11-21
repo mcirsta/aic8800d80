@@ -105,21 +105,21 @@ static struct iw_statistics *aicwf_get_wireless_stats(struct net_device *dev)
 	int tmp_level = -100;
 	int tmp_qual = 0;
 	int tmp_noise = 0;
+	bool signal_valid = false;
 
 	struct rwnx_vif* rwnx_vif = netdev_priv(dev);
 	struct rwnx_hw* rwnx_hw = rwnx_vif->rwnx_hw;
-	struct rwnx_sta *sta = NULL; 
+	struct rwnx_sta *sta = READ_ONCE(rwnx_vif->sta.ap);
 
-	union rwnx_rate_ctrl_info *rate_info;
 	struct mm_get_sta_info_cfm cfm;
 
 	AICWFDBG(LOGTRACE, "%s Enter", __func__);
 
-	if(rwnx_vif->sta.ap){
-		sta = rwnx_vif->sta.ap;
-		rwnx_send_get_sta_info_req(rwnx_hw, sta->sta_idx, &cfm);
-			rate_info = (union rwnx_rate_ctrl_info *)&cfm.rate_info;
+	if (sta) {
+		if (!rwnx_send_get_sta_info_req(rwnx_hw, sta->sta_idx, &cfm)) {
 			tmp_level = cfm.rssi;
+			signal_valid = true;
+		}
 	}
 
 
@@ -127,7 +127,9 @@ static struct iw_statistics *aicwf_get_wireless_stats(struct net_device *dev)
 	iwstats.qual.qual = tmp_qual;
 	iwstats.qual.noise = tmp_noise;
 	iwstats.qual.updated = 0x07;
-	iwstats.qual.updated = iwstats.qual.updated | IW_QUAL_DBM;
+	iwstats.qual.updated |= IW_QUAL_DBM;
+	if (!signal_valid)
+		iwstats.qual.updated |= IW_QUAL_LEVEL_INVALID;
 
 	return &iwstats;
 }
@@ -138,54 +140,47 @@ static int aicwf_get_name(struct net_device *dev,
 			   struct iw_request_info *info,
 			   union iwreq_data *wrqu, char *extra)
 {
-	struct rwnx_vif* rwnx_vif = netdev_priv(dev);
-	struct rwnx_hw* rwnx_hw = rwnx_vif->rwnx_hw;
-	struct rwnx_sta *sta = NULL; 
-
-	union rwnx_rate_ctrl_info *rate_info;
+	struct rwnx_vif *vif = netdev_priv(dev);
+	struct rwnx_sta *sta = READ_ONCE(vif->sta.ap);
 	struct mm_get_sta_info_cfm cfm;
+	union rwnx_rate_ctrl_info rate;
+	const char *name;
+	int ret;
 
 	AICWFDBG(LOGTRACE, "%s Enter", __func__);
 
-	if(rwnx_vif->sta.ap){
-		sta = rwnx_vif->sta.ap;
-		rwnx_send_get_sta_info_req(rwnx_hw, sta->sta_idx, &cfm);
-			rate_info = (union rwnx_rate_ctrl_info *)&cfm.rate_info;
-		
-			switch (rate_info->formatModTx) {
-			case FORMATMOD_NON_HT:
-			case FORMATMOD_NON_HT_DUP_OFDM:
-				snprintf(wrqu->name, IFNAMSIZ, "IEEE 802.11bg");
-				break;
-			case FORMATMOD_HT_MF:
-			case FORMATMOD_HT_GF:
-				snprintf(wrqu->name, IFNAMSIZ, "IEEE 802.11n");
-				break;
-			case FORMATMOD_VHT:
-				snprintf(wrqu->name, IFNAMSIZ, "IEEE 802.11ac");
-				break;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
-			case FORMATMOD_HE_MU:
-			case FORMATMOD_HE_SU:
-			case FORMATMOD_HE_ER:
-				snprintf(wrqu->name, IFNAMSIZ, "IEEE 802.11ax");
-				break;
-#else
-			//kernel not support he
-			case FORMATMOD_HE_MU:
-			case FORMATMOD_HE_SU:
-			case FORMATMOD_HE_ER:
-				snprintf(wrqu->name, IFNAMSIZ, "IEEE 802.11ax");
-				break;
-#endif
-			}
-
-		
-	}else{
+	if (!sta) {
 		snprintf(wrqu->name, IFNAMSIZ, "unassociated");
+		return 0;
 	}
 
+	ret = rwnx_send_get_sta_info_req(vif->rwnx_hw, sta->sta_idx, &cfm);
+	if (ret)
+		return ret;
 
+	rate.value = cfm.rate_info;
+	switch (rate.formatModTx) {
+	case FORMATMOD_NON_HT:
+	case FORMATMOD_NON_HT_DUP_OFDM:
+		name = "IEEE 802.11bg";
+		break;
+	case FORMATMOD_HT_MF:
+	case FORMATMOD_HT_GF:
+		name = "IEEE 802.11n";
+		break;
+	case FORMATMOD_VHT:
+		name = "IEEE 802.11ac";
+		break;
+	case FORMATMOD_HE_MU:
+	case FORMATMOD_HE_SU:
+	case FORMATMOD_HE_ER:
+		name = "IEEE 802.11ax";
+		break;
+	default:
+		return -ENODATA;
+	}
+
+	snprintf(wrqu->name, IFNAMSIZ, "%s", name);
 	return 0;
 }
 
@@ -871,40 +866,47 @@ static int aicwf_get_rate(struct net_device *dev,
 			   struct iw_request_info *info,
 			   union iwreq_data *wrqu, char *extra)
 {
-	u16 max_rate = 0;
-	struct rwnx_vif* rwnx_vif = netdev_priv(dev);
-	struct rwnx_hw* rwnx_hw = rwnx_vif->rwnx_hw;
-	struct rwnx_sta *sta = NULL; 
-	
-	union rwnx_rate_ctrl_info *rate_info;
+	struct rwnx_vif *vif = netdev_priv(dev);
+	struct rwnx_sta *sta = READ_ONCE(vif->sta.ap);
 	struct mm_get_sta_info_cfm cfm;
-	
+	union rwnx_rate_ctrl_info rate;
+	u16 max_rate = 0;
+	int ret;
+
 	AICWFDBG(LOGTRACE, "%s Enter", __func__);
-	
-	if(rwnx_vif->sta.ap){
-		sta = rwnx_vif->sta.ap;
-		rwnx_send_get_sta_info_req(rwnx_hw, sta->sta_idx, &cfm);
-			rate_info = (union rwnx_rate_ctrl_info *)&cfm.rate_info;
-			
-			switch (rate_info->formatModTx) {
-			case FORMATMOD_NON_HT:
-			case FORMATMOD_NON_HT_DUP_OFDM:
-				//get bg mode datarate
-				max_rate = tx_legrates_lut_rate[rate_info->mcsIndexTx]/10;
-				break;
-			case FORMATMOD_HT_MF:
-			case FORMATMOD_HT_GF:
-			case FORMATMOD_VHT:
-				//get bg mode MCS index
-				max_rate = VHT_MCS_DATA_RATE[rate_info->bwTx][1][rate_info->mcsIndexTx]/2;
-				break;
-			case FORMATMOD_HE_MU:
-			case FORMATMOD_HE_SU:
-			case FORMATMOD_HE_ER:
-				//get bg mode MCS index
-				max_rate = HE_MCS_DATA_RATE[rate_info->bwTx][rate_info->mcsIndexTx];
-				break;
-			}
+
+	if (sta) {
+		ret = rwnx_send_get_sta_info_req(vif->rwnx_hw, sta->sta_idx, &cfm);
+		if (ret)
+			return ret;
+
+		rate.value = cfm.rate_info;
+		switch (rate.formatModTx) {
+		case FORMATMOD_NON_HT:
+		case FORMATMOD_NON_HT_DUP_OFDM:
+			if (rate.mcsIndexTx >= ARRAY_SIZE(tx_legrates_lut_rate))
+				return -ENODATA;
+			max_rate = tx_legrates_lut_rate[rate.mcsIndexTx] / 10;
+			break;
+		case FORMATMOD_HT_MF:
+		case FORMATMOD_HT_GF:
+		case FORMATMOD_VHT:
+			if (rate.bwTx >= ARRAY_SIZE(VHT_MCS_DATA_RATE) ||
+			    rate.mcsIndexTx >= ARRAY_SIZE(VHT_MCS_DATA_RATE[0][0]))
+				return -ENODATA;
+			max_rate = VHT_MCS_DATA_RATE[rate.bwTx][1][rate.mcsIndexTx] / 2;
+			break;
+		case FORMATMOD_HE_MU:
+		case FORMATMOD_HE_SU:
+		case FORMATMOD_HE_ER:
+			if (rate.bwTx >= ARRAY_SIZE(HE_MCS_DATA_RATE) ||
+			    rate.mcsIndexTx >= ARRAY_SIZE(HE_MCS_DATA_RATE[0]))
+				return -ENODATA;
+			max_rate = HE_MCS_DATA_RATE[rate.bwTx][rate.mcsIndexTx];
+			break;
+		default:
+			return -ENODATA;
+		}
 	}
 
 	wrqu->bitrate.fixed = 0;	/* no auto select */

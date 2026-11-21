@@ -52,6 +52,7 @@ static inline bool rwnx_sta_is_valid(const struct rwnx_sta *sta)
 
 static inline void rwnx_sta_publish(struct rwnx_sta *sta)
 {
+	sta->stats.last_rx_valid = false;
 	smp_store_release(&sta->valid, true);
 }
 

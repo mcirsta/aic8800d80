@@ -241,9 +241,6 @@ static void rwnx_rx_statistic(struct rwnx_hw *rwnx_hw, struct hw_rxhdr *hw_rxhdr
     struct rx_vector_1 *rxvect = &hw_rxhdr->hwvect.rx_vect1;
     int mpdu, ampdu, mpdu_prev, rate_idx;
 
-    /* save complete hwvect */
-    sta->stats.last_rx = hw_rxhdr->hwvect;
-
     /* update ampdu rx stats */
     mpdu = hw_rxhdr->hwvect.mpdu_cnt;
     ampdu = hw_rxhdr->hwvect.ampdu_cnt;
@@ -2949,6 +2946,10 @@ static u8 rwnx_rxdataind_aicwf_inner(struct rwnx_hw *rwnx_hw, void *hostid, void
 		valid = rwnx_sta_is_valid(sta) &&
 			sta->sta_idx == hw_rxhdr->flags_sta_idx &&
 			sta->vif_idx == hw_rxhdr->flags_vif_idx;
+		if (valid) {
+			sta->stats.last_rx = hw_rxhdr->hwvect;
+			sta->stats.last_rx_valid = true;
+		}
 		vlan_idx = sta->vlan_idx;
 		spin_unlock_bh(&rwnx_hw->cb_lock);
 		if (!valid)

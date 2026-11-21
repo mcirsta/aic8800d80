@@ -5843,10 +5843,6 @@ enum {
     PHYMODE_AX
 };
 
-static const u32 legacy_map_to_rate[12] = { //Kbps
-    1000, 2000, 5500, 11000, 6000, 9000, 12000, 18000, 24000, 36000, 48000, 54000
-};
-
 static const u32 he_mcs_map_to_rate[2][3][3][12] = { //NSS/GI/BW/MCS
     { //1ss
         { //0.8us
@@ -5941,98 +5937,127 @@ static const u32 ht_mcs_map_to_rate[2][2][3][8] = { //NSS//GI/BW/MCS
 };
 
 
+/* Validate firmware indexes against every dimension of a rate table. */
+#define RWNX_RATE_INDEX_VALID(table, streams, gi, bw, mcs) \
+	((streams) < ARRAY_SIZE(table) && (gi) < ARRAY_SIZE((table)[0]) && \
+	 (bw) < ARRAY_SIZE((table)[0][0]) && (mcs) < ARRAY_SIZE((table)[0][0][0]))
+
 int rwnx_fill_station_info(struct rwnx_sta *sta, struct rwnx_vif *vif,
 								  struct station_info *sinfo, u8 *phymode, u32 *tx_phyrate, u32 *rx_phyrate)
 {
 	struct rwnx_sta_stats *stats = &sta->stats;
-	struct rx_vector_1 *rx_vect1 = &stats->last_rx.rx_vect1;
-	union rwnx_rate_ctrl_info *rate_info;
+	struct rx_vector_1 rx_vect1;
+	bool rx_valid;
+	union rwnx_rate_ctrl_info rate_info;
 	struct mm_get_sta_info_cfm cfm;
-    u8 phymode_local = 0, mcs;
-    u32 tx_phyrate_local = 0;
-    u32 rx_phyrate_local = 0;
+	unsigned int streams, mcs;
+	int ret;
+	u8 phymode_local = 0;
+	u32 tx_phyrate_local;
+	u32 rx_phyrate_local;
 
-	rwnx_send_get_sta_info_req(vif->rwnx_hw, sta->sta_idx, &cfm);
+	ret = rwnx_send_get_sta_info_req(vif->rwnx_hw, sta->sta_idx, &cfm);
+	if (ret)
+		return ret;
+
 	sinfo->tx_failed = cfm.txfailed;
-	rate_info = (union rwnx_rate_ctrl_info *)&cfm.rate_info;
+	sinfo->signal = (s8)cfm.rssi;
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+	sinfo->filled |= STATION_INFO_SIGNAL;
+#else
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+#endif
+	rate_info.value = cfm.rate_info;
 
-	//printk("chan  time=%d, busy=%d, tx succ=%d, tx_fail=%d\n", cfm.chan_busy_time, cfm.chan_time, cfm.ack_succ_stat, cfm.ack_fail_stat);
-    stats->last_chan_busy_time = cfm.chan_busy_time;
-    stats->last_chan_time = cfm.chan_time;
-    stats->tx_ack_succ_stat = cfm.ack_succ_stat;
-    stats->tx_ack_fail_stat = cfm.ack_fail_stat;
-    stats->last_chan_tx_busy_time = cfm.chan_tx_busy_time;
+	stats->last_chan_busy_time = cfm.chan_busy_time;
+	stats->last_chan_time = cfm.chan_time;
+	stats->tx_ack_succ_stat = cfm.ack_succ_stat;
+	stats->tx_ack_fail_stat = cfm.ack_fail_stat;
+	stats->last_chan_tx_busy_time = cfm.chan_tx_busy_time;
 
-	switch (rate_info->formatModTx) {
+	switch (rate_info.formatModTx) {
 	case FORMATMOD_NON_HT:
-        sinfo->txrate.flags = 0;
-        sinfo->txrate.legacy = tx_legrates_lut_rate[rate_info->mcsIndexTx];
-        sinfo->txrate.nss = 1;
-        tx_phyrate_local = legacy_map_to_rate[rate_info->mcsIndexTx];
-        if(sta->band == NL80211_BAND_2GHZ)
-            phymode_local = PHYMODE_B;
-        break;
-	case FORMATMOD_NON_HT_DUP_OFDM:
+		if (rate_info.mcsIndexTx >= ARRAY_SIZE(tx_legrates_lut_rate))
+			goto rx_rate;
 		sinfo->txrate.flags = 0;
-		sinfo->txrate.legacy = tx_legrates_lut_rate[rate_info->mcsIndexTx];
-        sinfo->txrate.nss = 1;
-        tx_phyrate_local = legacy_map_to_rate[rate_info->mcsIndexTx];
-        if(sta->band == NL80211_BAND_2GHZ)
-            phymode_local = PHYMODE_G;
-        else
-            phymode_local = PHYMODE_A;
+		sinfo->txrate.legacy = tx_legrates_lut_rate[rate_info.mcsIndexTx];
+		sinfo->txrate.nss = 1;
+		tx_phyrate_local = sinfo->txrate.legacy * 100;
+		if (sta->band == NL80211_BAND_2GHZ)
+			phymode_local = PHYMODE_B;
+		break;
+	case FORMATMOD_NON_HT_DUP_OFDM:
+		if (rate_info.mcsIndexTx >= ARRAY_SIZE(tx_legrates_lut_rate))
+			goto rx_rate;
+		sinfo->txrate.flags = 0;
+		sinfo->txrate.legacy = tx_legrates_lut_rate[rate_info.mcsIndexTx];
+		sinfo->txrate.nss = 1;
+		tx_phyrate_local = sinfo->txrate.legacy * 100;
+		if (sta->band == NL80211_BAND_2GHZ)
+			phymode_local = PHYMODE_G;
+		else
+			phymode_local = PHYMODE_A;
 		break;
 	case FORMATMOD_HT_MF:
 	case FORMATMOD_HT_GF:
+		streams = rate_info.mcsIndexTx / 8;
+		mcs = rate_info.mcsIndexTx % 8;
+		if (rate_info.bwTx > PHY_CHNL_BW_40 ||
+		    !RWNX_RATE_INDEX_VALID(ht_mcs_map_to_rate, streams,
+					   rate_info.giAndPreTypeTx, rate_info.bwTx, mcs))
+			goto rx_rate;
 		sinfo->txrate.flags = RATE_INFO_FLAGS_MCS;
-		sinfo->txrate.mcs = rate_info->mcsIndexTx & 0x7;
-        sinfo->txrate.nss = ((rate_info->mcsIndexTx >> 3) & 0x7) + 1;
-        phymode_local = PHYMODE_N;
-
-        tx_phyrate_local = ht_mcs_map_to_rate[sinfo->txrate.nss - 1][rate_info->giAndPreTypeTx][rate_info->bwTx][sinfo->txrate.mcs];
+		if (rate_info.giAndPreTypeTx)
+			sinfo->txrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+		sinfo->txrate.mcs = rate_info.mcsIndexTx;
+		sinfo->txrate.nss = streams + 1;
+		phymode_local = PHYMODE_N;
+		tx_phyrate_local = ht_mcs_map_to_rate[streams][rate_info.giAndPreTypeTx]
+						   [rate_info.bwTx][mcs];
 		break;
 	case FORMATMOD_VHT:
+		streams = rate_info.mcsIndexTx >> 4;
+		mcs = rate_info.mcsIndexTx & 0xf;
+		if (!RWNX_RATE_INDEX_VALID(vht_mcs_map_to_rate, streams,
+					   rate_info.giAndPreTypeTx, rate_info.bwTx, mcs))
+			goto rx_rate;
 		sinfo->txrate.flags = RATE_INFO_FLAGS_VHT_MCS;
-		sinfo->txrate.mcs = rate_info->mcsIndexTx & 0xF;
-        sinfo->txrate.nss = ((rate_info->mcsIndexTx >> 4) & 0x7) + 1;
-        tx_phyrate_local = vht_mcs_map_to_rate[sinfo->txrate.nss - 1][rate_info->giAndPreTypeTx][rate_info->bwTx][sinfo->txrate.mcs];
-        //printk("phyrate: %d,%d,%d,%d\n", sinfo->txrate.nss - 1, rate_info->giAndPreTypeTx, rate_info->bwTx, sinfo->txrate.mcs);
-        phymode_local = PHYMODE_AC;
+		if (rate_info.giAndPreTypeTx)
+			sinfo->txrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+		sinfo->txrate.mcs = mcs;
+		sinfo->txrate.nss = streams + 1;
+		tx_phyrate_local = vht_mcs_map_to_rate[streams][rate_info.giAndPreTypeTx]
+						    [rate_info.bwTx][mcs];
+		phymode_local = PHYMODE_AC;
 		break;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
-	case FORMATMOD_HE_MU:
 	case FORMATMOD_HE_SU:
-	case FORMATMOD_HE_ER:
+		streams = rate_info.mcsIndexTx >> 4;
+		mcs = rate_info.mcsIndexTx & 0xf;
+		if (!RWNX_RATE_INDEX_VALID(he_mcs_map_to_rate, streams,
+					   rate_info.giAndPreTypeTx, rate_info.bwTx, mcs))
+			goto rx_rate;
 		sinfo->txrate.flags = RATE_INFO_FLAGS_HE_MCS;
-        sinfo->txrate.mcs = rate_info->mcsIndexTx & 0xF;
-        sinfo->txrate.nss = ((rate_info->mcsIndexTx >> 4) & 0x7) + 1;
-        tx_phyrate_local = he_mcs_map_to_rate[sinfo->txrate.nss - 1][rate_info->giAndPreTypeTx][rate_info->bwTx][sinfo->txrate.mcs];
-        phymode_local = PHYMODE_AX;
-        //printk("phyrate: %d,%d,%d,%d\n", sinfo->txrate.nss - 1, rate_info->giAndPreTypeTx, rate_info->bwTx, sinfo->txrate.mcs);
-		break;
-#else
-	case FORMATMOD_HE_MU:
-	case FORMATMOD_HE_SU:
-	case FORMATMOD_HE_ER:
-		sinfo->txrate.flags = RATE_INFO_FLAGS_VHT_MCS;
-		sinfo->txrate.mcs = ((rate_info->mcsIndexTx & 0xF) > 9 ? 9 : (rate_info->mcsIndexTx & 0xF));
-        sinfo->txrate.nss = ((rate_info->mcsIndexTx >> 4) & 0x7) + 1;
-        tx_phyrate_local = he_mcs_map_to_rate[sinfo->txrate.nss - 1][rate_info->giAndPreTypeTx][rate_info->bwTx][sinfo->txrate.mcs];
-        phymode_local = PHYMODE_AX;
+		sinfo->txrate.mcs = mcs;
+		sinfo->txrate.nss = streams + 1;
+		sinfo->txrate.he_gi = rate_info.giAndPreTypeTx;
+		phymode_local = PHYMODE_AX;
+		tx_phyrate_local = he_mcs_map_to_rate[streams][rate_info.giAndPreTypeTx]
+						   [rate_info.bwTx][mcs];
 		break;
 #endif
 	default:
-		return -EINVAL;
+		/* The confirmation lacks the RU information for HE MU/ER. */
+		goto rx_rate;
 	}
 
-    if(phymode)
-        *phymode = phymode_local;
-    if(tx_phyrate) {
-        *tx_phyrate = tx_phyrate_local;
-        AICWFDBG(LOGINFO, "phyrate=%d\n", *tx_phyrate);
-    }
+	if (phymode)
+		*phymode = phymode_local;
+	if (tx_phyrate)
+		*tx_phyrate = tx_phyrate_local;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
-	switch (rate_info->bwTx) {
+	switch (rate_info.bwTx) {
 	case PHY_CHNL_BW_20:
 		sinfo->txrate.bw = RATE_INFO_BW_20;
 		break;
@@ -6055,17 +6080,18 @@ int rwnx_fill_station_info(struct rwnx_sta *sta, struct rwnx_vif *vif,
 	}
 #endif
 
-	//sinfo->txrate.nss = 1;
-	sinfo->filled |= (BIT(NL80211_STA_INFO_TX_BITRATE) | BIT(NL80211_STA_INFO_TX_FAILED));
-	sinfo->inactive_time = jiffies_to_msecs(jiffies - vif->rwnx_hw->stats.last_tx);
-	sinfo->rx_bytes = vif->net_stats.rx_bytes;
-	sinfo->tx_bytes = vif->net_stats.tx_bytes;
-	sinfo->tx_packets = vif->net_stats.tx_packets;
-	sinfo->rx_packets = vif->net_stats.rx_packets;
-	sinfo->signal = (s8)cfm.rssi;
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
 
-	#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
-	switch (rx_vect1->ch_bw) {
+rx_rate:
+	spin_lock_bh(&vif->rwnx_hw->cb_lock);
+	rx_valid = stats->last_rx_valid;
+	rx_vect1 = stats->last_rx.rx_vect1;
+	spin_unlock_bh(&vif->rwnx_hw->cb_lock);
+	if (!rx_valid)
+		return 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0)
+	switch (rx_vect1.ch_bw) {
 	case PHY_CHNL_BW_20:
 		sinfo->rxrate.bw = RATE_INFO_BW_20;
 		break;
@@ -6088,98 +6114,77 @@ int rwnx_fill_station_info(struct rwnx_sta *sta, struct rwnx_vif *vif,
 	}
 	#endif
 
-	switch (rx_vect1->format_mod) {
+	switch (rx_vect1.format_mod) {
 	case FORMATMOD_NON_HT:
 	case FORMATMOD_NON_HT_DUP_OFDM:
+		if (!legrates_lut[rx_vect1.leg_rate].rate)
+			return 0;
 		sinfo->rxrate.flags = 0;
-		sinfo->rxrate.legacy = legrates_lut[rx_vect1->leg_rate].rate;
-        sinfo->rxrate.nss = 1;
-        rx_phyrate_local = legrates_lut[rx_vect1->leg_rate].rate;
+		sinfo->rxrate.legacy = legrates_lut[rx_vect1.leg_rate].rate;
+		sinfo->rxrate.nss = 1;
+		rx_phyrate_local = legrates_lut[rx_vect1.leg_rate].rate;
 		break;
 	case FORMATMOD_HT_MF:
 	case FORMATMOD_HT_GF:
+		streams = rx_vect1.ht.mcs / 8;
+		mcs = rx_vect1.ht.mcs % 8;
+		if (rx_vect1.ch_bw > PHY_CHNL_BW_40 ||
+		    !RWNX_RATE_INDEX_VALID(ht_mcs_map_to_rate, streams,
+					   rx_vect1.ht.short_gi, rx_vect1.ch_bw, mcs))
+			return 0;
 		sinfo->rxrate.flags = RATE_INFO_FLAGS_MCS;
-		if (rx_vect1->ht.short_gi)
+		if (rx_vect1.ht.short_gi)
 			sinfo->rxrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
-		sinfo->rxrate.mcs = rx_vect1->ht.mcs;
-        sinfo->rxrate.nss = rx_vect1->ht.num_extn_ss + 1;
-
-        if(rx_vect1->ht.mcs == 32) {//mcs 32
-            if(rx_vect1->vht.short_gi)
-                rx_phyrate_local = 6700;
-            else
-                rx_phyrate_local = 6000;
-        } else {
-            if(sinfo->rxrate.mcs >= 8)
-                mcs = sinfo->rxrate.mcs - 8;
-            else
-                mcs = sinfo->rxrate.mcs;
-            rx_phyrate_local = ht_mcs_map_to_rate[rx_vect1->ht.num_extn_ss][rx_vect1->ht.short_gi][rx_vect1->ch_bw][mcs];
-        }
+		sinfo->rxrate.mcs = rx_vect1.ht.mcs;
+		sinfo->rxrate.nss = streams + 1;
+		rx_phyrate_local = ht_mcs_map_to_rate[streams][rx_vect1.ht.short_gi]
+						   [rx_vect1.ch_bw][mcs];
 		break;
 	case FORMATMOD_VHT:
+		if (!RWNX_RATE_INDEX_VALID(vht_mcs_map_to_rate, rx_vect1.vht.nss,
+					   rx_vect1.vht.short_gi, rx_vect1.ch_bw,
+					   rx_vect1.vht.mcs))
+			return 0;
 		sinfo->rxrate.flags = RATE_INFO_FLAGS_VHT_MCS;
-		if (rx_vect1->vht.short_gi)
+		if (rx_vect1.vht.short_gi)
 			sinfo->rxrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
-		sinfo->rxrate.mcs = rx_vect1->vht.mcs;
-        sinfo->rxrate.nss = rx_vect1->vht.nss + 1;
-        rx_phyrate_local = vht_mcs_map_to_rate[rx_vect1->vht.nss][rx_vect1->vht.short_gi][rx_vect1->ch_bw][sinfo->rxrate.mcs];
-        //printk("rx:%d,%d,%d,%d\n", rx_vect1->vht.nss, rx_vect1->vht.short_gi, rx_vect1->ch_bw, sinfo->rxrate.mcs);
+		sinfo->rxrate.mcs = rx_vect1.vht.mcs;
+		sinfo->rxrate.nss = rx_vect1.vht.nss + 1;
+		rx_phyrate_local = vht_mcs_map_to_rate[rx_vect1.vht.nss][rx_vect1.vht.short_gi]
+						    [rx_vect1.ch_bw][sinfo->rxrate.mcs];
 		break;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
-	case FORMATMOD_HE_MU:
-		sinfo->rxrate.he_ru_alloc = rx_vect1->he.ru_size;
 	case FORMATMOD_HE_SU:
-	case FORMATMOD_HE_ER:
+		if (!RWNX_RATE_INDEX_VALID(he_mcs_map_to_rate, rx_vect1.he.nss,
+					   rx_vect1.he.gi_type, rx_vect1.ch_bw,
+					   rx_vect1.he.mcs))
+			return 0;
 		sinfo->rxrate.flags = RATE_INFO_FLAGS_HE_MCS;
-		sinfo->rxrate.mcs = rx_vect1->he.mcs;
-		sinfo->rxrate.he_gi = rx_vect1->he.gi_type;
-        if (rx_vect1->he.gi_type)
-            sinfo->rxrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
-		sinfo->rxrate.he_dcm = rx_vect1->he.dcm;
-        sinfo->rxrate.nss = rx_vect1->he.nss + 1;
-        rx_phyrate_local = he_mcs_map_to_rate[rx_vect1->he.nss][rx_vect1->he.gi_type][rx_vect1->ch_bw][sinfo->rxrate.mcs];
-		break;
-#else
-	//kernel not support he
-	case FORMATMOD_HE_MU:
-	case FORMATMOD_HE_SU:
-	case FORMATMOD_HE_ER:
-		sinfo->rxrate.flags = RATE_INFO_FLAGS_VHT_MCS;
-		sinfo->rxrate.mcs = (rx_vect1->he.mcs > 9 ? 9 : rx_vect1->he.mcs);
-        sinfo->rxrate.nss = rx_vect1->he.nss + 1;
+		sinfo->rxrate.mcs = rx_vect1.he.mcs;
+		sinfo->rxrate.he_gi = rx_vect1.he.gi_type;
+		sinfo->rxrate.he_dcm = rx_vect1.he.dcm;
+		sinfo->rxrate.nss = rx_vect1.he.nss + 1;
+		rx_phyrate_local = he_mcs_map_to_rate[rx_vect1.he.nss][rx_vect1.he.gi_type]
+						   [rx_vect1.ch_bw][rx_vect1.he.mcs];
 		break;
 #endif
 	default:
-		return -EINVAL;
+		return 0;
 	}
 
-    if(rx_phyrate) {
-        *rx_phyrate = rx_phyrate_local;
-        AICWFDBG(LOGINFO, "rx_phyrate=%d\n", *rx_phyrate);
-    }
+	if (rx_phyrate)
+		*rx_phyrate = rx_phyrate_local;
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
-	sinfo->filled |= (STATION_INFO_INACTIVE_TIME |
-					 STATION_INFO_RX_BYTES64 |
-					 STATION_INFO_TX_BYTES64 |
-					 STATION_INFO_RX_PACKETS |
-					 STATION_INFO_TX_PACKETS |
-					 STATION_INFO_SIGNAL |
-					 STATION_INFO_RX_BITRATE);
+	sinfo->filled |= STATION_INFO_RX_BITRATE;
 #else
-	sinfo->filled |= (BIT(NL80211_STA_INFO_INACTIVE_TIME) |
-					 BIT(NL80211_STA_INFO_RX_BYTES64)    |
-					 BIT(NL80211_STA_INFO_TX_BYTES64)    |
-					 BIT(NL80211_STA_INFO_RX_PACKETS)    |
-					 BIT(NL80211_STA_INFO_TX_PACKETS)    |
-					 BIT(NL80211_STA_INFO_SIGNAL)        |
-					 BIT(NL80211_STA_INFO_RX_BITRATE));
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
 #endif
 
 	return 0;
 }
 
+#undef RWNX_RATE_INDEX_VALID
 
 
 /**
@@ -6312,11 +6317,7 @@ static int rwnx_cfg80211_dump_station(struct wiphy *wiphy,
 #endif
 #endif
 
-    if (sta){
-        rwnx_fill_station_info(sta, rwnx_vif, sinfo, NULL, NULL, NULL);
-    }
-
-    return 0;
+	return rwnx_fill_station_info(sta, rwnx_vif, sinfo, NULL, NULL, NULL);
 }
 
 /**
