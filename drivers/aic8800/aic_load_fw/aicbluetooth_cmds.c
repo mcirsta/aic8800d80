@@ -15,13 +15,14 @@
 //#include <stddef.h>
 #include "aicbluetooth_cmds.h"
 #include "aic_txrxif.h"
+#include "aicwf_debug.h"
 #include "aicwf_usb.h"
 
 //extern int aicwf_sdio_writeb(struct aic_sdio_dev *sdiodev, uint regaddr, u8 val);
 
 static void cmd_dump(const struct rwnx_cmd *cmd)
 {
-    printk(KERN_CRIT "tkn[%d]  flags:%04x  result:%3d  cmd:%4d - reqcfm(%4d)\n",
+    AICWFDBG(LOGDEBUG, "tkn[%d]  flags:%04x  result:%3d  cmd:%4d - reqcfm(%4d)\n",
            cmd->tkn, cmd->flags, cmd->result, cmd->id, cmd->reqid);
 }
 
@@ -173,7 +174,7 @@ static void cmd_mgr_print(struct rwnx_cmd_mgr *cmd_mgr)
     struct rwnx_cmd *cur;
 
     spin_lock_bh(&cmd_mgr->lock);
-    printk("q_sz/max: %2d / %2d - next tkn: %d\n",
+    AICWFDBG(LOGDEBUG, "q_sz/max: %2d / %2d - next tkn: %d\n",
              cmd_mgr->queue_sz, cmd_mgr->max_queue_sz,
              cmd_mgr->next_tkn);
     list_for_each_entry(cur, &cmd_mgr->cmds, list) {
@@ -284,7 +285,7 @@ static inline void *rwnx_msg_zalloc(lmac_msg_id_t const id,
     msg = (struct lmac_msg *)kzalloc(sizeof(struct lmac_msg) + param_len,
                                      flags);
     if (msg == NULL) {
-        printk(KERN_CRIT "%s: msg allocation failed\n", __func__);
+        pr_err("%s: msg allocation failed\n", __func__);
         return NULL;
     }
     msg->id = id;
@@ -493,7 +494,7 @@ int rwnx_send_reboot(struct aic_usb_dev *usbdev)
     int ret = 0;
     u32 delay = 2 *1000; //1s
 
-    printk("%s enter \r\n", __func__);
+    AICWFDBG(LOGDEBUG, "%s\n", __func__);
 
     ret = rwnx_send_dbg_start_app_req(usbdev, delay, HOST_START_APP_REBOOT);
     return ret;
