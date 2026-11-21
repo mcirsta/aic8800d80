@@ -597,9 +597,17 @@ load_module() {
     print_info "Updating module dependencies..."
     depmod -a >> "$LOG_FILE" 2>&1
     
-    if lsmod | grep -q "$MODULE_NAME"; then
+    if [ -d "/sys/module/$MODULE_NAME" ]; then
         print_info "Wi-Fi module already loaded. Reloading..."
-        modprobe -r "$MODULE_NAME" >> "$LOG_FILE" 2>&1 || true
+        # Keep cfg80211 loaded so running supplicants retain their nl80211
+        # family ID and multicast subscriptions across the driver reload.
+        if ! rmmod "$MODULE_NAME" >> "$LOG_FILE" 2>&1; then
+            print_warning "Could not unload the running Wi-Fi module. Reboot to activate the update."
+            return 0
+        fi
+        if [ -d /sys/module/aic_load_fw ] && ! rmmod aic_load_fw >> "$LOG_FILE" 2>&1; then
+            print_warning "Could not unload the running firmware loader. Reboot to activate its update."
+        fi
     fi
     
     # aic8800_fdrv depends on aic_load_fw, which initializes both Wi-Fi-only

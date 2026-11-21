@@ -164,6 +164,15 @@ After installation, load the driver with the following command:
 sudo modprobe aic8800_fdrv
 ```
 
+To reload the driver after an update, disconnect Wi-Fi first. Remove only the
+AIC modules so `cfg80211` keeps the nl80211 family that the running supplicant
+uses:
+
+```bash
+sudo rmmod aic8800_fdrv && sudo rmmod aic_load_fw
+sudo modprobe aic8800_fdrv
+```
+
 ### Verify the Module is Active
 Check if the module is loaded correctly:
 
